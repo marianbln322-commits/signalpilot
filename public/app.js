@@ -8,6 +8,7 @@ const cardsEl = $('cards');
 const alertsEl = $('alerts');
 let cards = {}; // symbol -> element
 let soundOn = true;
+let SNIPER_MODE = true; // set from server config on load
 
 // Local <-> UTC hour conversion (offset in hours; e.g. UTC+3 => off = -3).
 const OFF = new Date().getTimezoneOffset() / 60;
@@ -35,30 +36,41 @@ function snapChips(snaps) {
 
 function renderCard(v) {
   const dir = v.directie.toLowerCase();
+  const eligible = v.sniper && v.sniper.eligible;
   const sigs = (v.signals || []).slice(0, 5).map((s) => `<li>${s.label} <span class="muted">[${s.tf}]</span></li>`).join('');
   const ai = v.ai
     ? `<div class="ai-note">🤖 <b>AI (${v.ai.acord || '—'})</b>: ${v.ai.risc ? '⚠️ ' + v.ai.risc : ''} ${v.ai.comentariu || ''}</div>`
     : (v.aiError ? `<div class="ai-note">🤖 AI indisponibil: ${v.aiError}</div>` : '');
+
+  // The BIG banner: the only thing you act on. Sniper Mode = trade only on 🎯.
+  let banner;
+  if (SNIPER_MODE) {
+    banner = eligible
+      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">pe MEXC event futures · fereastră ${v.interval}</div></div>`
+      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
+  } else {
+    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval} · încredere ${v.incredere}</div></div>`;
+  }
 
   return `
     <div class="card-top">
       <span class="card-sym">${v.symbol}</span>
       <span class="card-price">${fmt(v.price)} USDT</span>
     </div>
-    <div class="dir ${dir}">${v.directie}${v.directie !== 'NEUTRU' ? (v.directie === 'UP' ? ' ▲' : ' ▼') : ''}</div>
-    <div class="sniper-status ${v.sniper && v.sniper.eligible ? 'ok' : ''}">
-      ${v.sniper && v.sniper.eligible ? '🎯 SNIPER A+ — ' + v.sniper.reason : '⏳ ' + (v.sniper ? v.sniper.reason : 'aștept setup')}
-    </div>
-    <div class="row5">
-      <b>Interval</b><span>${v.interval}</span>
-      <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
-      <b>Justificare</b><span>${v.justificare}</span>
-      <b>Invalidare</b><span>${v.invalidare}</span>
-    </div>
-    ${sigs ? `<ul class="sig-list">${sigs}</ul>` : ''}
-    ${ai}
-    <div class="snap">${snapChips(v.snapshots)}</div>
-    <div class="muted" style="margin-top:8px;font-size:11px">actualizat ${new Date(v.ts).toLocaleTimeString('ro-RO')}</div>
+    ${banner}
+    <details class="analysis">
+      <summary>Analiza motorului (context, nu semnal de intrare)</summary>
+      <div class="row5">
+        <b>Direcție motor</b><span class="dir-inline ${dir}">${v.directie} · ${v.interval}</span>
+        <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
+        <b>Justificare</b><span>${v.justificare}</span>
+        <b>Invalidare</b><span>${v.invalidare}</span>
+      </div>
+      ${sigs ? `<ul class="sig-list">${sigs}</ul>` : ''}
+      ${ai}
+      <div class="snap">${snapChips(v.snapshots)}</div>
+    </details>
+    <div class="muted" style="margin-top:8px;font-size:11px">preț live · actualizat ${new Date(v.ts).toLocaleTimeString('ro-RO')}</div>
   `;
 }
 
@@ -203,6 +215,7 @@ async function loadState() {
   $('symbols').value = (c.symbols || []).join('\n');
   $('scanInterval').value = c.scanIntervalSec;
   $('alertMinConfidence').value = c.alertMinConfidence;
+  SNIPER_MODE = c.sniperMode !== false;
   $('sniperMode').checked = c.sniperMode !== false;
   $('sniperRequireVolume').checked = c.sniperRequireVolume !== false;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
