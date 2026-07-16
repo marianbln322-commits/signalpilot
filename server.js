@@ -2,7 +2,7 @@
 
 // ============================================================================
 // SignalPilot server — always-on local app (PinPilot style).
-// Serves the UI at http://localhost:3000, polls MEXC, runs the engine on a
+// Serves the UI at http://localhost:3001, polls MEXC, runs the engine on a
 // scheduler, pushes live updates over SSE, and alerts on good setups.
 // ============================================================================
 
@@ -24,7 +24,8 @@ const gemini = require('./lib/gemini');
 const backtest = require('./lib/backtest');
 const journal = require('./lib/journal');
 
-const PORT = process.env.PORT || 3000;
+// Port 3001 by default so SignalPilot can run alongside PinPilot (which uses 3000).
+const PORT = process.env.PORT || 3001;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const DEFAULT_CONFIG = {
   symbols: ['BTCUSDT', 'ETHUSDT'],
