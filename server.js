@@ -36,6 +36,11 @@ const DEFAULT_CONFIG = {
   sniperMode: true,
   sniperRequireVolume: true,
   activeHoursUTC: [6, 7, 8, 9, 13, 14, 15, 16, 17],
+  // Adaptive interval: mirror the trader — when the recent 10-min win-rate
+  // degrades, shift new signals to the 30-min window (more time, less noise).
+  adaptiveInterval: true,
+  adaptive10minThreshold: 45, // if recent 10-min win-rate < this (%) => use 30-min
+  adaptiveMinSamples: 8,      // need at least this many resolved 10-min trades first
   gemini: { enabled: false, apiKey: '', model: 'gemini-3.5-flash' },
 };
 
@@ -77,6 +82,16 @@ async function scanSymbol(symbol) {
   const mtf = await mexc.fetchMultiTimeframe(symbol, ['5m', '15m'], 200);
   const verdict = engine.decide(mtf);
   verdict.symbol = symbol;
+
+  // Adaptive interval: if recent 10-min trades are underperforming, push new
+  // 10-min signals to the 30-min window (exactly what the trader does).
+  if (config.adaptiveInterval && verdict.interval === '10 minute') {
+    const ten = journal.recentByInterval(20).tenMin;
+    if (ten.n >= config.adaptiveMinSamples && ten.winRate != null && ten.winRate < config.adaptive10minThreshold) {
+      verdict.interval = '30 minute';
+      verdict.intervalAdapted = { from: '10 minute', reason: `10 min recent la ${ten.winRate}% (< ${config.adaptive10minThreshold}%) → trec pe 30 min`, recent10: ten };
+    }
+  }
 
   // Optional Gemini narration (numbers only, never an image).
   if (config.gemini && config.gemini.enabled && config.gemini.apiKey && verdict.directie !== 'NEUTRU') {
@@ -219,6 +234,11 @@ app.post('/api/config', (req, res) => {
   }
   if (typeof body.sniperMode === 'boolean') config.sniperMode = body.sniperMode;
   if (typeof body.sniperRequireVolume === 'boolean') config.sniperRequireVolume = body.sniperRequireVolume;
+  if (typeof body.adaptiveInterval === 'boolean') config.adaptiveInterval = body.adaptiveInterval;
+  if (body.adaptive10minThreshold != null) {
+    const t = Number(body.adaptive10minThreshold);
+    if (t >= 30 && t <= 60) config.adaptive10minThreshold = t;
+  }
   if (Array.isArray(body.activeHoursUTC)) {
     config.activeHoursUTC = body.activeHoursUTC
       .map((h) => Number(h))

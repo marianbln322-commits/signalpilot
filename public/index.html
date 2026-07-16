@@ -89,6 +89,15 @@ ETHUSDT</textarea>
               <small class="muted">În afara Sniper Mode, aplicația alertează pe orice setup peste pragul de încredere (mai multe semnale, mai mult zgomot).</small>
             </div>
           </div>
+          <div class="grid" style="margin-top:12px">
+            <div class="field">
+              <label class="switch-inline"><input type="checkbox" id="adaptiveInterval" checked /> <b>Interval adaptiv</b> — trece pe 30 min când 10 min merge prost (ca traderul)</label>
+              <small class="muted">Comută automat semnalele de 10 min pe 30 min când win-rate-ul recent pe 10 min scade sub pragul de mai jos, și revine când 10 min își revine.</small>
+            </div>
+            <div class="field">
+              <label>Prag win-rate 10 min (%) sub care trec pe 30 min</label>
+              <input type="number" id="adaptive10minThreshold" min="30" max="60" value="45" />
+          </div>
         </div>
         <hr />
         <div class="grid">

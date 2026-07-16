@@ -43,13 +43,14 @@ function renderCard(v) {
     : (v.aiError ? `<div class="ai-note">🤖 AI indisponibil: ${v.aiError}</div>` : '');
 
   // The BIG banner: the only thing you act on. Sniper Mode = trade only on 🎯.
+  const adapt = v.intervalAdapted ? ' · 🔄 adaptat 10→30' : '';
   let banner;
   if (SNIPER_MODE) {
     banner = eligible
-      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">pe MEXC event futures · fereastră ${v.interval}</div></div>`
+      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">pe MEXC event futures · fereastră ${v.interval}${adapt}</div></div>`
       : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
   } else {
-    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval} · încredere ${v.incredere}</div></div>`;
+    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${adapt} · încredere ${v.incredere}</div></div>`;
   }
 
   return `
@@ -161,6 +162,12 @@ function renderJournal(d) {
   const s = d.stats;
   const box = (val, lbl) => `<div class="bt-box"><div class="big" style="font-size:20px">${val}</div><div class="lbl">${lbl}</div></div>`;
   let html = box(wr(s.overall), 'general (toate)') + box(wr(s.sniper), '🎯 doar Sniper') + `<div class="bt-box"><div class="big" style="font-size:20px">${s.pending}</div><div class="lbl">în așteptare</div></div>`;
+  if (s.byInterval) {
+    html += box(wr(s.byInterval['10 minute']), 'fereastră 10 min') + box(wr(s.byInterval['30 minute']), 'fereastră 30 min');
+  }
+  if (s.recentInterval && s.recentInterval.tenMin && s.recentInterval.tenMin.n) {
+    html += box(wr(s.recentInterval.tenMin), '10 min (recent 20)');
+  }
   for (const [sym, o] of Object.entries(s.sniperBySymbol || {})) {
     if (o.n) html += box(wr(o), `🎯 ${sym}`);
   }
@@ -218,6 +225,8 @@ async function loadState() {
   SNIPER_MODE = c.sniperMode !== false;
   $('sniperMode').checked = c.sniperMode !== false;
   $('sniperRequireVolume').checked = c.sniperRequireVolume !== false;
+  $('adaptiveInterval').checked = c.adaptiveInterval !== false;
+  if (c.adaptive10minThreshold) $('adaptive10minThreshold').value = c.adaptive10minThreshold;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -242,6 +251,8 @@ async function saveSettings() {
     alertMinConfidence: $('alertMinConfidence').value,
     sniperMode: $('sniperMode').checked,
     sniperRequireVolume: $('sniperRequireVolume').checked,
+    adaptiveInterval: $('adaptiveInterval').checked,
+    adaptive10minThreshold: Number($('adaptive10minThreshold').value),
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,
