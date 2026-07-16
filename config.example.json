@@ -1,0 +1,10 @@
+{
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "scanIntervalSec": 8,
+  "alertMinConfidence": "Mediu",
+  "gemini": {
+    "enabled": false,
+    "apiKey": "",
+    "model": "gemini-3.5-flash"
+  }
+}

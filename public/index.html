@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SignalPilot — MEXC live UP/DOWN</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="logo">📈</span>
+      <div>
+        <h1>SignalPilot</h1>
+        <p>Analiză MEXC în timp real → decizii UP/DOWN pe 10/30 min (indicatori + Smart Money, determinist)</p>
+      </div>
+    </div>
+    <div class="badges">
+      <span id="aiBadge" class="badge badge-off">AI: verific...</span>
+      <span id="connBadge" class="badge badge-off">Conectare...</span>
+    </div>
+  </header>
+
+  <main>
+    <!-- LIVE SIGNAL CARDS -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>Semnale live</h2>
+        <label class="switch-inline">
+          <input type="checkbox" id="soundToggle" checked /> sunet la alertă
+        </label>
+      </div>
+      <div id="cards" class="cards"></div>
+    </section>
+
+    <!-- ALERTS FEED -->
+    <section class="panel">
+      <div class="panel-head"><h2>Alerte (setup-uri bune)</h2><button id="clearAlerts" class="btn-ghost">golește</button></div>
+      <div id="alerts" class="alerts"><p class="muted">Aștept primul setup care depășește pragul de încredere...</p></div>
+    </section>
+
+    <!-- LIVE JOURNAL (AUTO) -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>📒 Jurnal live (automat)</h2>
+        <button id="resetJournal" class="btn-ghost">resetează</button>
+      </div>
+      <p class="muted" style="margin-top:-6px">Fiecare alertă e înregistrată automat, iar rezultatul (WIN/LOSS) se verifică singur după 10/30 min. Acesta e win-rate-ul TĂU real, live.</p>
+      <div id="journalStats" class="bt-result" style="margin-top:12px"></div>
+      <div id="journalList" class="journal-list"></div>
+    </section>
+
+    <!-- SETTINGS -->
+    <section class="panel">
+      <div class="panel-head"><h2>Setări</h2><button id="toggleSettings" class="btn-ghost">arată / ascunde</button></div>
+      <div id="settingsBody" class="settings">
+        <div class="grid">
+          <div class="field">
+            <label>Simboluri (unul pe linie, format MEXC ex. BTCUSDT)</label>
+            <textarea id="symbols" rows="3">BTCUSDT
+ETHUSDT</textarea>
+          </div>
+          <div class="field">
+            <label>Interval scanare (secunde)</label>
+            <input type="number" id="scanInterval" min="3" value="8" />
+            <label>Alertă de la încrederea (doar în mod normal)</label>
+            <select id="alertMinConfidence">
+              <option>Scăzut</option>
+              <option selected>Mediu</option>
+              <option>Ridicat</option>
+            </select>
+          </div>
+        </div>
+        <hr />
+        <div class="sniper-panel">
+          <label class="switch-inline"><input type="checkbox" id="sniperMode" checked /> <b>🎯 Sniper Mode</b> — alertează DOAR pe setup-ul A+ (liquidity sweep + volum + ore active). Recomandat.</label>
+          <div class="grid" style="margin-top:12px">
+            <div class="field">
+              <label>Ore active (ora TA locală, separate prin virgulă)</label>
+              <input type="text" id="activeHoursLocal" placeholder="ex: 9,10,11,16,17,18,19" />
+              <small class="muted" id="hoursHint"></small>
+            </div>
+            <div class="field">
+              <label class="switch-inline"><input type="checkbox" id="sniperRequireVolume" checked /> cere confirmare de volum pe sweep</label>
+              <small class="muted">În afara Sniper Mode, aplicația alertează pe orice setup peste pragul de încredere (mai multe semnale, mai mult zgomot).</small>
+            </div>
+          </div>
+        </div>
+        <hr />
+        <div class="grid">
+          <div class="field">
+            <label class="switch-inline"><input type="checkbox" id="geminiEnabled" /> Folosește Gemini pentru justificarea alertelor 🎯 (opțional)</label>
+            <label>Cheie API Gemini</label>
+            <input type="password" id="geminiKey" placeholder="lipește cheia (rămâne locală, pe mașina ta)" />
+            <label>Model Gemini</label>
+            <select id="geminiModel">
+              <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite (cel mai ieftin)</option>
+              <option value="gemini-3.5-flash" selected>gemini-3.5-flash (recomandat)</option>
+              <option value="gemini-3.1-pro">gemini-3.1-pro (cel mai scump)</option>
+            </select>
+            <small class="muted" id="costHint"></small>
+          </div>
+          <div class="field field-actions">
+            <button id="testAi" class="btn-secondary">Testează cheia AI</button>
+            <span id="testAiResult" class="muted"></span>
+          </div>
+        </div>
+        <div class="save-row">
+          <button id="saveSettings" class="btn-primary">Salvează setările</button>
+          <span id="saveResult" class="muted"></span>
+        </div>
+      </div>
+    </section>
+
+    <!-- BACKTEST -->
+    <section class="panel">
+      <div class="panel-head"><h2>Backtest (win-rate real pe istoric)</h2></div>
+      <div class="backtest-controls">
+        <select id="btSymbol"></select>
+        <select id="btDays">
+          <option value="7">ultimele 7 zile</option>
+          <option value="15" selected>ultimele 15 zile</option>
+          <option value="30">ultimele 30 zile</option>
+        </select>
+        <button id="runBacktest" class="btn-primary">Rulează backtest</button>
+        <span id="btStatus" class="muted"></span>
+      </div>
+      <div id="btResult" class="bt-result"></div>
+      <p class="disclaimer">⚠️ Backtest-ul măsoară strict dacă prețul a închis în direcția prezisă după fereastra contractului, pe date istorice recente. Rezultatele trecute NU garantează rezultate viitoare. Comisioanele/spread-ul platformei nu sunt incluse. Tranzacționarea contractelor pe 10/30 min este speculativă și riscantă.</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>

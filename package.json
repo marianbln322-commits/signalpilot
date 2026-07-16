@@ -1,0 +1,14 @@
+{
+  "name": "signalpilot",
+  "version": "1.0.0",
+  "description": "Local real-time MEXC signal engine for 10/30-min event-futures UP/DOWN decisions (deterministic indicators + SMC, optional Gemini narrator, backtest).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2"
+  }
+}
