@@ -2,7 +2,7 @@
 
 // ============================================================================
 // SignalPilot server — always-on local app (PinPilot style).
-// Serves the UI at http://localhost:3001, polls MEXC, runs the engine on a
+// Serves the UI at http://localhost:3002, polls MEXC, runs the engine on a
 // scheduler, pushes live updates over SSE, and alerts on good setups.
 // ============================================================================
 
@@ -26,8 +26,9 @@ const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
 
-// Port 3001 by default so SignalPilot can run alongside PinPilot (which uses 3000).
-const PORT = process.env.PORT || 3001;
+// Port 3002 by default so this version runs alongside PinPilot (3000) and an
+// older SignalPilot (3001). Override with the PORT env var if needed.
+const PORT = process.env.PORT || 3002;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const DEFAULT_CONFIG = {
   symbols: ['BTCUSDT', 'ETHUSDT'],

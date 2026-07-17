@@ -19,8 +19,8 @@ npm install
 npm start
 ```
 
-Apoi deschide în browser: **http://localhost:3001**
-(Portul 3001 e ales special ca SignalPilot să ruleze în paralel cu PinPilot, care folosește 3000.)
+Apoi deschide în browser: **http://localhost:3002**
+(Portul 3002 e ales ca să ruleze în paralel cu PinPilot (3000) și o versiune mai veche de SignalPilot (3001). Poți schimba portul cu variabila de mediu PORT.)
 Ca să oprești: închide fereastra / `Ctrl+C`.
 
 Pe Windows poți da dublu-click pe **`start.bat`**.
