@@ -34,7 +34,10 @@ const DEFAULT_CONFIG = {
   // Sniper mode: only act on the out-of-sample-validated A+ setup
   // (liquidity sweep + volume + active session hours). Alerts fire only on these.
   sniperMode: true,
-  sniperRequireVolume: true,
+  // Volume confirmation OFF by default: "sweep + active hours" fires ~10/day
+  // (trader-like cadence) and backtested similarly; the volume filter did not
+  // robustly help out-of-sample. Turn ON for a stricter ~4-5/day.
+  sniperRequireVolume: false,
   activeHoursUTC: [6, 7, 8, 9, 13, 14, 15, 16, 17],
   // EV-based interval selection (mirrors the trader): pick the window whose
   // MEXC payout gives the best expected value. Break-even win-rate = 1/(1+payout).

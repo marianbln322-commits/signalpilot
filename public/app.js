@@ -9,6 +9,27 @@ const alertsEl = $('alerts');
 let cards = {}; // symbol -> element
 let soundOn = true;
 let SNIPER_MODE = true; // set from server config on load
+let ACTIVE_HOURS = [6, 7, 8, 9, 13, 14, 15, 16, 17]; // UTC, set from config
+
+function updateSessionBadge() {
+  const nowUtc = new Date().getUTCHours();
+  const active = ACTIVE_HOURS.includes(nowUtc);
+  const el = $('sessionBadge');
+  if (!el) return;
+  if (active) {
+    el.textContent = '🟢 Sesiune ACTIVĂ';
+    el.className = 'badge badge-on';
+  } else {
+    // find next active hour
+    let next = null;
+    for (let k = 1; k <= 24; k++) {
+      const h = (nowUtc + k) % 24;
+      if (ACTIVE_HOURS.includes(h)) { next = k; break; }
+    }
+    el.textContent = next != null ? `⚪ Pauză (sesiune în ~${next}h)` : '⚪ Pauză';
+    el.className = 'badge badge-off';
+  }
+}
 
 // Local <-> UTC hour conversion (offset in hours; e.g. UTC+3 => off = -3).
 const OFF = new Date().getTimezoneOffset() / 60;
@@ -229,8 +250,10 @@ async function loadState() {
   $('scanInterval').value = c.scanIntervalSec;
   $('alertMinConfidence').value = c.alertMinConfidence;
   SNIPER_MODE = c.sniperMode !== false;
+  if (Array.isArray(c.activeHoursUTC) && c.activeHoursUTC.length) ACTIVE_HOURS = c.activeHoursUTC;
+  updateSessionBadge();
   $('sniperMode').checked = c.sniperMode !== false;
-  $('sniperRequireVolume').checked = c.sniperRequireVolume !== false;
+  $('sniperRequireVolume').checked = !!c.sniperRequireVolume;
   $('adaptiveInterval').checked = c.adaptiveInterval !== false;
   if (c.payout10) $('payout10').value = c.payout10;
   if (c.payout30) $('payout30').value = c.payout30;
@@ -329,3 +352,5 @@ if ('Notification' in window && Notification.permission === 'default') {
 
 loadState();
 connect();
+updateSessionBadge();
+setInterval(updateSessionBadge, 60000);
