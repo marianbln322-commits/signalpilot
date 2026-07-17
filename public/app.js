@@ -55,6 +55,23 @@ function snapChips(snaps) {
   return parts.join('');
 }
 
+function ofRow(v) {
+  const parts = [];
+  if (v.orderflow) {
+    const of = v.orderflow;
+    const map = { buy: '🟢 cumpărare', sell: '🔴 vânzare', neutru: '⚪ neutru' };
+    const agreeMap = { 'confirmă': '<span class="ok">✓ confirmă</span>', 'conflict': '<span class="bad">✗ conflict</span>', 'neutru': 'neutru' };
+    parts.push(`<span title="dezechilibru order book + agresiune tranzacții">Order flow: <b>${map[of.state] || of.state}</b> (${(of.pressure * 100).toFixed(0)}%) · ${agreeMap[v.ofAgree] || ''}</span>`);
+  }
+  if (v.learned && v.learned.ready) {
+    const cls = v.learned.estimate >= 55 ? 'ok' : (v.learned.estimate < 48 ? 'bad' : '');
+    parts.push(`<span title="estimare din istoricul tău">🧠 istoric: <span class="${cls}">${v.learned.estimate}%</span></span>`);
+  }
+  if (v.suppressed) parts.push(`<span class="bad">⛔ blocat: ${v.suppressed}</span>`);
+  if (!parts.length) return '';
+  return `<div class="of-row">${parts.join(' &nbsp;·&nbsp; ')}</div>`;
+}
+
 function renderCard(v) {
   const dir = v.directie.toLowerCase();
   const eligible = v.sniper && v.sniper.eligible;
@@ -85,6 +102,7 @@ function renderCard(v) {
       <span class="card-price">${fmt(v.price)} USDT</span>
     </div>
     ${banner}
+    ${ofRow(v)}
     <details class="analysis">
       <summary>Analiza motorului (context, nu semnal de intrare)</summary>
       <div class="row5">
@@ -163,6 +181,7 @@ function connect() {
     const d = JSON.parse(e.data);
     Object.values(d.latest || {}).forEach(upsertCard);
     if (d.journal) renderJournal(d.journal);
+    if (d.learning) renderLearning(d.learning);
     (d.alerts || []).slice().reverse().forEach((a) => {
       // render without sound on initial load
       if (alertsEl.querySelector('.muted')) alertsEl.innerHTML = '';
@@ -177,7 +196,31 @@ function connect() {
   });
   es.addEventListener('signal', (e) => upsertCard(JSON.parse(e.data)));
   es.addEventListener('alert', (e) => addAlert(JSON.parse(e.data)));
-  es.addEventListener('journal', (e) => renderJournal(JSON.parse(e.data)));
+  es.addEventListener('journal', (e) => {
+    const d = JSON.parse(e.data);
+    renderJournal(d);
+    if (d.learning) renderLearning(d.learning);
+  });
+}
+
+// ---------- learning panel ----------
+function renderLearning(l) {
+  if (!l) return;
+  const el = $('learningBody');
+  if (!l.ready) {
+    el.innerHTML = `<p class="muted">Încă strâng date (${l.total || 0} semnale rezolvate). Am nevoie de minim ${l.minSample || 10} per tipar ca să învăț ceva sigur.</p>`;
+    return;
+  }
+  const row = (r) => {
+    const cls = r.winRate >= 55 ? 'ok' : (r.winRate < 48 ? 'bad' : '');
+    return `<div class="lrow"><span>${r.key}</span><span class="${cls}"><b>${r.winRate}%</b> <span class="muted">(${r.n})</span></span></div>`;
+  };
+  el.innerHTML = `
+    <div class="learn-cols">
+      <div><div class="learn-h ok">✅ Ce îți merge</div>${(l.best || []).map(row).join('') || '<p class="muted">—</p>'}</div>
+      <div><div class="learn-h bad">⛔ Ce evită</div>${(l.worst || []).map(row).join('') || '<p class="muted">—</p>'}</div>
+    </div>
+    <p class="muted" style="margin-top:10px">Din ${l.total} semnale rezolvate. Aplicația folosește asta ca să confirme sau să blocheze semnale noi automat.</p>`;
 }
 
 // ---------- live journal ----------
@@ -257,6 +300,9 @@ async function loadState() {
   $('adaptiveInterval').checked = c.adaptiveInterval !== false;
   if (c.payout10) $('payout10').value = c.payout10;
   if (c.payout30) $('payout30').value = c.payout30;
+  $('useOrderFlow').checked = c.useOrderFlow !== false;
+  $('requireOfAgree').checked = !!c.requireOfAgree;
+  $('useLearning').checked = c.useLearning !== false;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -284,6 +330,9 @@ async function saveSettings() {
     adaptiveInterval: $('adaptiveInterval').checked,
     payout10: Number($('payout10').value),
     payout30: Number($('payout30').value),
+    useOrderFlow: $('useOrderFlow').checked,
+    requireOfAgree: $('requireOfAgree').checked,
+    useLearning: $('useLearning').checked,
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,

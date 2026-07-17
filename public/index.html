@@ -55,6 +55,15 @@
       <div id="journalList" class="journal-list"></div>
     </section>
 
+    <!-- LEARNING -->
+    <section class="panel">
+      <div class="panel-head"><h2>🧠 Ce a învățat (din rezultatele tale)</h2></div>
+      <p class="muted" style="margin-top:-6px">Pe măsură ce jurnalul se umple, aplicația învață ce tipare îți merg și ce evită. Are nevoie de minim ~10 semnale per tipar ca să aibă încredere.</p>
+      <div id="learningBody" class="learning-body">
+        <p class="muted">Încă strâng date — nimic învățat sigur deocamdată. Lasă aplicația să ruleze câteva sesiuni.</p>
+      </div>
+    </section>
+
     <!-- SETTINGS -->
     <section class="panel">
       <div class="panel-head"><h2>Setări</h2><button id="toggleSettings" class="btn-ghost">arată / ascunde</button></div>
@@ -101,6 +110,16 @@ ETHUSDT</textarea>
               <label>Payout MEXC pe 30 min (%)</label>
               <input type="number" id="payout30" min="1" max="500" value="82" />
           </div>
+        </div>
+        <div class="grid" style="margin-top:12px">
+            <div class="field">
+              <label class="switch-inline"><input type="checkbox" id="useOrderFlow" checked /> <b>Order flow live</b> — confirmă direcția cu order book + agresiunea tranzacțiilor</label>
+              <label class="switch-inline"><input type="checkbox" id="requireOfAgree" /> nu alerta când order flow e în conflict cu direcția</label>
+            </div>
+            <div class="field">
+              <label class="switch-inline"><input type="checkbox" id="useLearning" checked /> <b>🧠 Învățare din jurnal</b> — se calibrează din rezultatele tale și blochează tiparele pierzătoare</label>
+              <small class="muted">Are nevoie de minim ~10 semnale per tipar înainte să acționeze.</small>
+            </div>
         </div>
         <hr />
         <div class="grid">

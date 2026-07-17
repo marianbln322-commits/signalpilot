@@ -139,3 +139,19 @@ button:hover { filter: brightness(1.1); }
 
 
 .ev-warn { margin-top: 6px; padding: 8px 12px; border-radius: 8px; background: rgba(234,57,67,0.15); color: var(--down); font-size: 12.5px; font-weight: 600; text-align: center; }
+
+
+/* Order flow row on cards */
+.of-row { margin: 6px 0; padding: 6px 10px; border-radius: 8px; background: rgba(255,255,255,0.04); font-size: 11.5px; color: var(--muted); display: flex; flex-wrap: wrap; gap: 4px; }
+.of-row .ok { color: var(--up); font-weight: 700; }
+.of-row .bad { color: var(--down); font-weight: 700; }
+
+/* Learning panel */
+.learn-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 640px) { .learn-cols { grid-template-columns: 1fr; } }
+.learn-h { font-size: 13px; font-weight: 700; margin-bottom: 8px; }
+.learn-h.ok { color: var(--up); }
+.learn-h.bad { color: var(--down); }
+.lrow { display: flex; justify-content: space-between; align-items: center; padding: 7px 10px; border-radius: 8px; background: var(--panel2); border: 1px solid var(--border); font-size: 12.5px; margin-bottom: 4px; }
+.lrow .ok { color: var(--up); }
+.lrow .bad { color: var(--down); }

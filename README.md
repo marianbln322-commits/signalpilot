@@ -85,6 +85,22 @@ Contractele MEXC event-futures sunt binare: dacă îți iese, primești un **pay
 
 De aceea contează enorm ce fereastră alegi. Introdu în Setări payout-urile curente de pe MEXC (10 min și 30 min). Aplicația calculează **EV (valoarea așteptată)** pentru fiecare fereastră (folosind win-rate-ul din jurnal sau ~55% ca estimare inițială) și **alege automat fereastra cu EV mai bun** — exact ce făcea traderul când trecea de la 10 min (payout mic) la 30 min (payout 80-85%). Dacă payout-ul e prea mic pentru edge-ul tău (EV negativ), banner-ul te avertizează să **sari peste**.
 
+## 📊 Order flow live (ce citește un scalper)
+
+Pe lângă lumânări, aplicația citește în timp real de pe MEXC:
+- **Order book imbalance** (`/api/v3/depth`): sunt mai mulți bani la cumpărare sau la vânzare lângă preț?
+- **Agresiunea tranzacțiilor** (`/api/v3/aggTrades`): cumpărătorii lovesc mai tare decât vânzătorii?
+
+Rezultatul (`buy` / `sell` / `neutru`) **confirmă sau intră în conflict** cu direcția semnalului. Opțional (`requireOfAgree`), aplicația nu alertează dacă order flow-ul contrazice direcția. ⚠️ Order flow-ul NU se poate backtesta (MEXC nu dă istoric), deci e o confirmare **live**, validată prin jurnal.
+
+## 🧠 Învățare din jurnal (se calibrează sesiune de sesiune)
+
+Aplicația învață din **rezultatele tale reale**, nu dintr-o cutie neagră. Pe măsură ce jurnalul se umple, calculează win-rate-ul pe dimensiuni (tip setup, oră, monedă+direcție, order flow) și:
+- **întărește** tiparele care îți câștigă (>55%)
+- **blochează** automat tiparele pe care istoricul tău le arată pierzătoare (< `learningSuppressBelow`, implicit 45%)
+
+Panoul „🧠 Ce a învățat" îți arată transparent ce merge și ce evită. **Are nevoie de minim ~10 semnale per tipar** înainte să acționeze — deci devine mai bună treptat, pe măsură ce tranzacționezi (pe demo întâi!). Nu inventează edge; optimizează în jurul celui real.
+
 ## ⚠️ Avertisment
 
 Tranzacționarea contractelor pe 10/30 min este **speculativă și riscantă**. Backtest-ul nu include comisioane/spread, iar rezultatele trecute **nu garantează** nimic în viitor. Folosește aplicația ca instrument de analiză, nu ca sfat financiar. Testează pe sume mici și verifică singur semnalele.

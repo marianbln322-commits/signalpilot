@@ -23,6 +23,8 @@ const engine = require('./lib/engine');
 const gemini = require('./lib/gemini');
 const backtest = require('./lib/backtest');
 const journal = require('./lib/journal');
+const orderflow = require('./lib/orderflow');
+const learning = require('./lib/learning');
 
 // Port 3001 by default so SignalPilot can run alongside PinPilot (which uses 3000).
 const PORT = process.env.PORT || 3001;
@@ -45,6 +47,12 @@ const DEFAULT_CONFIG = {
   payout10: 65,          // current MEXC payout % for 10-min contracts (user updates)
   payout30: 82,          // current MEXC payout % for 30-min contracts
   fallbackWinRate: 55,   // assumed win-rate when the journal has too few samples yet (sniper OOS ~55%)
+  // Live order flow (order book + trade aggression). Confirms/vetoes direction.
+  useOrderFlow: true,
+  requireOfAgree: false, // if true, only alert when order flow does NOT conflict
+  // Self-learning: calibrate from the user's own journal, session to session.
+  useLearning: true,
+  learningSuppressBelow: 45, // if learned estimate < this (%), suppress the alert
   gemini: { enabled: false, apiKey: '', model: 'gemini-3.5-flash' },
 };
 
@@ -131,6 +139,31 @@ async function scanSymbol(symbol) {
   const hourUTC = new Date().getUTCHours();
   verdict.sniper = engine.sniperEligibility(verdict, hourUTC, config.activeHoursUTC, config.sniperRequireVolume);
 
+  // Primary setup category (for learning + display).
+  verdict.setup = primarySetup(verdict);
+
+  // Live order flow (what a scalper reads): confirms or vetoes direction.
+  if (config.useOrderFlow) {
+    try {
+      const of = await orderflow.getOrderFlow(symbol);
+      verdict.orderflow = of;
+      verdict.ofAgree = orderflow.agreement(verdict.directie, of);
+    } catch (e) {
+      verdict.orderflowError = e.message;
+    }
+  }
+
+  // Self-learning: what does the user's own history say about this context?
+  if (config.useLearning) {
+    verdict.learned = learning.evaluate(journal.all(), {
+      symbol,
+      directie: verdict.directie,
+      setup: verdict.setup,
+      hourUTC,
+      ofAgree: verdict.ofAgree,
+    });
+  }
+
   const prev = latest[symbol];
   latest[symbol] = verdict;
   broadcast('signal', verdict);
@@ -147,6 +180,19 @@ async function scanSymbol(symbol) {
     const changed = !prev || prev.directie !== verdict.directie || prev.incredere !== verdict.incredere;
     shouldAlert = meetsConf && changed;
   }
+
+  // Order-flow veto: optionally require live order flow to not contradict.
+  if (shouldAlert && config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
+    shouldAlert = false;
+    verdict.suppressed = 'order flow în conflict cu direcția';
+  }
+  // Learning veto: suppress conditions the user's own history shows as losing.
+  if (shouldAlert && config.useLearning && verdict.learned && verdict.learned.ready &&
+      verdict.learned.estimate != null && verdict.learned.estimate < config.learningSuppressBelow) {
+    shouldAlert = false;
+    verdict.suppressed = `istoricul tău dă doar ${verdict.learned.estimate}% pe acest tipar`;
+  }
+
   if (shouldAlert) {
     const alert = {
       symbol,
@@ -156,17 +202,40 @@ async function scanSymbol(symbol) {
       price: verdict.price,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
+      ofState: verdict.orderflow ? verdict.orderflow.state : null,
+      ofAgree: verdict.ofAgree || null,
       ts: verdict.ts,
     };
     alerts.unshift(alert);
     if (alerts.length > 50) alerts.pop();
-    // Auto-journal every alert for hands-off forward testing.
-    const logged = journal.record({ ...alert });
+    // Auto-journal every alert with rich context for the learning layer.
+    const logged = journal.record({
+      ...alert,
+      setup: verdict.setup,
+      hourUTC,
+    });
     broadcast('alert', alert);
-    if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40) });
-    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} (${verdict.incredere}) @ ${verdict.price}`);
+    if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
+    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} (${verdict.incredere}) OF:${alert.ofAgree || '-'} @ ${verdict.price}`);
   }
   return verdict;
+}
+
+// Categorize the primary trigger of a verdict into a setup label.
+function primarySetup(verdict) {
+  const sig = (verdict.signals || []).find((s) => /sweep|squeeze|structure shift|fvg|divergen|crossover|absorb|distribu|reversie|band/i.test(s.label));
+  if (!sig) return 'context';
+  const l = sig.label.toLowerCase();
+  if (l.includes('sweep')) return 'Liquidity Sweep';
+  if (l.includes('squeeze')) return 'Squeeze breakout';
+  if (l.includes('structure shift')) return 'Market Structure Shift';
+  if (l.includes('ifvg')) return 'Inversion FVG';
+  if (l.includes('fvg')) return 'FVG retest';
+  if (l.includes('divergen')) return 'RSI divergence';
+  if (l.includes('crossover')) return 'MACD crossover';
+  if (l.includes('absorb') || l.includes('distribu')) return 'Volume absorption';
+  if (l.includes('reversie') || l.includes('band')) return 'Bollinger bounce';
+  return 'context';
 }
 
 // Background resolver: closes out pending journal entries automatically.
@@ -174,7 +243,7 @@ async function resolveJournal() {
   try {
     const resolved = await journal.resolvePending((sym) => mexc.fetchPrice(sym));
     if (resolved.length) {
-      broadcast('journal', { stats: journal.stats(), recent: journal.recent(40) });
+      broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
       for (const r of resolved) {
         console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice}->${r.exitPrice} => ${r.win ? 'WIN' : 'LOSS'}`);
       }
@@ -223,6 +292,7 @@ app.get('/api/state', (req, res) => {
     latest,
     alerts,
     journal: { stats: journal.stats(), recent: journal.recent(40) },
+    learning: learning.summary(journal.all()),
   });
 });
 
@@ -230,9 +300,13 @@ app.get('/api/journal', (req, res) => {
   res.json({ stats: journal.stats(), recent: journal.recent(100) });
 });
 
+app.get('/api/learning', (req, res) => {
+  res.json(learning.summary(journal.all()));
+});
+
 app.post('/api/journal/reset', (req, res) => {
   journal.reset();
-  broadcast('journal', { stats: journal.stats(), recent: journal.recent(40) });
+  broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
   res.json({ ok: true });
 });
 
@@ -274,6 +348,13 @@ app.post('/api/config', (req, res) => {
     config.activeHoursUTC = body.activeHoursUTC
       .map((h) => Number(h))
       .filter((h) => Number.isInteger(h) && h >= 0 && h <= 23);
+  }
+  if (typeof body.useOrderFlow === 'boolean') config.useOrderFlow = body.useOrderFlow;
+  if (typeof body.requireOfAgree === 'boolean') config.requireOfAgree = body.requireOfAgree;
+  if (typeof body.useLearning === 'boolean') config.useLearning = body.useLearning;
+  if (body.learningSuppressBelow != null) {
+    const v = Number(body.learningSuppressBelow);
+    if (v >= 30 && v <= 55) config.learningSuppressBelow = v;
   }
   if (body.gemini) {
     config.gemini.enabled = !!body.gemini.enabled;
@@ -319,7 +400,7 @@ app.get('/api/stream', (req, res) => {
   res.write('retry: 3000\n\n');
   sseClients.add(res);
   // Send current state immediately.
-  res.write(`event: snapshot\ndata: ${JSON.stringify({ latest, alerts, journal: { stats: journal.stats(), recent: journal.recent(40) } })}\n\n`);
+  res.write(`event: snapshot\ndata: ${JSON.stringify({ latest, alerts, journal: { stats: journal.stats(), recent: journal.recent(40) }, learning: learning.summary(journal.all()) })}\n\n`);
   const keepAlive = setInterval(() => {
     try { res.write(': ping\n\n'); } catch { /* noop */ }
   }, 15000);
