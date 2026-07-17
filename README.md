@@ -72,6 +72,19 @@ Concluzie onestă: **ETH ~55% e un edge subțire dar consistent; BTC nu a fost r
 3. Strânge **minim 30-50 de semnale** înainte de orice concluzie.
 4. Dacă win-rate-ul real ține peste ~55% → treci pe sume mici. Dacă nu → nu risca.
 
+## 💰 Alegerea intervalului după EV (payout)
+
+Contractele MEXC event-futures sunt binare: dacă îți iese, primești un **payout** (ex. +65% pe 10 min, +82% pe 30 min); dacă greșești, pierzi miza. Win-rate-ul necesar ca să fii pe zero e **`1 / (1 + payout)`**:
+
+| Payout | Win-rate necesar |
+|---|---|
+| 40% | 71.4% |
+| 65% | 60.6% |
+| 80% | 55.6% |
+| 85% | 54.1% |
+
+De aceea contează enorm ce fereastră alegi. Introdu în Setări payout-urile curente de pe MEXC (10 min și 30 min). Aplicația calculează **EV (valoarea așteptată)** pentru fiecare fereastră (folosind win-rate-ul din jurnal sau ~55% ca estimare inițială) și **alege automat fereastra cu EV mai bun** — exact ce făcea traderul când trecea de la 10 min (payout mic) la 30 min (payout 80-85%). Dacă payout-ul e prea mic pentru edge-ul tău (EV negativ), banner-ul te avertizează să **sari peste**.
+
 ## ⚠️ Avertisment
 
 Tranzacționarea contractelor pe 10/30 min este **speculativă și riscantă**. Backtest-ul nu include comisioane/spread, iar rezultatele trecute **nu garantează** nimic în viitor. Folosește aplicația ca instrument de analiză, nu ca sfat financiar. Testează pe sume mici și verifică singur semnalele.

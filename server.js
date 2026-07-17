@@ -36,11 +36,12 @@ const DEFAULT_CONFIG = {
   sniperMode: true,
   sniperRequireVolume: true,
   activeHoursUTC: [6, 7, 8, 9, 13, 14, 15, 16, 17],
-  // Adaptive interval: mirror the trader — when the recent 10-min win-rate
-  // degrades, shift new signals to the 30-min window (more time, less noise).
+  // EV-based interval selection (mirrors the trader): pick the window whose
+  // MEXC payout gives the best expected value. Break-even win-rate = 1/(1+payout).
   adaptiveInterval: true,
-  adaptive10minThreshold: 45, // if recent 10-min win-rate < this (%) => use 30-min
-  adaptiveMinSamples: 8,      // need at least this many resolved 10-min trades first
+  payout10: 65,          // current MEXC payout % for 10-min contracts (user updates)
+  payout30: 82,          // current MEXC payout % for 30-min contracts
+  fallbackWinRate: 55,   // assumed win-rate when the journal has too few samples yet (sniper OOS ~55%)
   gemini: { enabled: false, apiKey: '', model: 'gemini-3.5-flash' },
 };
 
@@ -83,14 +84,33 @@ async function scanSymbol(symbol) {
   const verdict = engine.decide(mtf);
   verdict.symbol = symbol;
 
-  // Adaptive interval: if recent 10-min trades are underperforming, push new
-  // 10-min signals to the 30-min window (exactly what the trader does).
-  if (config.adaptiveInterval && verdict.interval === '10 minute') {
-    const ten = journal.recentByInterval(20).tenMin;
-    if (ten.n >= config.adaptiveMinSamples && ten.winRate != null && ten.winRate < config.adaptive10minThreshold) {
-      verdict.interval = '30 minute';
-      verdict.intervalAdapted = { from: '10 minute', reason: `10 min recent la ${ten.winRate}% (< ${config.adaptive10minThreshold}%) → trec pe 30 min`, recent10: ten };
-    }
+  // EV-based interval selection: choose the window with the best expected value
+  // given MEXC payouts. This is what the trader did — avoid low-payout windows.
+  if (config.adaptiveInterval && verdict.directie !== 'NEUTRU') {
+    const ji = journal.recentByInterval(20);
+    const wr10 = (ji.tenMin.n >= 8 && ji.tenMin.winRate != null) ? ji.tenMin.winRate : config.fallbackWinRate;
+    const wr30 = (ji.thirtyMin.n >= 8 && ji.thirtyMin.winRate != null) ? ji.thirtyMin.winRate : config.fallbackWinRate;
+    const p10 = config.payout10 / 100;
+    const p30 = config.payout30 / 100;
+    const evOf = (wr, p) => (wr / 100) * p - (1 - wr / 100); // per $1 staked
+    const ev10 = evOf(wr10, p10);
+    const ev30 = evOf(wr30, p30);
+    const breakEven = (p) => +(100 / (1 + p)).toFixed(1);
+    const chosen = ev30 >= ev10 ? '30 minute' : '10 minute';
+    const chosenEv = chosen === '30 minute' ? ev30 : ev10;
+    verdict.interval = chosen;
+    verdict.ev = {
+      payout10: config.payout10,
+      payout30: config.payout30,
+      breakEven10: breakEven(p10),
+      breakEven30: breakEven(p30),
+      wr10,
+      wr30,
+      ev10: +(ev10 * 100).toFixed(1),
+      ev30: +(ev30 * 100).toFixed(1),
+      chosen,
+      positive: chosenEv > 0,
+    };
   }
 
   // Optional Gemini narration (numbers only, never an image).
@@ -235,9 +255,17 @@ app.post('/api/config', (req, res) => {
   if (typeof body.sniperMode === 'boolean') config.sniperMode = body.sniperMode;
   if (typeof body.sniperRequireVolume === 'boolean') config.sniperRequireVolume = body.sniperRequireVolume;
   if (typeof body.adaptiveInterval === 'boolean') config.adaptiveInterval = body.adaptiveInterval;
-  if (body.adaptive10minThreshold != null) {
-    const t = Number(body.adaptive10minThreshold);
-    if (t >= 30 && t <= 60) config.adaptive10minThreshold = t;
+  if (body.payout10 != null) {
+    const v = Number(body.payout10);
+    if (v > 0 && v <= 500) config.payout10 = v;
+  }
+  if (body.payout30 != null) {
+    const v = Number(body.payout30);
+    if (v > 0 && v <= 500) config.payout30 = v;
+  }
+  if (body.fallbackWinRate != null) {
+    const v = Number(body.fallbackWinRate);
+    if (v >= 40 && v <= 70) config.fallbackWinRate = v;
   }
   if (Array.isArray(body.activeHoursUTC)) {
     config.activeHoursUTC = body.activeHoursUTC

@@ -91,12 +91,14 @@ ETHUSDT</textarea>
           </div>
           <div class="grid" style="margin-top:12px">
             <div class="field">
-              <label class="switch-inline"><input type="checkbox" id="adaptiveInterval" checked /> <b>Interval adaptiv</b> — trece pe 30 min când 10 min merge prost (ca traderul)</label>
-              <small class="muted">Comută automat semnalele de 10 min pe 30 min când win-rate-ul recent pe 10 min scade sub pragul de mai jos, și revine când 10 min își revine.</small>
+              <label class="switch-inline"><input type="checkbox" id="adaptiveInterval" checked /> <b>Alegere interval după EV (payout)</b> — alege 10 vs 30 min după valoarea așteptată, ca traderul</label>
+              <small class="muted">Introdu payout-ul curent de pe MEXC. Aplicația calculează win-rate-ul necesar (break-even = 1/(1+payout)) și alege fereastra cu EV mai bun. Te avertizează dacă payout-ul e prea mic pentru edge-ul tău.</small>
             </div>
             <div class="field">
-              <label>Prag win-rate 10 min (%) sub care trec pe 30 min</label>
-              <input type="number" id="adaptive10minThreshold" min="30" max="60" value="45" />
+              <label>Payout MEXC pe 10 min (%)</label>
+              <input type="number" id="payout10" min="1" max="500" value="65" />
+              <label>Payout MEXC pe 30 min (%)</label>
+              <input type="number" id="payout30" min="1" max="500" value="82" />
           </div>
         </div>
         <hr />

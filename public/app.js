@@ -43,14 +43,19 @@ function renderCard(v) {
     : (v.aiError ? `<div class="ai-note">🤖 AI indisponibil: ${v.aiError}</div>` : '');
 
   // The BIG banner: the only thing you act on. Sniper Mode = trade only on 🎯.
-  const adapt = v.intervalAdapted ? ' · 🔄 adaptat 10→30' : '';
+  const ev = v.ev;
+  const payoutNow = ev ? (v.interval === '10 minute' ? ev.payout10 : ev.payout30) : null;
+  const beNow = ev ? (v.interval === '10 minute' ? ev.breakEven10 : ev.breakEven30) : null;
+  const evWarn = ev && !ev.positive;
+  const evNote = ev ? ` · payout ${payoutNow}% (break-even ${beNow}%)` : '';
+  const warnLine = evWarn ? `<div class="ev-warn">⚠️ payout prea mic pentru edge-ul tău — EV negativ, mai bine sari peste</div>` : '';
   let banner;
   if (SNIPER_MODE) {
     banner = eligible
-      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">pe MEXC event futures · fereastră ${v.interval}${adapt}</div></div>`
+      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${warnLine}`
       : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
   } else {
-    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${adapt} · încredere ${v.incredere}</div></div>`;
+    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`;
   }
 
   return `
@@ -66,6 +71,7 @@ function renderCard(v) {
         <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
         <b>Justificare</b><span>${v.justificare}</span>
         <b>Invalidare</b><span>${v.invalidare}</span>
+        ${ev ? `<b>EV / fereastră</b><span>10 min: <span class="${ev.ev10 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev10 > 0 ? '+' : ''}${ev.ev10}%</span> (payout ${ev.payout10}%, nevoie ${ev.breakEven10}%) · 30 min: <span class="${ev.ev30 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev30 > 0 ? '+' : ''}${ev.ev30}%</span> (payout ${ev.payout30}%, nevoie ${ev.breakEven30}%)</span>` : ''}
       </div>
       ${sigs ? `<ul class="sig-list">${sigs}</ul>` : ''}
       ${ai}
@@ -226,7 +232,8 @@ async function loadState() {
   $('sniperMode').checked = c.sniperMode !== false;
   $('sniperRequireVolume').checked = c.sniperRequireVolume !== false;
   $('adaptiveInterval').checked = c.adaptiveInterval !== false;
-  if (c.adaptive10minThreshold) $('adaptive10minThreshold').value = c.adaptive10minThreshold;
+  if (c.payout10) $('payout10').value = c.payout10;
+  if (c.payout30) $('payout30').value = c.payout30;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -252,7 +259,8 @@ async function saveSettings() {
     sniperMode: $('sniperMode').checked,
     sniperRequireVolume: $('sniperRequireVolume').checked,
     adaptiveInterval: $('adaptiveInterval').checked,
-    adaptive10minThreshold: Number($('adaptive10minThreshold').value),
+    payout10: Number($('payout10').value),
+    payout30: Number($('payout30').value),
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,
