@@ -101,8 +101,8 @@ ETHUSDT</textarea>
           </div>
           <div class="grid" style="margin-top:12px">
             <div class="field">
-              <label class="switch-inline"><input type="checkbox" id="adaptiveInterval" checked /> <b>Alegere interval după EV (payout)</b> — alege 10 vs 30 min după valoarea așteptată, ca traderul</label>
-              <small class="muted">Introdu payout-ul curent de pe MEXC. Aplicația calculează win-rate-ul necesar (break-even = 1/(1+payout)) și alege fereastra cu EV mai bun. Te avertizează dacă payout-ul e prea mic pentru edge-ul tău.</small>
+              <label class="switch-inline"><input type="checkbox" id="adaptiveInterval" /> <b>Comută 10→30 min când payout-ul pe 10 min e slab</b> (opțional)</label>
+              <small class="muted">Intervalul e ales natural de tipul setup-ului (sweep rapid → 10 min, structură → 30 min), deci apar AMBELE. Payout-ul de mai jos e afișat mereu ca informație. Bifează asta doar dacă vrei ca aplicația să treacă singură pe 30 min când 10 min are payout prost.</small>
             </div>
             <div class="field">
               <label>Payout MEXC pe 10 min (%)</label>

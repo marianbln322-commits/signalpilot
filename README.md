@@ -19,8 +19,10 @@ npm install
 npm start
 ```
 
-Apoi deschide în browser: **http://localhost:3002**
-(Portul 3002 e ales ca să ruleze în paralel cu PinPilot (3000) și o versiune mai veche de SignalPilot (3001). Poți schimba portul cu variabila de mediu PORT.)
+Apoi deschide în browser: **http://localhost:3005**
+(Portul 3005 e ales ca să ruleze în paralel cu PinPilot (3004) și versiuni mai vechi de SignalPilot. Poți schimba portul cu variabila de mediu PORT.)
+
+Intervalul (10 vs 30 min) e ales automat după tipul setup-ului: sweep/momentum rapid → **10 min**, structură (FVG, trend) → **30 min**. Deci apar ambele. Payout-ul introdus în Setări e folosit pentru a afișa EV-ul (valoarea așteptată) și, opțional, pentru a comuta 10→30 când payout-ul pe 10 min e slab.
 Ca să oprești: închide fereastra / `Ctrl+C`.
 
 Pe Windows poți da dublu-click pe **`start.bat`**.

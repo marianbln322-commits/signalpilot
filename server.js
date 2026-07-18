@@ -2,7 +2,7 @@
 
 // ============================================================================
 // SignalPilot server — always-on local app (PinPilot style).
-// Serves the UI at http://localhost:3002, polls MEXC, runs the engine on a
+// Serves the UI at http://localhost:3005, polls MEXC, runs the engine on a
 // scheduler, pushes live updates over SSE, and alerts on good setups.
 // ============================================================================
 
@@ -26,9 +26,9 @@ const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
 
-// Port 3002 by default so this version runs alongside PinPilot (3000) and an
-// older SignalPilot (3001). Override with the PORT env var if needed.
-const PORT = process.env.PORT || 3002;
+// Port 3005 by default so it runs alongside PinPilot (3004) and older
+// SignalPilot versions (3001/3002). Override with the PORT env var if needed.
+const PORT = process.env.PORT || 3005;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const DEFAULT_CONFIG = {
   symbols: ['BTCUSDT', 'ETHUSDT'],
@@ -42,9 +42,10 @@ const DEFAULT_CONFIG = {
   // robustly help out-of-sample. Turn ON for a stricter ~4-5/day.
   sniperRequireVolume: false,
   activeHoursUTC: [6, 7, 8, 9, 13, 14, 15, 16, 17],
-  // EV-based interval selection (mirrors the trader): pick the window whose
-  // MEXC payout gives the best expected value. Break-even win-rate = 1/(1+payout).
-  adaptiveInterval: true,
+  // Interval is decided by the setup type (fast -> 10 min, structural -> 30 min).
+  // adaptiveInterval (optional, OFF by default) only nudges 10 -> 30 when the
+  // 10-min payout is too poor. Payout/EV is always shown as info either way.
+  adaptiveInterval: false,
   payout10: 65,          // current MEXC payout % for 10-min contracts (user updates)
   payout30: 82,          // current MEXC payout % for 30-min contracts
   fallbackWinRate: 55,   // assumed win-rate when the journal has too few samples yet (sniper OOS ~55%)
@@ -96,9 +97,11 @@ async function scanSymbol(symbol) {
   const verdict = engine.decide(mtf);
   verdict.symbol = symbol;
 
-  // EV-based interval selection: choose the window with the best expected value
-  // given MEXC payouts. This is what the trader did — avoid low-payout windows.
-  if (config.adaptiveInterval && verdict.directie !== 'NEUTRU') {
+  // Interval = the setup's NATURAL window (fast momentum like sweeps -> 10 min,
+  // structural setups -> 30 min). Payout/EV is shown as INFO, and only used to
+  // adapt 10 -> 30 when adaptiveInterval is ON and the 10-min payout is poor.
+  // This keeps BOTH 10-min and 30-min signals instead of forcing everything 30.
+  if (verdict.directie !== 'NEUTRU') {
     const ji = journal.recentByInterval(20);
     const wr10 = (ji.tenMin.n >= 8 && ji.tenMin.winRate != null) ? ji.tenMin.winRate : config.fallbackWinRate;
     const wr30 = (ji.thirtyMin.n >= 8 && ji.thirtyMin.winRate != null) ? ji.thirtyMin.winRate : config.fallbackWinRate;
@@ -108,9 +111,18 @@ async function scanSymbol(symbol) {
     const ev10 = evOf(wr10, p10);
     const ev30 = evOf(wr30, p30);
     const breakEven = (p) => +(100 / (1 + p)).toFixed(1);
-    const chosen = ev30 >= ev10 ? '30 minute' : '10 minute';
-    const chosenEv = chosen === '30 minute' ? ev30 : ev10;
+
+    const natural = verdict.interval; // set by engine from setup type
+    let chosen = natural;
+    // Optional trader-style adaptation: only nudge 10 -> 30 when 10-min EV is
+    // negative but 30-min is meaningfully better. Off by default.
+    if (config.adaptiveInterval && natural === '10 minute' && ev10 < 0 && ev30 > ev10) {
+      chosen = '30 minute';
+      verdict.intervalAdapted = { from: '10 minute', reason: `payout 10 min slab (EV ${(ev10 * 100).toFixed(1)}%) → 30 min` };
+    }
     verdict.interval = chosen;
+
+    const chosenEv = chosen === '30 minute' ? ev30 : ev10;
     verdict.ev = {
       payout10: config.payout10,
       payout30: config.payout30,
