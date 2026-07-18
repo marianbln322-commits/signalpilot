@@ -95,6 +95,11 @@ Pe lângă lumânări, aplicația citește în timp real de pe MEXC:
 
 Rezultatul (`buy` / `sell` / `neutru`) **confirmă sau intră în conflict** cu direcția semnalului. Opțional (`requireOfAgree`), aplicația nu alertează dacă order flow-ul contrazice direcția. ⚠️ Order flow-ul NU se poate backtesta (MEXC nu dă istoric), deci e o confirmare **live**, validată prin jurnal.
 
+## 📐 VWAP + aliniere cu trendul 1h
+
+- **VWAP** (Volume-Weighted Average Price): ancora „valorii corecte" pe care o urmăresc scalperii. Preț peste VWAP în urcare = bias bullish; sub VWAP în coborâre = bias bearish.
+- **Aliniere cu trendul de 1 oră**: aplicația citește și graficul de 60m și favorizează semnalele care merg în sensul trendului mare (trade with the trend).
+
 ## 🧠 Învățare din jurnal (se calibrează sesiune de sesiune)
 
 Aplicația învață din **rezultatele tale reale**, nu dintr-o cutie neagră. Pe măsură ce jurnalul se umple, calculează win-rate-ul pe dimensiuni (tip setup, oră, monedă+direcție, order flow) și:
@@ -102,6 +107,8 @@ Aplicația învață din **rezultatele tale reale**, nu dintr-o cutie neagră. P
 - **blochează** automat tiparele pe care istoricul tău le arată pierzătoare (< `learningSuppressBelow`, implicit 45%)
 
 Panoul „🧠 Ce a învățat" îți arată transparent ce merge și ce evită. **Are nevoie de minim ~10 semnale per tipar** înainte să acționeze — deci devine mai bună treptat, pe măsură ce tranzacționezi (pe demo întâi!). Nu inventează edge; optimizează în jurul celui real.
+
+**Învățare non-stop:** cât timp aplicația e deschisă, înregistrează în fundal o „observație" per lumânare per monedă (chiar și fără alertă) și îi verifică singură rezultatul. Așa învață continuu despre ETH/USDT și BTC/USDT, 24/7, chiar dacă nu tranzacționezi. Observațiile alimentează învățarea, dar NU apar în lista ta de tranzacții (care rămâne doar cu alerte reale). Jurnalul persistă în `journal.json`, deci progresul nu se pierde la repornire.
 
 ## ⚠️ Avertisment
 

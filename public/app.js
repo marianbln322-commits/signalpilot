@@ -10,6 +10,7 @@ let cards = {}; // symbol -> element
 let soundOn = true;
 let SNIPER_MODE = true; // set from server config on load
 let ACTIVE_HOURS = [6, 7, 8, 9, 13, 14, 15, 16, 17]; // UTC, set from config
+const detailsOpen = {}; // per-symbol: keep the analysis panel open across live re-renders
 
 function updateSessionBadge() {
   const nowUtc = new Date().getUTCHours();
@@ -51,6 +52,7 @@ function snapChips(snaps) {
     if (s.fvgRetest) parts.push(`<span>${tf} · FVG ${s.fvgRetest}</span>`);
     if (s.divergence) parts.push(`<span>${tf} · div ${s.divergence}</span>`);
     if (s.squeeze) parts.push(`<span>${tf} · squeeze</span>`);
+    if (s.aboveVwap != null) parts.push(`<span>${tf} · ${s.aboveVwap ? 'peste' : 'sub'} VWAP</span>`);
   }
   return parts.join('');
 }
@@ -66,6 +68,10 @@ function ofRow(v) {
   if (v.learned && v.learned.ready) {
     const cls = v.learned.estimate >= 55 ? 'ok' : (v.learned.estimate < 48 ? 'bad' : '');
     parts.push(`<span title="estimare din istoricul tău">🧠 istoric: <span class="${cls}">${v.learned.estimate}%</span></span>`);
+  }
+  if (v.htfTrend) {
+    const up = v.htfTrend === 'up';
+    parts.push(`<span title="trendul pe 1 oră">Trend 1h: <b class="${up ? 'ok' : 'bad'}">${up ? '↗ ascendent' : '↘ descendent'}</b></span>`);
   }
   if (v.suppressed) parts.push(`<span class="bad">⛔ blocat: ${v.suppressed}</span>`);
   if (!parts.length) return '';
@@ -103,8 +109,8 @@ function renderCard(v) {
     </div>
     ${banner}
     ${ofRow(v)}
-    <details class="analysis">
-      <summary>Analiza motorului (context, nu semnal de intrare)</summary>
+    <details class="analysis" data-sym="${v.symbol}" ${detailsOpen[v.symbol] ? 'open' : ''}>
+      <summary>Analiza motorului în timp real (context, nu semnal de intrare)</summary>
       <div class="row5">
         <b>Direcție motor</b><span class="dir-inline ${dir}">${v.directie} · ${v.interval}</span>
         <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
@@ -130,6 +136,11 @@ function upsertCard(v) {
   }
   el.className = 'card ' + v.directie.toLowerCase();
   el.innerHTML = renderCard(v);
+  // Persist the analysis panel's open/closed state across live re-renders.
+  const det = el.querySelector('details.analysis');
+  if (det) {
+    det.addEventListener('toggle', () => { detailsOpen[v.symbol] = det.open; });
+  }
 }
 
 function addAlert(a) {

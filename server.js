@@ -93,7 +93,7 @@ function broadcast(event, data) {
 
 // ---- Core scan for one symbol ----------------------------------------------
 async function scanSymbol(symbol) {
-  const mtf = await mexc.fetchMultiTimeframe(symbol, ['5m', '15m'], 200);
+  const mtf = await mexc.fetchMultiTimeframe(symbol, ['5m', '15m', '60m'], 200);
   const verdict = engine.decide(mtf);
   verdict.symbol = symbol;
 
@@ -175,6 +175,32 @@ async function scanSymbol(symbol) {
       hourUTC,
       ofAgree: verdict.ofAgree,
     });
+  }
+
+  // Continuous learning: log one observation per 5m candle per symbol (even when
+  // no alert fires) so the software keeps learning about ETH/BTC 24/7. These are
+  // resolved automatically and feed the learning layer, but stay out of the
+  // trade journal display.
+  if (config.useLearning && verdict.directie !== 'NEUTRU') {
+    try {
+      const c5 = mtf['5m'];
+      const candleOpen = c5[c5.length - 1].openTime;
+      journal.record({
+        observation: true,
+        candleOpen,
+        symbol,
+        directie: verdict.directie,
+        interval: verdict.interval,
+        incredere: verdict.incredere,
+        sniper: false,
+        setup: verdict.setup,
+        hourUTC,
+        ofState: verdict.orderflow ? verdict.orderflow.state : null,
+        ofAgree: verdict.ofAgree,
+        price: verdict.price,
+        ts: verdict.ts,
+      });
+    } catch { /* non-fatal */ }
   }
 
   const prev = latest[symbol];
