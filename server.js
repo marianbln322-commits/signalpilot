@@ -450,18 +450,36 @@ app.get('/api/stream', (req, res) => {
 });
 
 // ---- Boot -------------------------------------------------------------------
-app.listen(PORT, async () => {
-  console.log('====================================================');
-  console.log('  SignalPilot — MEXC live UP/DOWN engine');
-  console.log('====================================================');
-  console.log(`  Running at http://localhost:${PORT}`);
-  console.log(`  AI (Gemini): ${config.gemini.enabled && config.gemini.apiKey ? 'ENABLED' : 'disabled'}`);
-  console.log(`  Symbols: ${config.symbols.join(', ')}`);
-  console.log('  (Deschide singur in browser? Acceseaza linkul de mai sus.)');
-  console.log('====================================================');
-  const ok = await mexc.ping().catch(() => false);
-  console.log(ok ? '  MEXC reachable: OK' : '  WARNING: MEXC not reachable from this machine.');
-  startScheduler();
-  startResolver();
-  if (process.env.NO_OPEN !== '1') openBrowser(`http://localhost:${PORT}`);
-});
+// Start on PORT, but if it's already in use (another window open), automatically
+// try the next port instead of crashing. This makes double-clicking safe.
+function startServer(port, attemptsLeft) {
+  const server = app.listen(port, async () => {
+    console.log('====================================================');
+    console.log('  SignalPilot — MEXC live UP/DOWN engine');
+    console.log('====================================================');
+    console.log(`  Running at http://localhost:${port}`);
+    console.log(`  AI (Gemini): ${config.gemini.enabled && config.gemini.apiKey ? 'ENABLED' : 'disabled'}`);
+    console.log(`  Symbols: ${config.symbols.join(', ')}`);
+    console.log('  (Se deschide singur in browser. Ca sa opresti: inchide fereastra.)');
+    console.log('====================================================');
+    const ok = await mexc.ping().catch(() => false);
+    console.log(ok ? '  MEXC reachable: OK' : '  WARNING: MEXC not reachable from this machine.');
+    startScheduler();
+    startResolver();
+    if (process.env.NO_OPEN !== '1') openBrowser(`http://localhost:${port}`);
+  });
+  server.on('error', (err) => {
+    if (err.code === 'EADDRINUSE' && attemptsLeft > 0) {
+      console.log(`  Portul ${port} e deja folosit (alta fereastra SignalPilot?). Incerc ${port + 1}...`);
+      startServer(port + 1, attemptsLeft - 1);
+    } else if (err.code === 'EADDRINUSE') {
+      console.error(`\n  Toate porturile ${PORT}-${port} sunt ocupate.`);
+      console.error('  Inchide celelalte ferestre SignalPilot si porneste din nou.\n');
+      process.exit(1);
+    } else {
+      console.error('  Nu pot porni serverul:', err.message);
+      process.exit(1);
+    }
+  });
+}
+startServer(PORT, 10);
