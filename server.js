@@ -24,7 +24,11 @@ const gemini = require('./lib/gemini');
 const backtest = require('./lib/backtest');
 const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
+const derivatives = require('./lib/derivatives');
 const learning = require('./lib/learning');
+
+const POLICY_VERSION = '2.1-closed-bar';
+const ENGINE_WINDOW = 199;
 
 // Port 3005 by default so it runs alongside PinPilot (3004) and older
 // SignalPilot versions (3001/3002). Override with the PORT env var if needed.
@@ -52,9 +56,12 @@ const DEFAULT_CONFIG = {
   // Live order flow (order book + trade aggression). Confirms/vetoes direction.
   useOrderFlow: true,
   requireOfAgree: false, // if true, only alert when order flow does NOT conflict
+  useDerivatives: true,  // record funding/OI/basis for forward calibration; no heuristic score
+  requirePositiveEv: true,
+  evSafetyMarginPct: 1,
   // Self-learning: calibrate from the user's own journal, session to session.
   useLearning: true,
-  learningSuppressBelow: 45, // if learned estimate < this (%), suppress the alert
+  learningSuppressBelow: 45, // suppress only when the 95% upper bound is below this
   gemini: { enabled: false, apiKey: '', model: 'gemini-3.5-flash' },
 };
 
@@ -92,19 +99,41 @@ function broadcast(event, data) {
 }
 
 // ---- Core scan for one symbol ----------------------------------------------
-async function scanSymbol(symbol) {
-  const mtf = await mexc.fetchMultiTimeframe(symbol, ['5m', '15m', '60m'], 200);
+async function scanSymbol(symbol, opts = {}) {
+  const sideEffects = opts.sideEffects !== false;
+  const now = Date.now();
+  const [rawMtf, livePrice, derivativeContext] = await Promise.all([
+    mexc.fetchMultiTimeframe(symbol, ['5m', '15m', '60m'], 200),
+    mexc.fetchPrice(symbol).catch(() => null),
+    config.useDerivatives ? derivatives.getDerivativesContext(symbol).catch(() => null) : Promise.resolve(null),
+  ]);
+  const tf5 = mexc.closedCandles(rawMtf['5m'], now).slice(-ENGINE_WINDOW);
+  if (tf5.length < 60) throw new Error(`Nu sunt suficiente lumânări 5m închise pentru ${symbol}`);
+  const decisionTs = tf5.at(-1).closeTime;
+  const mtf = {
+    '5m': tf5,
+    '15m': mexc.closedCandles(rawMtf['15m'], now).filter((c) => c.closeTime <= decisionTs).slice(-ENGINE_WINDOW),
+    '60m': mexc.closedCandles(rawMtf['60m'], now).filter((c) => c.closeTime <= decisionTs).slice(-ENGINE_WINDOW),
+  };
   const verdict = engine.decide(mtf);
   verdict.symbol = symbol;
+  verdict.analysisPrice = verdict.price;
+  verdict.marketPrice = Number.isFinite(livePrice) ? livePrice : null;
+  verdict.derivatives = derivativeContext;
+  verdict.policyVersion = POLICY_VERSION;
 
   // Interval = the setup's NATURAL window (fast momentum like sweeps -> 10 min,
   // structural setups -> 30 min). Payout/EV is shown as INFO, and only used to
   // adapt 10 -> 30 when adaptiveInterval is ON and the 10-min payout is poor.
   // This keeps BOTH 10-min and 30-min signals instead of forcing everything 30.
   if (verdict.directie !== 'NEUTRU') {
-    const ji = journal.recentByInterval(20);
-    const wr10 = (ji.tenMin.n >= 8 && ji.tenMin.winRate != null) ? ji.tenMin.winRate : config.fallbackWinRate;
-    const wr30 = (ji.thirtyMin.n >= 8 && ji.thirtyMin.winRate != null) ? ji.thirtyMin.winRate : config.fallbackWinRate;
+    // Observations bootstrap calibration; an EV veto is not enforced until the
+    // selected horizon has at least 20 resolved, deduplicated samples.
+    const ji = journal.recentByInterval(20, false, POLICY_VERSION);
+    const ready10 = ji.tenMin.n >= 20 && ji.tenMin.winRate != null;
+    const ready30 = ji.thirtyMin.n >= 20 && ji.thirtyMin.winRate != null;
+    const wr10 = ready10 ? ji.tenMin.winRate : config.fallbackWinRate;
+    const wr30 = ready30 ? ji.thirtyMin.winRate : config.fallbackWinRate;
     const p10 = config.payout10 / 100;
     const p30 = config.payout30 / 100;
     const evOf = (wr, p) => (wr / 100) * p - (1 - wr / 100); // per $1 staked
@@ -116,13 +145,14 @@ async function scanSymbol(symbol) {
     let chosen = natural;
     // Optional trader-style adaptation: only nudge 10 -> 30 when 10-min EV is
     // negative but 30-min is meaningfully better. Off by default.
-    if (config.adaptiveInterval && natural === '10 minute' && ev10 < 0 && ev30 > ev10) {
+    if (config.adaptiveInterval && ready10 && ready30 && natural === '10 minute' && ev10 < 0 && ev30 > ev10) {
       chosen = '30 minute';
       verdict.intervalAdapted = { from: '10 minute', reason: `payout 10 min slab (EV ${(ev10 * 100).toFixed(1)}%) → 30 min` };
     }
     verdict.interval = chosen;
 
     const chosenEv = chosen === '30 minute' ? ev30 : ev10;
+    const chosenReady = chosen === '30 minute' ? ready30 : ready10;
     verdict.ev = {
       payout10: config.payout10,
       payout30: config.payout30,
@@ -130,15 +160,20 @@ async function scanSymbol(symbol) {
       breakEven30: breakEven(p30),
       wr10,
       wr30,
+      sample10: ji.tenMin.n,
+      sample30: ji.thirtyMin.n,
+      ready10,
+      ready30,
       ev10: +(ev10 * 100).toFixed(1),
       ev30: +(ev30 * 100).toFixed(1),
       chosen,
-      positive: chosenEv > 0,
+      ready: chosenReady,
+      positive: chosenReady ? chosenEv > 0 : null,
     };
   }
 
   // Optional Gemini narration (numbers only, never an image).
-  if (config.gemini && config.gemini.enabled && config.gemini.apiKey && verdict.directie !== 'NEUTRU') {
+  if (sideEffects && config.gemini && config.gemini.enabled && config.gemini.apiKey && verdict.directie !== 'NEUTRU') {
     const ai = await gemini.narrate(symbol, verdict, config.gemini);
     if (ai.used) {
       verdict.ai = { justificare: ai.justificare, acord: ai.acord, risc: ai.risc, comentariu: ai.comentariu };
@@ -148,8 +183,8 @@ async function scanSymbol(symbol) {
     }
   }
 
-  // Sniper eligibility (uses live UTC hour).
-  const hourUTC = new Date().getUTCHours();
+  // Use the closed decision candle consistently in live and replay.
+  const hourUTC = new Date(verdict.decisionCandleTs ?? Date.now()).getUTCHours();
   verdict.sniper = engine.sniperEligibility(verdict, hourUTC, config.activeHoursUTC, config.sniperRequireVolume);
 
   // Primary setup category (for learning + display).
@@ -172,22 +207,22 @@ async function scanSymbol(symbol) {
       symbol,
       directie: verdict.directie,
       setup: verdict.setup,
+      interval: verdict.interval,
+      policyVersion: POLICY_VERSION,
       hourUTC,
       ofAgree: verdict.ofAgree,
     });
   }
 
-  // Continuous learning: log one observation per 5m candle per symbol (even when
-  // no alert fires) so the software keeps learning about ETH/BTC 24/7. These are
-  // resolved automatically and feed the learning layer, but stay out of the
-  // trade journal display.
-  if (config.useLearning && verdict.directie !== 'NEUTRU') {
+  // Continuous learning: log one observation per closed 5m decision candle.
+  if (sideEffects && config.useLearning && verdict.directie !== 'NEUTRU') {
     try {
       const c5 = mtf['5m'];
-      const candleOpen = c5[c5.length - 1].openTime;
+      const decisionCandleTs = c5.at(-1).closeTime;
       journal.record({
         observation: true,
-        candleOpen,
+        decisionCandleTs,
+        expiryTs: decisionCandleTs + (verdict.interval === '10 minute' ? 10 : 30) * 60 * 1000,
         symbol,
         directie: verdict.directie,
         interval: verdict.interval,
@@ -197,6 +232,10 @@ async function scanSymbol(symbol) {
         hourUTC,
         ofState: verdict.orderflow ? verdict.orderflow.state : null,
         ofAgree: verdict.ofAgree,
+        orderflow: verdict.orderflow || null,
+        derivatives: verdict.derivatives || null,
+        payout: verdict.interval === '10 minute' ? config.payout10 : config.payout30,
+        policyVersion: POLICY_VERSION,
         price: verdict.price,
         ts: verdict.ts,
       });
@@ -204,58 +243,76 @@ async function scanSymbol(symbol) {
   }
 
   const prev = latest[symbol];
-  latest[symbol] = verdict;
-  broadcast('signal', verdict);
 
-  // Alert logic depends on mode.
-  let shouldAlert;
+  // Current policy eligibility is separate from the edge-triggered notification.
+  // The UI acts on `actionable`; alerts fire only when that state turns on.
+  let policyEligible;
   if (config.sniperMode) {
-    // Only the A+ setup fires an alert.
-    const wasEligible = prev && prev.sniper && prev.sniper.eligible;
-    shouldAlert = verdict.sniper.eligible && (!wasEligible || prev.directie !== verdict.directie);
+    policyEligible = verdict.sniper.eligible;
   } else {
-    const meetsConf = verdict.directie !== 'NEUTRU' &&
+    policyEligible = verdict.directie !== 'NEUTRU' &&
       CONF_RANK[verdict.incredere] >= CONF_RANK[config.alertMinConfidence];
-    const changed = !prev || prev.directie !== verdict.directie || prev.incredere !== verdict.incredere;
-    shouldAlert = meetsConf && changed;
   }
 
-  // Order-flow veto: optionally require live order flow to not contradict.
-  if (shouldAlert && config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
-    shouldAlert = false;
+  if (policyEligible && config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
+    policyEligible = false;
     verdict.suppressed = 'order flow în conflict cu direcția';
   }
-  // Learning veto: suppress conditions the user's own history shows as losing.
-  if (shouldAlert && config.useLearning && verdict.learned && verdict.learned.ready &&
-      verdict.learned.estimate != null && verdict.learned.estimate < config.learningSuppressBelow) {
-    shouldAlert = false;
-    verdict.suppressed = `istoricul tău dă doar ${verdict.learned.estimate}% pe acest tipar`;
+  if (policyEligible && config.requirePositiveEv && verdict.ev?.ready &&
+      (verdict.interval === '10 minute' ? verdict.ev.ev10 : verdict.ev.ev30) <= config.evSafetyMarginPct) {
+    policyEligible = false;
+    verdict.suppressed = `EV sub marja minimă de ${config.evSafetyMarginPct}%`;
+  }
+  if (policyEligible && config.useLearning && verdict.learned?.ready &&
+      verdict.learned.upper != null && verdict.learned.upper < config.learningSuppressBelow) {
+    policyEligible = false;
+    verdict.suppressed = `cohorta comparabilă are limita superioară doar ${verdict.learned.upper}%`;
+  }
+
+  verdict.actionable = policyEligible;
+  const shouldAlert = sideEffects && policyEligible &&
+    (!prev?.actionable || prev.directie !== verdict.directie || prev.interval !== verdict.interval);
+  if (sideEffects) {
+    latest[symbol] = verdict;
+    broadcast('signal', verdict);
   }
 
   if (shouldAlert) {
+    const alertTs = Date.now();
+    const alertPrice = await mexc.fetchPrice(symbol).catch(() => verdict.marketPrice ?? verdict.price);
+    const horizonMs = (verdict.interval === '10 minute' ? 10 : 30) * 60 * 1000;
     const alert = {
       symbol,
       directie: verdict.directie,
       interval: verdict.interval,
       incredere: verdict.incredere,
-      price: verdict.price,
+      price: alertPrice,
+      signalReferencePrice: verdict.price,
+      signalExpiryTs: verdict.decisionCandleTs + horizonMs,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
       ofState: verdict.orderflow ? verdict.orderflow.state : null,
       ofAgree: verdict.ofAgree || null,
-      ts: verdict.ts,
+      orderflow: verdict.orderflow || null,
+      derivatives: verdict.derivatives || null,
+      decisionCandleTs: verdict.decisionCandleTs,
+      expiryTs: alertTs + horizonMs,
+      payout: verdict.interval === '10 minute' ? config.payout10 : config.payout30,
+      policyVersion: POLICY_VERSION,
+      ts: alertTs,
     };
-    alerts.unshift(alert);
-    if (alerts.length > 50) alerts.pop();
-    // Auto-journal every alert with rich context for the learning layer.
     const logged = journal.record({
       ...alert,
       setup: verdict.setup,
       hourUTC,
     });
-    broadcast('alert', alert);
-    if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
-    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} (${verdict.incredere}) OF:${alert.ofAgree || '-'} @ ${verdict.price}`);
+    if (!logged.alreadyAlerted) {
+      alerts.unshift(alert);
+      if (alerts.length > 50) alerts.pop();
+      broadcast('alert', alert);
+      broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all(), learning.DEFAULT_MIN_SAMPLE, POLICY_VERSION) });
+      console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} (${verdict.incredere}) OF:${alert.ofAgree || '-'} @ ${alert.price}`);
+    }
   }
   return verdict;
 }
@@ -278,28 +335,44 @@ function primarySetup(verdict) {
 }
 
 // Background resolver: closes out pending journal entries automatically.
+let resolveRunning = false;
 async function resolveJournal() {
+  if (resolveRunning) return;
+  resolveRunning = true;
   try {
-    const resolved = await journal.resolvePending((sym) => mexc.fetchPrice(sym));
+    const resolved = await journal.resolvePending((entry) =>
+      mexc.fetchSettlementPrice(entry.symbol, entry.resolveTs)
+    );
     if (resolved.length) {
-      broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
+      broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all(), learning.DEFAULT_MIN_SAMPLE, POLICY_VERSION) });
       for (const r of resolved) {
-        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice}->${r.exitPrice} => ${r.win ? 'WIN' : 'LOSS'}`);
+        const outcome = r.status === 'settlement_error' ? `SETTLEMENT ERROR: ${r.lastSettlementError}`
+          : r.status === 'void' ? 'VOID' : r.win ? 'WIN' : 'LOSS';
+        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice}->${r.exitPrice ?? '—'} => ${outcome}`);
       }
     }
   } catch (e) {
     console.error('Journal resolve error:', e.message);
+  } finally {
+    resolveRunning = false;
   }
 }
 
+let scanRunning = false;
 async function scanAll() {
-  for (const symbol of config.symbols) {
-    try {
-      await scanSymbol(symbol);
-    } catch (e) {
-      console.error(`Scan error ${symbol}:`, e.message);
-      broadcast('error', { symbol, message: e.message });
+  if (scanRunning) return;
+  scanRunning = true;
+  try {
+    for (const symbol of config.symbols) {
+      try {
+        await scanSymbol(symbol);
+      } catch (e) {
+        console.error(`Scan error ${symbol}:`, e.message);
+        broadcast('error', { symbol, message: e.message });
+      }
     }
+  } finally {
+    scanRunning = false;
   }
 }
 
@@ -331,7 +404,7 @@ app.get('/api/state', (req, res) => {
     latest,
     alerts,
     journal: { stats: journal.stats(), recent: journal.recent(40) },
-    learning: learning.summary(journal.all()),
+    learning: learning.summary(journal.all(), learning.DEFAULT_MIN_SAMPLE, POLICY_VERSION),
   });
 });
 
@@ -340,19 +413,19 @@ app.get('/api/journal', (req, res) => {
 });
 
 app.get('/api/learning', (req, res) => {
-  res.json(learning.summary(journal.all()));
+  res.json(learning.summary(journal.all(), learning.DEFAULT_MIN_SAMPLE, POLICY_VERSION));
 });
 
 app.post('/api/journal/reset', (req, res) => {
   journal.reset();
-  broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
+  broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all(), learning.DEFAULT_MIN_SAMPLE, POLICY_VERSION) });
   res.json({ ok: true });
 });
 
 app.get('/api/signal', async (req, res) => {
   const symbol = (req.query.symbol || config.symbols[0]).toUpperCase();
   try {
-    const verdict = await scanSymbol(symbol);
+    const verdict = await scanSymbol(symbol, { sideEffects: false });
     res.json(verdict);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -390,6 +463,12 @@ app.post('/api/config', (req, res) => {
   }
   if (typeof body.useOrderFlow === 'boolean') config.useOrderFlow = body.useOrderFlow;
   if (typeof body.requireOfAgree === 'boolean') config.requireOfAgree = body.requireOfAgree;
+  if (typeof body.useDerivatives === 'boolean') config.useDerivatives = body.useDerivatives;
+  if (typeof body.requirePositiveEv === 'boolean') config.requirePositiveEv = body.requirePositiveEv;
+  if (body.evSafetyMarginPct != null) {
+    const v = Number(body.evSafetyMarginPct);
+    if (v >= 0 && v <= 20) config.evSafetyMarginPct = v;
+  }
   if (typeof body.useLearning === 'boolean') config.useLearning = body.useLearning;
   if (body.learningSuppressBelow != null) {
     const v = Number(body.learningSuppressBelow);
@@ -422,7 +501,12 @@ app.get('/api/backtest', async (req, res) => {
   const days = Math.min(60, Math.max(3, Number(req.query.days) || 15));
   const endDaysAgo = Math.max(0, Number(req.query.endDaysAgo) || 0);
   try {
-    const result = await backtest.run(symbol, { days, endDaysAgo });
+    const result = await backtest.run(symbol, {
+      days,
+      endDaysAgo,
+      sniperRequireVolume: config.sniperRequireVolume,
+      activeHoursUTC: config.activeHoursUTC,
+    });
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -439,7 +523,7 @@ app.get('/api/stream', (req, res) => {
   res.write('retry: 3000\n\n');
   sseClients.add(res);
   // Send current state immediately.
-  res.write(`event: snapshot\ndata: ${JSON.stringify({ latest, alerts, journal: { stats: journal.stats(), recent: journal.recent(40) }, learning: learning.summary(journal.all()) })}\n\n`);
+  res.write(`event: snapshot\ndata: ${JSON.stringify({ latest, alerts, journal: { stats: journal.stats(), recent: journal.recent(40) }, learning: learning.summary(journal.all(), learning.DEFAULT_MIN_SAMPLE, POLICY_VERSION) })}\n\n`);
   const keepAlive = setInterval(() => {
     try { res.write(': ping\n\n'); } catch { /* noop */ }
   }, 15000);

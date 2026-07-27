@@ -61,13 +61,20 @@ function ofRow(v) {
   const parts = [];
   if (v.orderflow) {
     const of = v.orderflow;
-    const map = { buy: '🟢 cumpărare', sell: '🔴 vânzare', neutru: '⚪ neutru' };
+    const map = { buy: '🟢 cumpărare', sell: '🔴 vânzare', neutru: '⚪ neutru', insufficient: '⚪ date insuficiente' };
     const agreeMap = { 'confirmă': '<span class="ok">✓ confirmă</span>', 'conflict': '<span class="bad">✗ conflict</span>', 'neutru': 'neutru' };
     parts.push(`<span title="dezechilibru order book + agresiune tranzacții">Order flow: <b>${map[of.state] || of.state}</b> (${(of.pressure * 100).toFixed(0)}%) · ${agreeMap[v.ofAgree] || ''}</span>`);
   }
   if (v.learned && v.learned.ready) {
-    const cls = v.learned.estimate >= 55 ? 'ok' : (v.learned.estimate < 48 ? 'bad' : '');
-    parts.push(`<span title="estimare din istoricul tău">🧠 istoric: <span class="${cls}">${v.learned.estimate}%</span></span>`);
+    const cls = v.learned.lower >= 55 ? 'ok' : (v.learned.upper < 48 ? 'bad' : '');
+    parts.push(`<span title="estimare Beta cu decay; interval aproximativ 95%">🧠 cohortă: <span class="${cls}">${v.learned.estimate}%</span> <small>[${v.learned.lower}–${v.learned.upper}%]</small></span>`);
+  }
+  if (v.derivatives) {
+    const d = v.derivatives;
+    const oiWindow = d.oiWindowSec == null ? '' : `/${Math.round(d.oiWindowSec / 60)}m`;
+    const oi = d.oiChangePct == null ? 'se calibrează' : `${d.oiChangePct > 0 ? '+' : ''}${d.oiChangePct}% OI${oiWindow}`;
+    const funding = d.fundingRate == null ? '—' : `${(d.fundingRate * 100).toFixed(4)}%`;
+    parts.push(`<span title="Context MEXC perpetual; înregistrat, încă nefolosit euristic">Derivate: funding ${funding} · ${oi} · basis ${fmt(d.basisBps)} bps</span>`);
   }
   if (v.htfTrend) {
     const up = v.htfTrend === 'up';
@@ -81,6 +88,7 @@ function ofRow(v) {
 function renderCard(v) {
   const dir = v.directie.toLowerCase();
   const eligible = v.sniper && v.sniper.eligible;
+  const actionable = v.actionable === true;
   const sigs = (v.signals || []).slice(0, 5).map((s) => `<li>${s.label} <span class="muted">[${s.tf}]</span></li>`).join('');
   const ai = v.ai
     ? `<div class="ai-note">🤖 <b>AI (${v.ai.acord || '—'})</b>: ${v.ai.risc ? '⚠️ ' + v.ai.risc : ''} ${v.ai.comentariu || ''}</div>`
@@ -90,22 +98,28 @@ function renderCard(v) {
   const ev = v.ev;
   const payoutNow = ev ? (v.interval === '10 minute' ? ev.payout10 : ev.payout30) : null;
   const beNow = ev ? (v.interval === '10 minute' ? ev.breakEven10 : ev.breakEven30) : null;
-  const evWarn = ev && !ev.positive;
-  const evNote = ev ? ` · payout ${payoutNow}% (break-even ${beNow}%)` : '';
-  const warnLine = evWarn ? `<div class="ev-warn">⚠️ payout prea mic pentru edge-ul tău — EV negativ, mai bine sari peste</div>` : '';
+  const evReadyNow = ev ? (v.interval === '10 minute' ? ev.ready10 : ev.ready30) : false;
+  const sampleNow = ev ? (v.interval === '10 minute' ? ev.sample10 : ev.sample30) : 0;
+  const evWarn = ev && ev.positive === false;
+  const evNote = ev
+    ? (evReadyNow ? ` · payout ${payoutNow}% (break-even ${beNow}%)` : ` · EV în calibrare (${sampleNow || 0}/20)`)
+    : '';
+  const warnLine = evWarn ? `<div class="ev-warn">⚠️ EV sub prag — semnalul nu este acționabil</div>` : '';
   let banner;
   if (SNIPER_MODE) {
-    banner = eligible
+    banner = actionable
       ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${warnLine}`
-      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
+      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">${v.suppressed || (eligible ? 'setup detectat, dar filtrele nu permit intrarea' : `nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}`)}</div></div>`;
   } else {
-    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`;
+    banner = actionable
+      ? `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`
+      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">${v.suppressed || 'semnalul nu trece politica de alertare'}</div></div>`;
   }
 
   return `
     <div class="card-top">
       <span class="card-sym">${v.symbol}</span>
-      <span class="card-price">${fmt(v.price)} USDT</span>
+      <span class="card-price">${fmt(v.marketPrice ?? v.price)} USDT</span>
     </div>
     ${banner}
     ${ofRow(v)}
@@ -122,7 +136,7 @@ function renderCard(v) {
       ${ai}
       <div class="snap">${snapChips(v.snapshots)}</div>
     </details>
-    <div class="muted" style="margin-top:8px;font-size:11px">preț live · actualizat ${new Date(v.ts).toLocaleTimeString('ro-RO')}</div>
+    <div class="muted" style="margin-top:8px;font-size:11px">semnal pe ultima bară 5m închisă @ ${fmt(v.price)} · piață ${fmt(v.marketPrice)} · actualizat ${new Date(v.ts).toLocaleTimeString('ro-RO')}</div>
   `;
 }
 
@@ -224,7 +238,7 @@ function renderLearning(l) {
   }
   const row = (r) => {
     const cls = r.winRate >= 55 ? 'ok' : (r.winRate < 48 ? 'bad' : '');
-    return `<div class="lrow"><span>${r.key}</span><span class="${cls}"><b>${r.winRate}%</b> <span class="muted">(${r.n})</span></span></div>`;
+    return `<div class="lrow"><span>${r.key}</span><span class="${cls}"><b>${r.winRate}%</b> <span class="muted">95% ${r.lower}–${r.upper}% · n=${r.n}</span></span></div>`;
   };
   el.innerHTML = `
     <div class="learn-cols">
@@ -256,8 +270,12 @@ function renderJournal(d) {
 
   const rows = (d.recent || []).map((e) => {
     const st = e.status === 'pending'
-      ? '<span class="muted">⏳ în așteptare</span>'
-      : (e.win ? '<span class="adir up">✓ WIN</span>' : '<span class="adir down">✗ LOSS</span>');
+      ? (e.settlementAttempts ? '<span class="muted">⏳ settlement întârziat, reîncerc</span>' : '<span class="muted">⏳ în așteptare</span>')
+      : e.status === 'void'
+        ? '<span class="muted">— egal / void</span>'
+        : e.status === 'settlement_error'
+          ? '<span class="bad">⚠ settlement indisponibil</span>'
+          : (e.win ? '<span class="adir up">✓ WIN</span>' : '<span class="adir down">✗ LOSS</span>');
     const dir = e.directie === 'UP' ? '▲' : '▼';
     const exit = e.exitPrice != null ? fmt(e.exitPrice) : '—';
     return `<div class="jrow">
@@ -313,6 +331,9 @@ async function loadState() {
   if (c.payout30) $('payout30').value = c.payout30;
   $('useOrderFlow').checked = c.useOrderFlow !== false;
   $('requireOfAgree').checked = !!c.requireOfAgree;
+  $('useDerivatives').checked = c.useDerivatives !== false;
+  $('requirePositiveEv').checked = c.requirePositiveEv !== false;
+  $('evSafetyMarginPct').value = c.evSafetyMarginPct ?? 1;
   $('useLearning').checked = c.useLearning !== false;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
@@ -343,6 +364,9 @@ async function saveSettings() {
     payout30: Number($('payout30').value),
     useOrderFlow: $('useOrderFlow').checked,
     requireOfAgree: $('requireOfAgree').checked,
+    useDerivatives: $('useDerivatives').checked,
+    requirePositiveEv: $('requirePositiveEv').checked,
+    evSafetyMarginPct: Number($('evSafetyMarginPct').value),
     useLearning: $('useLearning').checked,
     activeHoursUTC,
     gemini: {

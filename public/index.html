@@ -50,7 +50,7 @@
         <h2>📒 Jurnal live (automat)</h2>
         <button id="resetJournal" class="btn-ghost">resetează</button>
       </div>
-      <p class="muted" style="margin-top:-6px">Fiecare alertă e înregistrată automat, iar rezultatul (WIN/LOSS) se verifică singur după 10/30 min. Acesta e win-rate-ul TĂU real, live.</p>
+      <p class="muted" style="margin-top:-6px">Fiecare alertă este un eveniment unic; rezultatul se verifică din lumânarea MEXC spot 1m închisă la expirarea 10/30 min. Este un proxy transparent și poate diferi de indexul contractual event-futures.</p>
       <div id="journalStats" class="bt-result" style="margin-top:12px"></div>
       <div id="journalList" class="journal-list"></div>
     </section>
@@ -58,7 +58,7 @@
     <!-- LEARNING -->
     <section class="panel">
       <div class="panel-head"><h2>🧠 Ce a învățat (din rezultatele tale)</h2></div>
-      <p class="muted" style="margin-top:-6px">Pe măsură ce jurnalul se umple, aplicația învață ce tipare îți merg și ce evită. Are nevoie de minim ~10 semnale per tipar ca să aibă încredere.</p>
+      <p class="muted" style="margin-top:-6px">Calibrarea folosește evenimente deduplicate, cohorte comparabile și intervale de incertitudine. Are nevoie de minimum 20 rezultate per cohortă.</p>
       <div id="learningBody" class="learning-body">
         <p class="muted">Încă strâng date — nimic învățat sigur deocamdată. Lasă aplicația să ruleze câteva sesiuni.</p>
       </div>
@@ -87,7 +87,7 @@ ETHUSDT</textarea>
         </div>
         <hr />
         <div class="sniper-panel">
-          <label class="switch-inline"><input type="checkbox" id="sniperMode" checked /> <b>🎯 Sniper Mode</b> — alertează DOAR pe setup-ul A+ (liquidity sweep + volum + ore active). Recomandat.</label>
+          <label class="switch-inline"><input type="checkbox" id="sniperMode" checked /> <b>🎯 Sniper Mode</b> — alertează doar pe liquidity sweep în ore active; confirmarea de volum este configurabilă mai jos.</label>
           <div class="grid" style="margin-top:12px">
             <div class="field">
               <label>Ore active (ora TA locală, separate prin virgulă)</label>
@@ -113,13 +113,18 @@ ETHUSDT</textarea>
         </div>
         <div class="grid" style="margin-top:12px">
             <div class="field">
-              <label class="switch-inline"><input type="checkbox" id="useOrderFlow" checked /> <b>Order flow live</b> — confirmă direcția cu order book + agresiunea tranzacțiilor</label>
+              <label class="switch-inline"><input type="checkbox" id="useOrderFlow" checked /> <b>Order flow live</b> — confirmă direcția cu order book ponderat + agresiunea tranzacțiilor</label>
               <label class="switch-inline"><input type="checkbox" id="requireOfAgree" /> nu alerta când order flow e în conflict cu direcția</label>
+              <label class="switch-inline"><input type="checkbox" id="useDerivatives" checked /> înregistrează funding, open interest și basis MEXC Futures pentru calibrare</label>
             </div>
             <div class="field">
-              <label class="switch-inline"><input type="checkbox" id="useLearning" checked /> <b>🧠 Învățare din jurnal</b> — se calibrează din rezultatele tale și blochează tiparele pierzătoare</label>
-              <small class="muted">Are nevoie de minim ~10 semnale per tipar înainte să acționeze.</small>
+              <label class="switch-inline"><input type="checkbox" id="useLearning" checked /> <b>🧠 Calibrare din jurnal</b> — blochează doar cohorte demonstrabil slabe</label>
+              <label class="switch-inline"><input type="checkbox" id="requirePositiveEv" checked /> nu alerta dacă EV-ul estimat nu depășește marja</label>
+              <label>Marjă EV minimă (%)</label>
+              <input type="number" id="evSafetyMarginPct" min="0" max="20" step="0.5" value="1" />
+              <small class="muted">Minimum 20 de evenimente fără ferestre suprapuse; estimarea afișează un interval aproximativ de 95%.</small>
             </div>
+        </div>
         </div>
         <hr />
         <div class="grid">

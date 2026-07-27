@@ -4,13 +4,13 @@ Aplicație locală (stil PinPilot) care citește **date live de pe MEXC**, calcu
 
 ## Ce face
 
-- Se conectează la MEXC (endpoint public, **fără cheie API**) și ia lumânări pe 5m + 15m.
-- Calculează: **RSI, MACD, Bollinger, EMA 9/20/50, ATR, volum vs. medie**.
+- Se conectează la MEXC (endpoint public, **fără cheie API**) și analizează numai lumânări **închise și sincronizate** pe 5m + 15m + 60m.
+- Calculează: **RSI, MACD, Bollinger, EMA 9/20/50, ATR, VWAP de sesiune, volum vs. media barelor anterioare**.
 - Detectează **Smart Money**: FVG / Inversion FVG, Liquidity Sweep (SFP), Market Structure Shift (CHoCH), structură HH/HL/LH/LL.
 - Combină totul prin confluență ponderată → output standardizat în **5 pași**:
   `Direcție · Interval (10/30 min) · Justificare · Nivel de încredere · Ce ar invalida`.
 - **Scanner automat**: verifică la câteva secunde și dă **alertă (sunet + notificare)** doar când încrederea ≥ pragul ales.
-- **Backtest** pe istoric real: îți arată win-rate-ul pe niveluri de încredere, **fără look-ahead**.
+- **Backtest closed-bar** pe proxy Binance 5m/15m/60m: folosește ferestre de eveniment nesuprapuse și aceeași logică tehnică, dar nu poate reproduce order flow-ul sau microstructura MEXC.
 
 ## Cum pornești (la fel ca PinPilot)
 
@@ -55,16 +55,16 @@ Pe Windows poți da dublu-click pe **`start.bat`**.
 
 Backtest-ul pe date reale (in-sample + out-of-sample, ~4000 lumânări/lună) a arătat că **majoritatea semnalelor sunt zgomot (~48-49% win-rate)** și că scorul de „încredere" brut nu ajută. Singurul setup care a **supraviețuit testului out-of-sample** este combinația:
 
-> **liquidity sweep + confirmare de volum + oră de sesiune activă (deschidere UE/SUA).**
+> **liquidity sweep + oră de sesiune activă**, cu confirmarea de volum disponibilă ca filtru opțional.
 
-Rezultate backtest (30 zile in-sample vs 30 zile out-of-sample):
+Rezultatele istorice de mai jos au motivat ipoteza inițială; după corecțiile de temporalitate și scoring trebuie regenerate înainte de a fi tratate drept comparabile cu versiunea curentă:
 
 | | in-sample | out-of-sample |
 |---|---|---|
 | ETH Sniper | 54.8% | **55.6%** (a rezistat) |
 | BTC Sniper | 69.7% | 46.9% (a fost noroc) |
 
-Concluzie onestă: **ETH ~55% e un edge subțire dar consistent; BTC nu a fost robust.** ~55% e abia peste break-even după comisioane — deci **NU e bani garantați**, ci un fir care merită validat înainte de bani reali.
+Concluzie onestă: **ETH ~55% a fost o ipoteză promițătoare în versiunea veche, nu un edge confirmat pentru motorul reparat; BTC nu a fost robust.** Rezultatele trebuie regenerate și validate forward înainte de bani reali.
 
 **Sniper Mode** (activat implicit) face aplicația să alerteze **DOAR** pe acest setup A+ — câteva semnale pe sesiune, nu 125/zi. Setează în UI orele tale locale de sesiune; aplicația le convertește automat în UTC.
 
@@ -85,7 +85,7 @@ Contractele MEXC event-futures sunt binare: dacă îți iese, primești un **pay
 | 80% | 55.6% |
 | 85% | 54.1% |
 
-De aceea contează enorm ce fereastră alegi. Introdu în Setări payout-urile curente de pe MEXC (10 min și 30 min). Aplicația calculează **EV (valoarea așteptată)** pentru fiecare fereastră (folosind win-rate-ul din jurnal sau ~55% ca estimare inițială) și **alege automat fereastra cu EV mai bun** — exact ce făcea traderul când trecea de la 10 min (payout mic) la 30 min (payout 80-85%). Dacă payout-ul e prea mic pentru edge-ul tău (EV negativ), banner-ul te avertizează să **sari peste**.
+De aceea contează enorm ce fereastră alegi. Introdu în Setări payout-urile curente. Aplicația afișează EV-ul ambelor ferestre; dacă activezi `adaptiveInterval`, poate comuta 10→30 numai după ce ambele intervale au minimum 20 de rezultate nesuprapuse. Veto-ul `requirePositiveEv` nu blochează bootstrap-ul: devine activ doar după ce intervalul ales are 20 de rezultate compatibile cu versiunea curentă a politicii.
 
 ## 📊 Order flow live (ce citește un scalper)
 
@@ -93,23 +93,25 @@ Pe lângă lumânări, aplicația citește în timp real de pe MEXC:
 - **Order book imbalance** (`/api/v3/depth`): sunt mai mulți bani la cumpărare sau la vânzare lângă preț?
 - **Agresiunea tranzacțiilor** (`/api/v3/aggTrades`): cumpărătorii lovesc mai tare decât vânzătorii?
 
-Rezultatul (`buy` / `sell` / `neutru`) **confirmă sau intră în conflict** cu direcția semnalului. Opțional (`requireOfAgree`), aplicația nu alertează dacă order flow-ul contrazice direcția. ⚠️ Order flow-ul NU se poate backtesta (MEXC nu dă istoric), deci e o confirmare **live**, validată prin jurnal.
+Rezultatul (`buy` / `sell` / `neutru` / `insufficient`) confirmă sau intră în conflict cu direcția. Cartea este ponderată după distanța față de mid, iar delta folosește maximum 60s cu decay; dacă batch-ul nu acoperă minimum 30s sau trade-urile sunt stale, starea devine `insufficient`, nu un semnal fals. Opțional (`requireOfAgree`), aplicația nu alertează când există un conflict valid.
+
+## 📉 Context derivate MEXC
+
+Aplicația colectează opțional funding rate, open interest, variația OI și basis-ul perpetual–index. Aceste valori sunt salvate în jurnal pentru forward-calibration, dar **nu primesc încă ponderi euristice**: ar fi necinstit să presupunem că funding pozitiv înseamnă automat DOWN sau că OI în creștere înseamnă automat continuare fără validare istorică.
 
 ## 📐 VWAP + aliniere cu trendul 1h
 
-- **VWAP** (Volume-Weighted Average Price): ancora „valorii corecte" pe care o urmăresc scalperii. Preț peste VWAP în urcare = bias bullish; sub VWAP în coborâre = bias bearish.
+- **VWAP de sesiune**: ancora se resetează la 00:00 UTC, astfel încât are aceeași semnificație economică pe 5m și 15m.
 - **Aliniere cu trendul de 1 oră**: aplicația citește și graficul de 60m și favorizează semnalele care merg în sensul trendului mare (trade with the trend).
 
 ## 🧠 Învățare din jurnal (se calibrează sesiune de sesiune)
 
-Aplicația învață din **rezultatele tale reale**, nu dintr-o cutie neagră. Pe măsură ce jurnalul se umple, calculează win-rate-ul pe dimensiuni (tip setup, oră, monedă+direcție, order flow) și:
-- **întărește** tiparele care îți câștigă (>55%)
-- **blochează** automat tiparele pe care istoricul tău le arată pierzătoare (< `learningSuppressBelow`, implicit 45%)
+Aplicația calibrează din **evenimente deduplicate și fără ferestre suprapuse pe același simbol**, nu dintr-o cutie neagră. Selectează o singură cohortă comparabilă (setup, simbol, direcție, interval și, când există destule date, order flow), aplică un prior Beta și decay temporal, apoi afișează un interval aproximativ de 95%. Nu mai mediază rate marginale corelate.
 
-Panoul „🧠 Ce a învățat" îți arată transparent ce merge și ce evită. **Are nevoie de minim ~10 semnale per tipar** înainte să acționeze — deci devine mai bună treptat, pe măsură ce tranzacționezi (pe demo întâi!). Nu inventează edge; optimizează în jurul celui real.
+Panoul „🧠 Ce a învățat” cere implicit **effective sample size de minimum 20 per cohortă**. O alertă este blocată statistic numai când limita superioară aproximativă este sub pragul configurat. BTC și ETH pot rămâne corelate, deci această protecție reduce dependența fără a pretinde independență perfectă.
 
 **Învățare non-stop:** cât timp aplicația e deschisă, înregistrează în fundal o „observație" per lumânare per monedă (chiar și fără alertă) și îi verifică singură rezultatul. Așa învață continuu despre ETH/USDT și BTC/USDT, 24/7, chiar dacă nu tranzacționezi. Observațiile alimentează învățarea, dar NU apar în lista ta de tranzacții (care rămâne doar cu alerte reale). Jurnalul persistă în `journal.json`, deci progresul nu se pierde la repornire.
 
 ## ⚠️ Avertisment
 
-Tranzacționarea contractelor pe 10/30 min este **speculativă și riscantă**. Backtest-ul nu include comisioane/spread, iar rezultatele trecute **nu garantează** nimic în viitor. Folosește aplicația ca instrument de analiză, nu ca sfat financiar. Testează pe sume mici și verifică singur semnalele.
+Tranzacționarea contractelor pe 10/30 min este **speculativă și riscantă**. Backtest-ul nu include comisioane/spread, iar rezultatele trecute **nu garantează** nimic în viitor. Settlement-ul jurnalului este un proxy bazat pe close-ul MEXC spot 1m; verifică rezultatul contractual dacă produsul folosește alt index, timestamp sau regulă de egalitate. Folosește aplicația ca instrument de analiză, nu ca sfat financiar. Testează pe sume mici și verifică singur semnalele.
