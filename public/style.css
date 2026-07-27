@@ -155,3 +155,34 @@ button:hover { filter: brightness(1.1); }
 .lrow { display: flex; justify-content: space-between; align-items: center; padding: 7px 10px; border-radius: 8px; background: var(--panel2); border: 1px solid var(--border); font-size: 12.5px; margin-bottom: 4px; }
 .lrow .ok { color: var(--up); }
 .lrow .bad { color: var(--down); }
+
+
+
+/* Explicit 10m / 30m Event Futures forecasts + live candlestick chart */
+.chart-label { display: flex; justify-content: space-between; margin: 14px 0 6px; color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .06em; }
+.candle-chart { display: block; width: 100%; height: 210px; background: #0d1117; border: 1px solid var(--border); border-radius: 10px; }
+.forecast-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 12px 0; }
+.forecast { border: 1px solid var(--border); border-radius: 10px; background: rgba(255,255,255,.025); padding: 11px; border-top: 3px solid var(--muted); }
+.forecast.up { border-top-color: var(--up); }
+.forecast.down { border-top-color: var(--down); }
+.forecast-head { display: flex; justify-content: space-between; align-items: center; color: var(--muted); font-size: 10px; letter-spacing: .08em; }
+.forecast-action { padding: 3px 7px; border-radius: 5px; font-size: 9px; font-weight: 800; }
+.forecast-action.trade { color: var(--up); background: rgba(22,199,132,.15); }
+.forecast-action.wait { color: var(--neutral); background: rgba(201,162,39,.15); }
+.forecast-direction { margin: 8px 0; font-size: 24px; font-weight: 900; }
+.forecast-direction.up { color: var(--up); }
+.forecast-direction.down { color: var(--down); }
+.forecast-direction small { color: var(--text); font-size: 12px; }
+.prob-track { height: 5px; border-radius: 6px; overflow: hidden; display: flex; background: var(--border); }
+.prob-track i { display: block; height: 100%; }
+.prob-down { background: var(--down); }
+.prob-up { background: var(--up); }
+.forecast-probs { display: flex; justify-content: space-between; margin-top: 4px; color: var(--muted); font-size: 9px; }
+.forecast-tfs { margin-top: 8px; color: var(--muted); font-size: 10px; }
+.forecast ul { margin: 7px 0 0; padding-left: 15px; color: var(--muted); font-size: 10px; line-height: 1.4; }
+.ok { color: var(--up); }
+.bad { color: var(--down); }
+@media (max-width: 720px) { .forecast-grid { grid-template-columns: 1fr; } .candle-chart { height: 180px; } }
+
+.forecast-learned { margin-top: 6px; color: var(--accent2); font-size: 10px; }
+.forecast-suppressed { margin-top: 5px; color: var(--down); font-size: 10px; }

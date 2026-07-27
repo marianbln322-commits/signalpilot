@@ -48,6 +48,7 @@ const DEFAULT_CONFIG = {
   adaptiveInterval: false,
   payout10: 65,          // current MEXC payout % for 10-min contracts (user updates)
   payout30: 82,          // current MEXC payout % for 30-min contracts
+  paperStake: 10,        // simulated stake per alert; no real order is ever placed
   fallbackWinRate: 55,   // assumed win-rate when the journal has too few samples yet (sniper OOS ~55%)
   // Live order flow (order book + trade aggression). Confirms/vetoes direction.
   useOrderFlow: true,
@@ -93,9 +94,28 @@ function broadcast(event, data) {
 
 // ---- Core scan for one symbol ----------------------------------------------
 async function scanSymbol(symbol) {
-  const mtf = await mexc.fetchMultiTimeframe(symbol, ['5m', '15m', '60m'], 200);
-  const verdict = engine.decide(mtf);
+  // Explicit horizon inputs: 10m reads 1m/5m/15m, 30m reads
+  // 5m/15m/30m, while 60m remains higher-timeframe context.
+  const mtf = await mexc.fetchMultiTimeframe(symbol, ['1m', '5m', '15m', '30m', '60m'], 200);
+  const analysisTime = Date.now();
+  const closedMtf = { errors: mtf.errors || {} };
+  for (const timeframe of ['1m', '5m', '15m', '30m', '60m']) {
+    if (Array.isArray(mtf[timeframe])) {
+      closedMtf[timeframe] = mtf[timeframe].filter((candle) => candle.closeTime < analysisTime);
+    }
+  }
+  const verdict = engine.decide(closedMtf);
   verdict.symbol = symbol;
+  const liveOneMinute = Array.isArray(mtf['1m']) ? mtf['1m'] : [];
+  const latestOneMinute = liveOneMinute.length ? liveOneMinute[liveOneMinute.length - 1] : null;
+  verdict.chart = liveOneMinute.slice(-120);
+  verdict.entryPriceFresh = !!(latestOneMinute && Number.isFinite(latestOneMinute.close) &&
+    Number.isFinite(latestOneMinute.openTime) && latestOneMinute.openTime >= analysisTime - 2 * 60 * 1000);
+  if (!verdict.chart.length && latest[symbol] && Array.isArray(latest[symbol].chart)) {
+    verdict.chart = latest[symbol].chart;
+  }
+  verdict.dataErrors = mtf.errors || {};
+  if (verdict.entryPriceFresh) verdict.price = latestOneMinute.close;
 
   // Interval = the setup's NATURAL window (fast momentum like sweeps -> 10 min,
   // structural setups -> 30 min). Payout/EV is shown as INFO, and only used to
@@ -174,63 +194,189 @@ async function scanSymbol(symbol) {
       setup: verdict.setup,
       hourUTC,
       ofAgree: verdict.ofAgree,
+      interval: verdict.interval,
+      requireInterval: true,
+      calibrationVersion: 2,
     });
+
+    // The engine emits only a technical score. A financial probability exists
+    // only when canonical, exact-settlement forward observations satisfy the
+    // horizon-specific minimum-sample guard. The probability is the empirical
+    // win-rate itself; the technical score remains a separate ranking signal.
+    for (const horizon of [10, 30]) {
+      const forecast = verdict.forecasts && verdict.forecasts[horizon];
+      if (!forecast || forecast.directie === 'NEUTRU') continue;
+      const learned = learning.evaluate(journal.all(), {
+        symbol,
+        directie: forecast.directie,
+        setup: forecast.reasons[0] || 'context',
+        hourUTC,
+        ofAgree: verdict.ofAgree,
+        interval: `${horizon} minute`,
+        requireInterval: true,
+        calibrationVersion: 2,
+      });
+      forecast.learned = learned;
+      if (learned.ready && learned.estimate != null) {
+        const calibratedConfidence = learned.estimate / 100;
+        forecast.confidence = +calibratedConfidence.toFixed(4);
+        forecast.probabilityUp = +(forecast.directie === 'UP' ? calibratedConfidence : 1 - calibratedConfidence).toFixed(4);
+        forecast.probabilityDown = +(1 - forecast.probabilityUp).toFixed(4);
+        forecast.calibrated = true;
+        forecast.reasons.push(`Calibrare jurnal: ${learned.estimate}% pe contexte similare (${learned.factors.length} factori)`);
+        if (learned.estimate < config.learningSuppressBelow) {
+          forecast.suppressed = `istoricul local indică doar ${learned.estimate}%`;
+        }
+      }
+    }
   }
 
-  // Continuous learning: log one observation per 5m candle per symbol (even when
-  // no alert fires) so the software keeps learning about ETH/BTC 24/7. These are
-  // resolved automatically and feed the learning layer, but stay out of the
-  // trade journal display.
-  if (config.useLearning && verdict.directie !== 'NEUTRU') {
+  // A binary contract becomes actionable only when it has an empirically
+  // calibrated probability strictly above payout-specific break-even.
+  for (const horizon of [10, 30]) {
+    const forecast = verdict.forecasts && verdict.forecasts[horizon];
+    if (!forecast) continue;
+    const payoutPct = horizon === 10 ? config.payout10 : config.payout30;
+    const breakEven = 1 / (1 + payoutPct / 100);
+    forecast.breakEven = +breakEven.toFixed(4);
+    forecast.payoutPct = payoutPct;
+    forecast.expectedValue = null;
+    forecast.action = 'WAIT';
+
+    if (!forecast.calibrated || !Number.isFinite(forecast.confidence)) {
+      forecast.suppressed = forecast.suppressed || 'calibrare în curs — date forward insuficiente';
+      continue;
+    }
+
+    forecast.expectedValue = +(forecast.confidence * (payoutPct / 100) - (1 - forecast.confidence)).toFixed(4);
+    if (!forecast.setupValid) {
+      forecast.suppressed = forecast.suppressed || 'setup tehnic incomplet';
+    } else if (forecast.suppressed) {
+      // A learning veto set above remains authoritative.
+    } else if (forecast.confidence <= breakEven) {
+      forecast.suppressed = `sub break-even: ${(forecast.confidence * 100).toFixed(1)}% ≤ ${(breakEven * 100).toFixed(1)}%`;
+    } else {
+      forecast.action = 'TRADE';
+    }
+  }
+
+  // Continuous learning: create non-overlapping observations only at exact
+  // 10m/30m boundaries. Features come from closed candles, while entry uses
+  // the boundary's 1m open, so labels do not leak post-entry information.
+  if (config.useLearning && verdict.forecasts && Array.isArray(mtf['1m'])) {
     try {
-      const c5 = mtf['5m'];
-      const candleOpen = c5[c5.length - 1].openTime;
-      journal.record({
-        observation: true,
-        candleOpen,
-        symbol,
-        directie: verdict.directie,
-        interval: verdict.interval,
-        incredere: verdict.incredere,
-        sniper: false,
-        setup: verdict.setup,
-        hourUTC,
-        ofState: verdict.orderflow ? verdict.orderflow.state : null,
-        ofAgree: verdict.ofAgree,
-        price: verdict.price,
-        ts: verdict.ts,
-      });
+      const now = Date.now();
+      const captureWindowMs = Math.max(15000, config.scanIntervalSec * 1000 + 5000);
+      for (const horizon of [10, 30]) {
+        const horizonMs = horizon * 60 * 1000;
+        const boundary = Math.floor(now / horizonMs) * horizonMs;
+        if (now - boundary > captureWindowMs) continue;
+        const entryCandle = mtf['1m'].find((candle) => candle.openTime === boundary);
+        if (!entryCandle) continue;
+        const boundaryMtf = { errors: mtf.errors || {} };
+        for (const timeframe of ['1m', '5m', '15m', '30m', '60m']) {
+          if (Array.isArray(mtf[timeframe])) {
+            boundaryMtf[timeframe] = mtf[timeframe].filter((candle) => candle.closeTime < boundary);
+          }
+        }
+        const forecast = engine.forecastHorizon(boundaryMtf, horizon);
+        if (!forecast.setupValid) continue;
+        journal.record({
+          observation: true,
+          calibrationVersion: 2,
+          entrySource: 'boundary-1m-open',
+          candleOpen: boundary,
+          symbol,
+          directie: forecast.directie,
+          interval: `${horizon} minute`,
+          incredere: forecast.confidence != null && forecast.confidence >= 0.68 ? 'Ridicat' : forecast.confidence != null && forecast.confidence >= 0.58 ? 'Mediu' : 'Scăzut',
+          probability: forecast.confidence,
+          sniper: false,
+          setup: forecast.reasons[0] || 'context',
+          hourUTC,
+          ofState: verdict.orderflow ? verdict.orderflow.state : null,
+          ofAgree: verdict.ofAgree,
+          price: entryCandle.open,
+          ts: boundary,
+          stake: 0,
+          payoutPct: horizon === 10 ? config.payout10 : config.payout30,
+        });
+      }
     } catch { /* non-fatal */ }
   }
 
   const prev = latest[symbol];
+
+  // The selected forecast is the single execution authority for UI, SSE and
+  // paper records. Apply every veto before publishing the signal snapshot.
+  const chosenHorizon = verdict.interval === '10 minute' ? 10 : 30;
+  const executionForecast = verdict.forecasts && verdict.forecasts[chosenHorizon];
+  const vetoExecution = (reason) => {
+    if (executionForecast && executionForecast.action === 'TRADE') {
+      executionForecast.action = 'WAIT';
+      executionForecast.suppressed = reason;
+    }
+    verdict.suppressed = reason;
+  };
+
+  if (executionForecast && executionForecast.action === 'TRADE' && executionForecast.directie !== verdict.directie) {
+    vetoExecution(`forecast ${chosenHorizon}m în dezacord cu direcția motorului`);
+  }
+  if (executionForecast && executionForecast.action === 'TRADE' &&
+      config.sniperMode && !(verdict.sniper && verdict.sniper.eligible)) {
+    vetoExecution(`setup Sniper neeligibil: ${verdict.sniper ? verdict.sniper.reason : 'fără confirmare'}`);
+  }
+  if (executionForecast && executionForecast.action === 'TRADE' &&
+      (verdict.directie === 'NEUTRU' || CONF_RANK[verdict.incredere] < CONF_RANK[config.alertMinConfidence])) {
+    vetoExecution(`încredere ${verdict.incredere} sub pragul ${config.alertMinConfidence}`);
+  }
+  if (executionForecast && executionForecast.action === 'TRADE' && !verdict.entryPriceFresh) {
+    vetoExecution('preț de intrare 1m proaspăt indisponibil');
+  }
+  if (executionForecast && executionForecast.action === 'TRADE' &&
+      config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
+    vetoExecution('order flow în conflict cu direcția');
+  }
+  if (executionForecast && executionForecast.action === 'TRADE' &&
+      config.useLearning && verdict.learned && verdict.learned.ready &&
+      verdict.learned.estimate != null && verdict.learned.estimate < config.learningSuppressBelow) {
+    vetoExecution(`istoricul tău dă doar ${verdict.learned.estimate}% pe acest tipar`);
+  }
+
+  const forecastAllowsTrade = executionForecast &&
+    executionForecast.action === 'TRADE' && executionForecast.directie === verdict.directie;
+  if (!forecastAllowsTrade) {
+    verdict.suppressed = verdict.suppressed || (executionForecast
+      ? `forecast ${chosenHorizon}m: ${executionForecast.action}${executionForecast.suppressed ? ` (${executionForecast.suppressed})` : ''}`
+      : `forecast ${chosenHorizon}m indisponibil`);
+  }
+
+  // One finalized execution snapshot drives the card/banner, signal SSE,
+  // alert transition and journal record. Alert frequency is based exclusively
+  // on this snapshot changing from WAIT to TRADE.
+  verdict.execution = {
+    horizon: chosenHorizon,
+    action: forecastAllowsTrade ? 'TRADE' : 'WAIT',
+    directie: executionForecast ? executionForecast.directie : 'NEUTRU',
+    calibrated: !!(executionForecast && executionForecast.calibrated),
+    calibrationVersion: executionForecast && executionForecast.calibrated ? 2 : null,
+    calibrationSource: executionForecast && executionForecast.calibrated ? 'exact-horizon-forward' : null,
+    probability: executionForecast && Number.isFinite(executionForecast.confidence) ? executionForecast.confidence : null,
+    probabilityUp: executionForecast ? executionForecast.probabilityUp : null,
+    probabilityDown: executionForecast ? executionForecast.probabilityDown : null,
+    technicalConfidence: executionForecast ? executionForecast.technicalConfidence : null,
+    setupValid: !!(executionForecast && executionForecast.setupValid),
+    breakEven: executionForecast ? executionForecast.breakEven : null,
+    expectedValue: executionForecast ? executionForecast.expectedValue : null,
+    payoutPct: executionForecast ? executionForecast.payoutPct : null,
+    reason: forecastAllowsTrade ? null : verdict.suppressed,
+  };
+  const previousExecution = prev && prev.execution;
+  const shouldAlert = verdict.execution.action === 'TRADE' &&
+    (!previousExecution || previousExecution.action !== 'TRADE');
+
   latest[symbol] = verdict;
   broadcast('signal', verdict);
-
-  // Alert logic depends on mode.
-  let shouldAlert;
-  if (config.sniperMode) {
-    // Only the A+ setup fires an alert.
-    const wasEligible = prev && prev.sniper && prev.sniper.eligible;
-    shouldAlert = verdict.sniper.eligible && (!wasEligible || prev.directie !== verdict.directie);
-  } else {
-    const meetsConf = verdict.directie !== 'NEUTRU' &&
-      CONF_RANK[verdict.incredere] >= CONF_RANK[config.alertMinConfidence];
-    const changed = !prev || prev.directie !== verdict.directie || prev.incredere !== verdict.incredere;
-    shouldAlert = meetsConf && changed;
-  }
-
-  // Order-flow veto: optionally require live order flow to not contradict.
-  if (shouldAlert && config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
-    shouldAlert = false;
-    verdict.suppressed = 'order flow în conflict cu direcția';
-  }
-  // Learning veto: suppress conditions the user's own history shows as losing.
-  if (shouldAlert && config.useLearning && verdict.learned && verdict.learned.ready &&
-      verdict.learned.estimate != null && verdict.learned.estimate < config.learningSuppressBelow) {
-    shouldAlert = false;
-    verdict.suppressed = `istoricul tău dă doar ${verdict.learned.estimate}% pe acest tipar`;
-  }
 
   if (shouldAlert) {
     const alert = {
@@ -243,6 +389,19 @@ async function scanSymbol(symbol) {
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
       ofState: verdict.orderflow ? verdict.orderflow.state : null,
       ofAgree: verdict.ofAgree || null,
+      action: verdict.execution.action,
+      horizon: verdict.execution.horizon,
+      probability: verdict.execution.probability,
+      probabilityUp: verdict.execution.probabilityUp,
+      probabilityDown: verdict.execution.probabilityDown,
+      calibrated: verdict.execution.calibrated,
+      calibrationVersion: verdict.execution.calibrationVersion,
+      calibrationSource: verdict.execution.calibrationSource,
+      technicalConfidence: verdict.execution.technicalConfidence,
+      setupValid: verdict.execution.setupValid,
+      breakEven: verdict.execution.breakEven,
+      expectedValue: verdict.execution.expectedValue,
+      payoutPct: verdict.execution.payoutPct,
       ts: verdict.ts,
     };
     alerts.unshift(alert);
@@ -252,6 +411,8 @@ async function scanSymbol(symbol) {
       ...alert,
       setup: verdict.setup,
       hourUTC,
+      stake: config.paperStake,
+      payoutPct: alert.interval === '10 minute' ? config.payout10 : config.payout30,
     });
     broadcast('alert', alert);
     if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
@@ -280,11 +441,15 @@ function primarySetup(verdict) {
 // Background resolver: closes out pending journal entries automatically.
 async function resolveJournal() {
   try {
-    const resolved = await journal.resolvePending((sym) => mexc.fetchPrice(sym));
+    const resolved = await journal.resolvePending((sym, resolveTs) => mexc.fetchSettlementPrice(sym, resolveTs));
     if (resolved.length) {
       broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
       for (const r of resolved) {
-        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice}->${r.exitPrice} => ${r.win ? 'WIN' : 'LOSS'}`);
+        if (r.status === 'void') {
+          console.log(`[VOID] ${r.symbol} ${r.directie}: settlement exact indisponibil după perioada de grație`);
+        } else {
+          console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice}->${r.exitPrice} => ${r.win ? 'WIN' : 'LOSS'}`);
+        }
       }
     }
   } catch (e) {
@@ -378,6 +543,10 @@ app.post('/api/config', (req, res) => {
   if (body.payout30 != null) {
     const v = Number(body.payout30);
     if (v > 0 && v <= 500) config.payout30 = v;
+  }
+  if (body.paperStake != null) {
+    const v = Number(body.paperStake);
+    if (Number.isFinite(v) && v > 0 && v <= 100000) config.paperStake = v;
   }
   if (body.fallbackWinRate != null) {
     const v = Number(body.fallbackWinRate);

@@ -4,12 +4,14 @@ Aplicație locală (stil PinPilot) care citește **date live de pe MEXC**, calcu
 
 ## Ce face
 
-- Se conectează la MEXC (endpoint public, **fără cheie API**) și ia lumânări pe 5m + 15m.
+- Se conectează la MEXC (endpoint public, **fără cheie API**) și ia lumânări pe 1m + 5m + 15m + 30m + 60m.
+- Afișează grafic candlestick 1m live și prognoze distincte pentru **10m** (1m/5m/15m) și **30m** (5m/15m/30m). Inițial afișează doar un **scor tehnic** și `WAIT`; probabilitatea UP/DOWN și `TRADE` devin disponibile numai după calibrare pe suficiente rezultate forward.
 - Calculează: **RSI, MACD, Bollinger, EMA 9/20/50, ATR, volum vs. medie**.
 - Detectează **Smart Money**: FVG / Inversion FVG, Liquidity Sweep (SFP), Market Structure Shift (CHoCH), structură HH/HL/LH/LL.
 - Combină totul prin confluență ponderată → output standardizat în **5 pași**:
   `Direcție · Interval (10/30 min) · Justificare · Nivel de încredere · Ce ar invalida`.
 - **Scanner automat**: verifică la câteva secunde și dă **alertă (sunet + notificare)** doar când încrederea ≥ pragul ales.
+- **Paper trading local**: fiecare alertă este evaluată automat, cu miză și payout configurabile, win-rate și P&L în USDT; nu plasează ordine reale.
 - **Backtest** pe istoric real: îți arată win-rate-ul pe niveluri de încredere, **fără look-ahead**.
 
 ## Cum pornești (la fel ca PinPilot)
@@ -32,6 +34,7 @@ Pe Windows poți da dublu-click pe **`start.bat`**.
 - **Simboluri**: format MEXC fără underscore, ex. `BTCUSDT`, `ETHUSDT`.
 - **Interval scanare** (secunde, minim 3).
 - **Alertă de la încrederea**: `Scăzut` / `Mediu` / `Ridicat`.
+- **Payout 10m / 30m și miză paper**: folosite pentru EV și P&L simulat; aplicația nu trimite ordine către MEXC.
 - **Gemini** (opțional): activează + lipește cheia + alege modelul. Cheia rămâne **local**, pe mașina ta, în `config.json` (care e în `.gitignore`).
 
 ## Cum e gândit (important)
@@ -85,7 +88,7 @@ Contractele MEXC event-futures sunt binare: dacă îți iese, primești un **pay
 | 80% | 55.6% |
 | 85% | 54.1% |
 
-De aceea contează enorm ce fereastră alegi. Introdu în Setări payout-urile curente de pe MEXC (10 min și 30 min). Aplicația calculează **EV (valoarea așteptată)** pentru fiecare fereastră (folosind win-rate-ul din jurnal sau ~55% ca estimare inițială) și **alege automat fereastra cu EV mai bun** — exact ce făcea traderul când trecea de la 10 min (payout mic) la 30 min (payout 80-85%). Dacă payout-ul e prea mic pentru edge-ul tău (EV negativ), banner-ul te avertizează să **sari peste**.
+De aceea contează enorm ce fereastră alegi. Introdu în Setări payout-urile curente de pe MEXC (10 min și 30 min). Aplicația afișează EV-ul de planificare pentru fiecare fereastră din win-rate-ul jurnalului (sau fallback-ul configurat când istoricul nu ajunge). Opțional, `adaptiveInterval` poate muta un setup de la 10 la 30 minute când payout-ul scurt este nefavorabil. Separat, un forecast poate deveni `TRADE` numai când probabilitatea sa calibrată pe rezultate forward este **strict peste** break-even; scorul tehnic brut nu este tratat ca probabilitate.
 
 ## 📊 Order flow live (ce citește un scalper)
 
@@ -106,9 +109,9 @@ Aplicația învață din **rezultatele tale reale**, nu dintr-o cutie neagră. P
 - **întărește** tiparele care îți câștigă (>55%)
 - **blochează** automat tiparele pe care istoricul tău le arată pierzătoare (< `learningSuppressBelow`, implicit 45%)
 
-Panoul „🧠 Ce a învățat" îți arată transparent ce merge și ce evită. **Are nevoie de minim ~10 semnale per tipar** înainte să acționeze — deci devine mai bună treptat, pe măsură ce tranzacționezi (pe demo întâi!). Nu inventează edge; optimizează în jurul celui real.
+Panoul „🧠 Ce a învățat" îți arată transparent ce merge și ce evită. **Are nevoie de minim 10 rezultate forward exacte separat pentru fiecare orizont (10m și 30m)** înainte să poată afișa o probabilitate calibrată sau `TRADE`. Înregistrările vechi, fără graniță canonică și settlement `aggTrade` exact, rămân în jurnalul vizual, dar nu pot debloca execuția. Astfel aplicația devine mai bine calibrată treptat, pe demo întâi; nu inventează edge și nu tratează scorul tehnic drept probabilitate.
 
-**Învățare non-stop:** cât timp aplicația e deschisă, înregistrează în fundal o „observație" per lumânare per monedă (chiar și fără alertă) și îi verifică singură rezultatul. Așa învață continuu despre ETH/USDT și BTC/USDT, 24/7, chiar dacă nu tranzacționezi. Observațiile alimentează învățarea, dar NU apar în lista ta de tranzacții (care rămâne doar cu alerte reale). Jurnalul persistă în `journal.json`, deci progresul nu se pierde la repornire.
+**Învățare non-stop:** cât timp aplicația e deschisă, înregistrează în fundal câte o observație la fiecare graniță exactă de 10m și 30m pentru fiecare monedă, folosind doar lumânări deja închise și prețul de deschidere al graniței. Rezultatul este stabilit din primul `aggTrade` de la ținta exactă; dacă acesta rămâne indisponibil după perioada de grație, observația devine `VOID` și nu intră în P&L sau învățare. Observațiile alimentează calibrarea, dar NU apar în lista ta de tranzacții. Jurnalul persistă în `journal.json`, deci progresul nu se pierde la repornire.
 
 ## ⚠️ Avertisment
 

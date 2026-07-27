@@ -74,8 +74,87 @@ function ofRow(v) {
     parts.push(`<span title="trendul pe 1 oră">Trend 1h: <b class="${up ? 'ok' : 'bad'}">${up ? '↗ ascendent' : '↘ descendent'}</b></span>`);
   }
   if (v.suppressed) parts.push(`<span class="bad">⛔ blocat: ${v.suppressed}</span>`);
+  const missingFrames = Object.keys(v.dataErrors || {});
+  if (missingFrames.length) parts.push(`<span class="bad">⚠️ feed parțial: ${missingFrames.join(', ')}</span>`);
   if (!parts.length) return '';
   return `<div class="of-row">${parts.join(' &nbsp;·&nbsp; ')}</div>`;
+}
+
+function forecastGrid(v) {
+  const forecasts = v.forecasts || {};
+  const card = (horizon) => {
+    const forecast = forecasts[horizon];
+    if (!forecast) return '';
+    const dir = forecast.directie.toLowerCase();
+    const calibrated = forecast.calibrated && Number.isFinite(forecast.probabilityUp) && Number.isFinite(forecast.probabilityDown);
+    const upValue = calibrated ? forecast.probabilityUp : forecast.technicalScoreUp;
+    const downValue = calibrated ? forecast.probabilityDown : forecast.technicalScoreDown;
+    const up = (Number.isFinite(upValue) ? upValue * 100 : 50).toFixed(1);
+    const down = (Number.isFinite(downValue) ? downValue * 100 : 50).toFixed(1);
+    const directionalValue = forecast.directie === 'UP' ? upValue : forecast.directie === 'DOWN' ? downValue : 0.5;
+    const directionalScore = (Number.isFinite(directionalValue) ? directionalValue * 100 : 50).toFixed(1);
+    const metricLabel = calibrated ? 'PROBABILITATE CALIBRATĂ' : 'SCOR TEHNIC';
+    const action = forecast.action === 'TRADE' ? 'TRADE' : 'WAIT';
+    return `<div class="forecast ${dir}">
+      <div class="forecast-head"><b>${horizon} MINUTE</b><span class="forecast-action ${action.toLowerCase()}">${action}</span></div>
+      <div class="forecast-direction ${dir}">${forecast.directie} <small>${directionalScore}%</small></div>
+      <div class="forecast-learned">${calibrated ? '🧠' : '📐'} ${metricLabel}</div>
+      <div class="prob-track"><i class="prob-down" style="width:${down}%"></i><i class="prob-up" style="width:${up}%"></i></div>
+      <div class="forecast-probs"><span>DOWN ${down}%</span><span>UP ${up}%</span></div>
+      <div class="forecast-tfs">Analiză: ${(forecast.timeframes || []).join(' · ')}${forecast.breakEven ? ` · break-even ${(forecast.breakEven * 100).toFixed(1)}%` : ''}</div>
+      ${forecast.suppressed ? `<div class="forecast-suppressed">⛔ ${forecast.suppressed}</div>` : ''}
+      <ul>${(forecast.reasons || []).slice(0, 4).map((reason) => `<li>${reason}</li>`).join('')}</ul>
+    </div>`;
+  };
+  return `<div class="forecast-grid">${card(10)}${card(30)}</div>`;
+}
+
+function drawCandles(canvas, candles) {
+  if (!canvas || !Array.isArray(candles) || candles.length < 2) return;
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = Math.max(1, Math.floor(rect.width * dpr));
+  canvas.height = Math.max(1, Math.floor(rect.height * dpr));
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const width = rect.width;
+  const height = rect.height;
+  const pad = { left: 8, right: 58, top: 12, bottom: 18 };
+  const highs = candles.map((c) => c.high);
+  const lows = candles.map((c) => c.low);
+  const max = Math.max(...highs);
+  const min = Math.min(...lows);
+  const range = Math.max(max - min, max * 0.0001);
+  const high = max + range * 0.08;
+  const low = min - range * 0.08;
+  const chartHeight = height - pad.top - pad.bottom;
+  const y = (price) => pad.top + (high - price) / (high - low) * chartHeight;
+  const step = (width - pad.left - pad.right) / candles.length;
+  const bodyWidth = Math.max(1.5, Math.min(5, step * 0.65));
+
+  ctx.clearRect(0, 0, width, height);
+  ctx.font = '9px system-ui';
+  ctx.textAlign = 'left';
+  ctx.textBaseline = 'middle';
+  for (let line = 0; line <= 4; line++) {
+    const price = high - (high - low) * line / 4;
+    const lineY = pad.top + chartHeight * line / 4;
+    ctx.strokeStyle = '#2a3240';
+    ctx.beginPath(); ctx.moveTo(pad.left, lineY); ctx.lineTo(width - pad.right + 5, lineY); ctx.stroke();
+    ctx.fillStyle = '#8b949e';
+    ctx.fillText(fmt(price), width - pad.right + 9, lineY);
+  }
+  candles.forEach((candle, index) => {
+    const x = pad.left + step * index + step / 2;
+    const rising = candle.close >= candle.open;
+    const color = rising ? '#16c784' : '#ea3943';
+    ctx.strokeStyle = color;
+    ctx.beginPath(); ctx.moveTo(x, y(candle.high)); ctx.lineTo(x, y(candle.low)); ctx.stroke();
+    ctx.fillStyle = color;
+    const top = y(Math.max(candle.open, candle.close));
+    const bottom = y(Math.min(candle.open, candle.close));
+    ctx.fillRect(x - bodyWidth / 2, top, bodyWidth, Math.max(1.2, bottom - top));
+  });
 }
 
 function renderCard(v) {
@@ -93,13 +172,25 @@ function renderCard(v) {
   const evWarn = ev && !ev.positive;
   const evNote = ev ? ` · payout ${payoutNow}% (break-even ${beNow}%)` : '';
   const warnLine = evWarn ? `<div class="ev-warn">⚠️ payout prea mic pentru edge-ul tău — EV negativ, mai bine sari peste</div>` : '';
+  const chosenHorizon = v.execution ? v.execution.horizon : (v.interval === '10 minute' ? 10 : 30);
+  const executionForecast = v.forecasts && v.forecasts[chosenHorizon];
+  const forecastAllowsTrade = v.execution
+    ? v.execution.action === 'TRADE' && v.execution.directie === v.directie
+    : executionForecast && executionForecast.action === 'TRADE' && executionForecast.directie === v.directie;
+  const waitReason = v.execution && v.execution.reason
+    ? v.execution.reason
+    : executionForecast
+      ? `${chosenHorizon}m ${executionForecast.action}${executionForecast.suppressed ? ` · ${executionForecast.suppressed}` : ''}`
+      : `forecast ${chosenHorizon}m indisponibil`;
   let banner;
   if (SNIPER_MODE) {
-    banner = eligible
+    banner = eligible && forecastAllowsTrade
       ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${warnLine}`
-      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
+      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">${!eligible ? `nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}` : waitReason}</div></div>`;
   } else {
-    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`;
+    banner = forecastAllowsTrade
+      ? `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`
+      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">${waitReason}</div></div>`;
   }
 
   return `
@@ -107,6 +198,9 @@ function renderCard(v) {
       <span class="card-sym">${v.symbol}</span>
       <span class="card-price">${fmt(v.price)} USDT</span>
     </div>
+    <div class="chart-label"><span>Lumânări live · 1 minut</span><span>ultimele 120m</span></div>
+    <canvas class="candle-chart" data-chart="${v.symbol}" aria-label="Grafic cu lumânări de un minut"></canvas>
+    ${forecastGrid(v)}
     ${banner}
     ${ofRow(v)}
     <details class="analysis" data-sym="${v.symbol}" ${detailsOpen[v.symbol] ? 'open' : ''}>
@@ -136,6 +230,7 @@ function upsertCard(v) {
   }
   el.className = 'card ' + v.directie.toLowerCase();
   el.innerHTML = renderCard(v);
+  requestAnimationFrame(() => drawCandles(el.querySelector('.candle-chart'), v.chart || []));
   // Persist the analysis panel's open/closed state across live re-renders.
   const det = el.querySelector('details.analysis');
   if (det) {
@@ -242,7 +337,11 @@ function renderJournal(d) {
   if (!d || !d.stats) return;
   const s = d.stats;
   const box = (val, lbl) => `<div class="bt-box"><div class="big" style="font-size:20px">${val}</div><div class="lbl">${lbl}</div></div>`;
-  let html = box(wr(s.overall), 'general (toate)') + box(wr(s.sniper), '🎯 doar Sniper') + `<div class="bt-box"><div class="big" style="font-size:20px">${s.pending}</div><div class="lbl">în așteptare</div></div>`;
+  let html = box(wr(s.overall), 'general (toate)') +
+    box(`${s.overall.pnl >= 0 ? '+' : ''}${Number(s.overall.pnl || 0).toFixed(2)} USDT`, 'paper P&L') +
+    box(wr(s.sniper), '🎯 doar Sniper') +
+    `<div class="bt-box"><div class="big" style="font-size:20px">${s.pending}</div><div class="lbl">în așteptare</div></div>` +
+    `<div class="bt-box"><div class="big" style="font-size:20px">${s.void || 0}</div><div class="lbl">VOID (fără settlement)</div></div>`;
   if (s.byInterval) {
     html += box(wr(s.byInterval['10 minute']), 'fereastră 10 min') + box(wr(s.byInterval['30 minute']), 'fereastră 30 min');
   }
@@ -255,9 +354,14 @@ function renderJournal(d) {
   $('journalStats').innerHTML = html;
 
   const rows = (d.recent || []).map((e) => {
+    const pnl = e.status === 'resolved' && Number.isFinite(e.pnl) && e.stake > 0
+      ? ` · <b class="${e.pnl >= 0 ? 'ok' : 'bad'}">${e.pnl >= 0 ? '+' : ''}${Number(e.pnl).toFixed(2)} USDT</b>`
+      : '';
     const st = e.status === 'pending'
       ? '<span class="muted">⏳ în așteptare</span>'
-      : (e.win ? '<span class="adir up">✓ WIN</span>' : '<span class="adir down">✗ LOSS</span>');
+      : e.status === 'void'
+        ? '<span class="muted">VOID · settlement indisponibil</span>'
+        : (e.win ? `<span class="adir up">✓ WIN${pnl}</span>` : `<span class="adir down">✗ LOSS${pnl}</span>`);
     const dir = e.directie === 'UP' ? '▲' : '▼';
     const exit = e.exitPrice != null ? fmt(e.exitPrice) : '—';
     return `<div class="jrow">
@@ -311,6 +415,7 @@ async function loadState() {
   $('adaptiveInterval').checked = c.adaptiveInterval !== false;
   if (c.payout10) $('payout10').value = c.payout10;
   if (c.payout30) $('payout30').value = c.payout30;
+  if (c.paperStake) $('paperStake').value = c.paperStake;
   $('useOrderFlow').checked = c.useOrderFlow !== false;
   $('requireOfAgree').checked = !!c.requireOfAgree;
   $('useLearning').checked = c.useLearning !== false;
@@ -341,6 +446,7 @@ async function saveSettings() {
     adaptiveInterval: $('adaptiveInterval').checked,
     payout10: Number($('payout10').value),
     payout30: Number($('payout30').value),
+    paperStake: Number($('paperStake').value),
     useOrderFlow: $('useOrderFlow').checked,
     requireOfAgree: $('requireOfAgree').checked,
     useLearning: $('useLearning').checked,
