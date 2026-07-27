@@ -14,20 +14,28 @@ Aplicație locală (stil PinPilot) care citește **date live de pe MEXC**, calcu
 - **Paper trading local**: fiecare alertă este evaluată automat, cu miză și payout configurabile, win-rate și P&L în USDT; nu plasează ordine reale.
 - **Backtest** pe istoric real: îți arată win-rate-ul pe niveluri de încredere, **fără look-ahead**.
 
-## Cum pornești (la fel ca PinPilot)
+## Pornire rapidă pe Windows 10/11 64-bit (ZIP → extragi → dublu-click)
+
+1. Descarcă arhiva ZIP a aplicației și extrage tot folderul.
+2. Dă dublu-click pe **`PORNESTE-SIGNALPILOT.bat`**.
+3. La prima pornire, launcherul descarcă automat în folder un runtime oficial Node.js dacă lipsește, verifică suma SHA256 și instalează dependențele. Pe Windows 64-bit x64/ARM64 nu cere instalare manuală sau drepturi de administrator.
+4. Browserul se deschide automat la **http://localhost:3010**. Pentru oprire, închide fereastra SignalPilot.
+
+Prima pornire necesită internet și poate dura câteva minute. Pornirile următoare refolosesc runtime-ul și dependențele locale. Folderele generate `.runtime` și `node_modules` pot rămâne lângă aplicație.
+
+## Pornire din terminal (Windows/macOS/Linux)
 
 ```bash
 npm install
 npm start
 ```
 
-Apoi deschide în browser: **http://localhost:3005**
-(Portul 3005 e ales ca să ruleze în paralel cu PinPilot (3004) și versiuni mai vechi de SignalPilot. Poți schimba portul cu variabila de mediu PORT.)
+Apoi deschide în browser: **http://localhost:3010**. Portul implicit este 3010 și poate fi schimbat cu variabila de mediu `PORT`.
 
 Intervalul (10 vs 30 min) e ales automat după tipul setup-ului: sweep/momentum rapid → **10 min**, structură (FVG, trend) → **30 min**. Deci apar ambele. Payout-ul introdus în Setări e folosit pentru a afișa EV-ul (valoarea așteptată) și, opțional, pentru a comuta 10→30 când payout-ul pe 10 min e slab.
 Ca să oprești: închide fereastra / `Ctrl+C`.
 
-Pe Windows poți da dublu-click pe **`start.bat`**.
+Fișierul vechi **`start.bat`** redirecționează către același launcher automat.
 
 ## Setări (în UI, se salvează în `config.json`)
 

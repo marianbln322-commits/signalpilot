@@ -2,7 +2,7 @@
 
 // ============================================================================
 // SignalPilot server — always-on local app (PinPilot style).
-// Serves the UI at http://localhost:3005, polls MEXC, runs the engine on a
+// Serves the UI at http://localhost:3010, polls MEXC, runs the engine on a
 // scheduler, pushes live updates over SSE, and alerts on good setups.
 // ============================================================================
 
@@ -26,9 +26,8 @@ const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
 
-// Port 3005 by default so it runs alongside PinPilot (3004) and older
-// SignalPilot versions (3001/3002). Override with the PORT env var if needed.
-const PORT = process.env.PORT || 3005;
+// Port 3010 by default. Override with the PORT environment variable when needed.
+const PORT = Number(process.env.PORT) || 3010;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const DEFAULT_CONFIG = {
   symbols: ['BTCUSDT', 'ETHUSDT'],
@@ -622,7 +621,7 @@ app.get('/api/stream', (req, res) => {
 // Start on PORT, but if it's already in use (another window open), automatically
 // try the next port instead of crashing. This makes double-clicking safe.
 function startServer(port, attemptsLeft) {
-  const server = app.listen(port, async () => {
+  const server = app.listen(port, '127.0.0.1', () => {
     console.log('====================================================');
     console.log('  SignalPilot — MEXC live UP/DOWN engine');
     console.log('====================================================');
@@ -631,11 +630,13 @@ function startServer(port, attemptsLeft) {
     console.log(`  Symbols: ${config.symbols.join(', ')}`);
     console.log('  (Se deschide singur in browser. Ca sa opresti: inchide fereastra.)');
     console.log('====================================================');
-    const ok = await mexc.ping().catch(() => false);
-    console.log(ok ? '  MEXC reachable: OK' : '  WARNING: MEXC not reachable from this machine.');
     startScheduler();
     startResolver();
     if (process.env.NO_OPEN !== '1') openBrowser(`http://localhost:${port}`);
+    // Reachability is informational and must never delay the UI opening.
+    mexc.ping()
+      .then((ok) => console.log(ok ? '  MEXC reachable: OK' : '  WARNING: MEXC not reachable from this machine.'))
+      .catch(() => console.log('  WARNING: MEXC not reachable from this machine.'));
   });
   server.on('error', (err) => {
     if (err.code === 'EADDRINUSE' && attemptsLeft > 0) {
