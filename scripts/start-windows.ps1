@@ -5,6 +5,21 @@ $ProgressPreference = 'SilentlyContinue'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $projectRoot
 $env:PORT = '3010'
+$env:NO_OPEN = '1'
+
+function Test-LocalTcpPort {
+  param([int]$Port)
+  $client = New-Object System.Net.Sockets.TcpClient
+  try {
+    $connectTask = $client.ConnectAsync('127.0.0.1', $Port)
+    if (-not $connectTask.Wait(500)) { return $false }
+    return $client.Connected
+  } catch {
+    return $false
+  } finally {
+    $client.Dispose()
+  }
+}
 
 function Test-NodeRuntime {
   param([string]$NodePath)
@@ -108,22 +123,18 @@ try {
   $serverProcess = Start-Process -FilePath $nodePath -ArgumentList @("`"$serverPath`"") -WorkingDirectory $projectRoot -NoNewWindow -PassThru
   try {
     $ready = $false
-    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+    for ($attempt = 0; $attempt -lt 40; $attempt++) {
       if ($serverProcess.HasExited) {
         throw "Serverul SignalPilot s-a oprit cu codul $($serverProcess.ExitCode)."
       }
-      try {
-        $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://localhost:3010/api/state' -TimeoutSec 2
-        if ($response.StatusCode -eq 200) {
-          $ready = $true
-          break
-        }
-      } catch {
-        Start-Sleep -Milliseconds 500
+      if (Test-LocalTcpPort -Port 3010) {
+        $ready = $true
+        break
       }
+      Start-Sleep -Milliseconds 250
     }
     if (-not $ready) {
-      throw 'Serverul nu a devenit disponibil la localhost:3010 in timpul asteptat.'
+      throw 'Procesul ruleaza, dar portul local 3010 nu accepta conexiuni.'
     }
 
     Start-Process 'http://localhost:3010'
