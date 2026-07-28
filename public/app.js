@@ -8,15 +8,21 @@ const cardsEl = $('cards');
 const alertsEl = $('alerts');
 let cards = {}; // symbol -> element
 let soundOn = true;
-let SNIPER_MODE = true; // set from server config on load
-let ACTIVE_HOURS = [6, 7, 8, 9, 13, 14, 15, 16, 17]; // UTC, set from config
+let SNIPER_MODE = false; // set from server config on load
+let CONTINUOUS_MODE = true;
+let ACTIVE_HOURS = Array.from({ length: 24 }, (_, hour) => hour); // UTC, set from config
 const detailsOpen = {}; // per-symbol: keep the analysis panel open across live re-renders
 
 function updateSessionBadge() {
-  const nowUtc = new Date().getUTCHours();
-  const active = ACTIVE_HOURS.includes(nowUtc);
   const el = $('sessionBadge');
   if (!el) return;
+  if (CONTINUOUS_MODE) {
+    el.textContent = '🟢 Monitorizare 24/7';
+    el.className = 'badge badge-on';
+    return;
+  }
+  const nowUtc = new Date().getUTCHours();
+  const active = ACTIVE_HOURS.includes(nowUtc);
   if (active) {
     el.textContent = '🟢 Sesiune ACTIVĂ';
     el.className = 'badge badge-on';
@@ -101,12 +107,23 @@ function forecastGrid(v) {
       <div class="forecast-learned">${calibrated ? '🧠' : '📐'} ${metricLabel}</div>
       <div class="prob-track"><i class="prob-down" style="width:${down}%"></i><i class="prob-up" style="width:${up}%"></i></div>
       <div class="forecast-probs"><span>DOWN ${down}%</span><span>UP ${up}%</span></div>
-      <div class="forecast-tfs">Analiză: ${(forecast.timeframes || []).join(' · ')}${forecast.breakEven ? ` · break-even ${(forecast.breakEven * 100).toFixed(1)}%` : ''}</div>
+      <div class="forecast-tfs">Analiză: ${(forecast.timeframes || []).join(' · ')}${forecast.requiredProbability ? ` · prag ${(forecast.requiredProbability * 100).toFixed(1)}%` : ''}${forecast.calibrationSampleSize ? ` · eșantion ${forecast.calibrationSampleSize}` : ''}</div>
+      ${calibrated && Number.isFinite(forecast.reliabilityLowerBound) ? `<div class="forecast-learned">Limită conservatoare 90%: ${(forecast.reliabilityLowerBound * 100).toFixed(1)}%</div>` : ''}
       ${forecast.suppressed ? `<div class="forecast-suppressed">⛔ ${forecast.suppressed}</div>` : ''}
       <ul>${(forecast.reasons || []).slice(0, 4).map((reason) => `<li>${reason}</li>`).join('')}</ul>
     </div>`;
   };
   return `<div class="forecast-grid">${card(10)}${card(30)}</div>`;
+}
+
+function liveCharts(v) {
+  const charts = v.charts || (v.chart ? { '1m': v.chart } : {});
+  const ordered = ['1m', '3m', '5m', '15m', '30m'].filter((timeframe) => Array.isArray(charts[timeframe]) && charts[timeframe].length > 1);
+  return `<div class="market-chart-grid">${ordered.map((timeframe) => `
+    <div class="market-chart-panel">
+      <div class="chart-label"><span>MEXC ${timeframe}${timeframe === '3m' ? ' · agregat din 1m' : ''}</span><span>live</span></div>
+      <canvas class="candle-chart" data-chart-tf="${timeframe}" aria-label="Grafic MEXC ${timeframe}"></canvas>
+    </div>`).join('')}</div>`;
 }
 
 function drawCandles(canvas, candles) {
@@ -198,8 +215,7 @@ function renderCard(v) {
       <span class="card-sym">${v.symbol}</span>
       <span class="card-price">${fmt(v.price)} USDT</span>
     </div>
-    <div class="chart-label"><span>Lumânări live · 1 minut</span><span>ultimele 120m</span></div>
-    <canvas class="candle-chart" data-chart="${v.symbol}" aria-label="Grafic cu lumânări de un minut"></canvas>
+    ${liveCharts(v)}
     ${forecastGrid(v)}
     ${banner}
     ${ofRow(v)}
@@ -216,7 +232,7 @@ function renderCard(v) {
       ${ai}
       <div class="snap">${snapChips(v.snapshots)}</div>
     </details>
-    <div class="muted" style="margin-top:8px;font-size:11px">preț live · actualizat ${new Date(v.ts).toLocaleTimeString('ro-RO')}</div>
+    <div class="muted" style="margin-top:8px;font-size:11px">sursă: ${v.marketData ? v.marketData.source : 'MEXC'} · grafice actualizate ${new Date(v.marketData ? v.marketData.fetchedAt : v.ts).toLocaleTimeString('ro-RO')} · analiză pe lumânări închise · scan ${v.marketData ? v.marketData.scanIntervalSec : '—'}s</div>
   `;
 }
 
@@ -230,7 +246,12 @@ function upsertCard(v) {
   }
   el.className = 'card ' + v.directie.toLowerCase();
   el.innerHTML = renderCard(v);
-  requestAnimationFrame(() => drawCandles(el.querySelector('.candle-chart'), v.chart || []));
+  requestAnimationFrame(() => {
+    const chartData = v.charts || (v.chart ? { '1m': v.chart } : {});
+    el.querySelectorAll('.candle-chart').forEach((canvas) => {
+      drawCandles(canvas, chartData[canvas.dataset.chartTf] || []);
+    });
+  });
   // Persist the analysis panel's open/closed state across live re-renders.
   const det = el.querySelector('details.analysis');
   if (det) {
@@ -407,10 +428,12 @@ async function loadState() {
   $('symbols').value = (c.symbols || []).join('\n');
   $('scanInterval').value = c.scanIntervalSec;
   $('alertMinConfidence').value = c.alertMinConfidence;
-  SNIPER_MODE = c.sniperMode !== false;
+  CONTINUOUS_MODE = c.continuousMode !== false;
+  SNIPER_MODE = c.sniperMode === true;
   if (Array.isArray(c.activeHoursUTC) && c.activeHoursUTC.length) ACTIVE_HOURS = c.activeHoursUTC;
   updateSessionBadge();
-  $('sniperMode').checked = c.sniperMode !== false;
+  $('continuousMode').checked = CONTINUOUS_MODE;
+  $('sniperMode').checked = SNIPER_MODE;
   $('sniperRequireVolume').checked = !!c.sniperRequireVolume;
   $('adaptiveInterval').checked = c.adaptiveInterval !== false;
   if (c.payout10) $('payout10').value = c.payout10;
@@ -419,6 +442,8 @@ async function loadState() {
   $('useOrderFlow').checked = c.useOrderFlow !== false;
   $('requireOfAgree').checked = !!c.requireOfAgree;
   $('useLearning').checked = c.useLearning !== false;
+  if (c.minCalibrationSamples) $('minCalibrationSamples').value = c.minCalibrationSamples;
+  if (c.minCalibratedWinRate) $('minCalibratedWinRate').value = c.minCalibratedWinRate;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -441,6 +466,7 @@ async function saveSettings() {
     symbols,
     scanIntervalSec: Number($('scanInterval').value),
     alertMinConfidence: $('alertMinConfidence').value,
+    continuousMode: $('continuousMode').checked,
     sniperMode: $('sniperMode').checked,
     sniperRequireVolume: $('sniperRequireVolume').checked,
     adaptiveInterval: $('adaptiveInterval').checked,
@@ -450,6 +476,8 @@ async function saveSettings() {
     useOrderFlow: $('useOrderFlow').checked,
     requireOfAgree: $('requireOfAgree').checked,
     useLearning: $('useLearning').checked,
+    minCalibrationSamples: Number($('minCalibrationSamples').value),
+    minCalibratedWinRate: Number($('minCalibratedWinRate').value),
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,

@@ -32,8 +32,8 @@
         </label>
       </div>
       <div class="howto">
-        <b>Cum se folosește:</b> aplicația citește prețul MEXC live și îl analizează singură (nu desenează grafic — îți dă direct concluzia).
-        În <b>Sniper Mode</b>, aștepți banner-ul verde/roșu <b>🎯 INTRĂ</b>: atunci deschizi MEXC → event futures pe moneda respectivă și pui <b>UP</b> sau <b>DOWN</b> pe fereastra afișată (10 sau 30 min). Cât timp vezi <b>⏳ AȘTEAPTĂ</b>, nu faci nimic. Fereastra (10 vs 30 min) o alege singură în funcție de tipul setup-ului.
+        <b>Cum se folosește:</b> aplicația sincronizează graficele MEXC 1m/3m/5m/15m/30m și analizează numai lumânări închise.
+        Aștepți banner-ul verde/roșu <b>INTRĂ</b>: apare numai când setup-ul tehnic, istoricul forward comparabil, pragul de minimum 60%, fiabilitatea și payout-ul trec toate filtrele. Cât timp vezi <b>⏳ AȘTEAPTĂ</b>, nu faci nimic. Aplicația face doar analiză și paper trading; ordinul real nu este automatizat.
       </div>
       <div id="cards" class="cards"></div>
     </section>
@@ -58,7 +58,7 @@
     <!-- LEARNING -->
     <section class="panel">
       <div class="panel-head"><h2>🧠 Ce a învățat (din rezultatele tale)</h2></div>
-      <p class="muted" style="margin-top:-6px">Pe măsură ce jurnalul se umple, aplicația învață ce tipare îți merg și ce evită. Are nevoie de minim ~10 semnale per tipar ca să aibă încredere.</p>
+      <p class="muted" style="margin-top:-6px">Calibrarea este separată pe monedă + direcție + orizont și folosește implicit minimum 30 rezultate forward exacte.</p>
       <div id="learningBody" class="learning-body">
         <p class="muted">Încă strâng date — nimic învățat sigur deocamdată. Lasă aplicația să ruleze câteva sesiuni.</p>
       </div>
@@ -76,7 +76,7 @@ ETHUSDT</textarea>
           </div>
           <div class="field">
             <label>Interval scanare (secunde)</label>
-            <input type="number" id="scanInterval" min="3" value="8" />
+            <input type="number" id="scanInterval" min="3" value="3" />
             <label>Alertă de la încrederea (doar în mod normal)</label>
             <select id="alertMinConfidence">
               <option>Scăzut</option>
@@ -87,7 +87,8 @@ ETHUSDT</textarea>
         </div>
         <hr />
         <div class="sniper-panel">
-          <label class="switch-inline"><input type="checkbox" id="sniperMode" checked /> <b>🎯 Sniper Mode</b> — alertează DOAR pe setup-ul A+ (liquidity sweep + volum + ore active). Recomandat.</label>
+          <label class="switch-inline"><input type="checkbox" id="continuousMode" checked /> <b>24/7 continuu</b> — monitorizează și permite setup-uri validate la orice oră.</label>
+          <label class="switch-inline"><input type="checkbox" id="sniperMode" /> <b>🎯 Filtru Sniper suplimentar</b> — cere liquidity sweep; orele active sunt ignorate când modul 24/7 este pornit.</label>
           <div class="grid" style="margin-top:12px">
             <div class="field">
               <label>Ore active (ora TA locală, separate prin virgulă)</label>
@@ -120,8 +121,12 @@ ETHUSDT</textarea>
               <label class="switch-inline"><input type="checkbox" id="requireOfAgree" /> nu alerta când order flow e în conflict cu direcția</label>
             </div>
             <div class="field">
-              <label class="switch-inline"><input type="checkbox" id="useLearning" checked /> <b>🧠 Învățare din jurnal</b> — se calibrează din rezultatele tale și blochează tiparele pierzătoare</label>
-              <small class="muted">Are nevoie de minim ~10 semnale per tipar înainte să acționeze.</small>
+              <label class="switch-inline"><input type="checkbox" id="useLearning" checked /> <b>🧠 Învățare din jurnal</b> — calibrează separat simbolul, direcția și orizontul</label>
+              <label>Minimum rezultate exacte per cohortă</label>
+              <input type="number" id="minCalibrationSamples" min="30" max="500" value="30" />
+              <label>Prag minim win-rate calibrat (%)</label>
+              <input type="number" id="minCalibratedWinRate" min="60" max="90" step="0.1" value="60" />
+              <small class="muted">Implicit: minimum 30 rezultate forward exacte și win-rate observat ≥60%. Este un filtru statistic, nu o garanție pentru tranzacțiile viitoare.</small>
             </div>
         </div>
         <hr />

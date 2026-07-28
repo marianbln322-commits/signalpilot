@@ -104,8 +104,38 @@ try {
 
   Write-Host ''
   Write-Host 'Pornesc SignalPilot la http://localhost:3010 ...' -ForegroundColor Green
-  & $nodePath (Join-Path $projectRoot 'server.js')
-  exit $LASTEXITCODE
+  $serverPath = Join-Path $projectRoot 'server.js'
+  $serverProcess = Start-Process -FilePath $nodePath -ArgumentList @("`"$serverPath`"") -WorkingDirectory $projectRoot -NoNewWindow -PassThru
+  try {
+    $ready = $false
+    for ($attempt = 0; $attempt -lt 60; $attempt++) {
+      if ($serverProcess.HasExited) {
+        throw "Serverul SignalPilot s-a oprit cu codul $($serverProcess.ExitCode)."
+      }
+      try {
+        $response = Invoke-WebRequest -UseBasicParsing -Uri 'http://localhost:3010/api/state' -TimeoutSec 2
+        if ($response.StatusCode -eq 200) {
+          $ready = $true
+          break
+        }
+      } catch {
+        Start-Sleep -Milliseconds 500
+      }
+    }
+    if (-not $ready) {
+      throw 'Serverul nu a devenit disponibil la localhost:3010 in timpul asteptat.'
+    }
+
+    Start-Process 'http://localhost:3010'
+    Write-Host 'SignalPilot ruleaza. Inchide aceasta fereastra pentru oprire.' -ForegroundColor Green
+    Wait-Process -Id $serverProcess.Id
+    $serverProcess.Refresh()
+    exit $serverProcess.ExitCode
+  } finally {
+    if ($serverProcess -and -not $serverProcess.HasExited) {
+      Stop-Process -Id $serverProcess.Id -Force -ErrorAction SilentlyContinue
+    }
+  }
 } catch {
   Write-Host ''
   Write-Host "EROARE: $($_.Exception.Message)" -ForegroundColor Red
