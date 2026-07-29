@@ -9,6 +9,16 @@
 const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
+// Fail with a readable message instead of a cryptic "fetch is not defined" crash
+// deep inside a request. The exchange clients rely on the global fetch API, which
+// only exists from Node 18 onwards.
+const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
+if (NODE_MAJOR < 18) {
+  console.error(`\n  Ai Node.js v${process.versions.node}, dar aplicația are nevoie de v18 sau mai nou.`);
+  console.error('  Descarcă versiunea LTS de pe https://nodejs.org apoi pornește din nou.\n');
+  process.exit(1);
+}
+
 const express = require('express');
 
 function openBrowser(url) {
