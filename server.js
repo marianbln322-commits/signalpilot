@@ -26,6 +26,8 @@ const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
 const cal = require('./lib/calibration');
+const sizing = require('./lib/sizing');
+const { PriceTape } = require('./lib/priceTape');
 
 // Port 3005 by default so it runs alongside PinPilot (3004) and older
 // SignalPilot versions (3001/3002). Override with the PORT env var if needed.
@@ -56,6 +58,24 @@ const DEFAULT_CONFIG = {
   requireEvGate: true,   // never alert on a signal whose EV is not provably positive
   evMarginPct: 1.5,      // required cushion above break-even
   calibrationMinSample: 30, // resolved outcomes needed before a bucket is trusted
+
+  // Position sizing. Stakes are derived from the measured edge via fractional
+  // Kelly on the CONSERVATIVE probability, then hard-capped. See lib/sizing.js.
+  bankroll: 1000,
+  kellyFractionMultiplier: 0.25,
+  maxStakePct: 5,
+  minStakePct: 0.5,
+
+  // Entry window. A verdict is computed at bar close; entering several minutes
+  // later is a materially different trade (shorter effective horizon, different
+  // entry price), so a stale signal is not actionable.
+  maxEntryDelaySec: 90,
+
+  // Settlement. MEXC determines Up/Down settlement from a composite index with a
+  // time-weighted average, so outcomes are graded on a TWAP over the final
+  // seconds rather than a single tick.
+  settlementTwapSec: 30,
+  priceSampleSec: 3,
   // Live order flow (order book + trade aggression). Confirms/vetoes direction.
   useOrderFlow: true,
   requireOfAgree: false, // if true, only alert when order flow does NOT conflict
@@ -77,6 +97,9 @@ const sseClients = new Set();
 // than to the poll: previously the same bar was re-evaluated every 8 seconds.
 const lastActedBar = {};
 let scanning = false;       // re-entrancy guard for the scheduler
+// Rolling price tape, sampled independently of the scan loop, so settlement can
+// use a time-weighted average over the final seconds of a contract window.
+const tape = new PriceTape();
 
 function loadCalibration() {
   try {
@@ -215,6 +238,32 @@ async function scanSymbol(symbol) {
       verdict.gate = altGate;
       verdict.ev.chosen = alt;
     }
+
+    // ---- Position sizing --------------------------------------------------
+    // Bigger edge -> bigger stake, but derived from the conservative probability
+    // and shrunk by how many outcomes it rests on. See lib/sizing.js for why the
+    // cap matters: a binary contract has no partial exit.
+    verdict.sizing = sizing.recommend(verdict.gate, payoutFor(verdict.interval), {
+      bankroll: config.bankroll,
+      kellyFractionMultiplier: config.kellyFractionMultiplier,
+      maxStakePct: config.maxStakePct,
+      minStakePct: config.minStakePct,
+    });
+
+    // ---- Entry window -----------------------------------------------------
+    // The verdict describes the bar that just closed. Acting on it 6 minutes
+    // later is a different trade: the effective horizon is shorter and the entry
+    // price has moved. Signals therefore expire.
+    const closeTs = verdict.barCloseTime || verdict.ts;
+    const deadlineTs = closeTs + config.maxEntryDelaySec * 1000;
+    const secondsLeft = Math.round((deadlineTs - Date.now()) / 1000);
+    verdict.entryWindow = {
+      barCloseTime: closeTs,
+      deadlineTs,
+      secondsLeft,
+      stale: secondsLeft <= 0,
+      maxEntryDelaySec: config.maxEntryDelaySec,
+    };
   }
 
   // Optional Gemini narration (numbers only, never an image).
@@ -321,6 +370,20 @@ async function scanSymbol(symbol) {
     }
   }
 
+  // Staleness veto: never alert on a bar whose entry window has already passed
+  // (e.g. after the app was asleep, or a slow poll).
+  if (shouldAlert && verdict.entryWindow && verdict.entryWindow.stale) {
+    shouldAlert = false;
+    verdict.suppressed = `semnal expirat (bara s-a închis acum ${Math.round((Date.now() - verdict.entryWindow.barCloseTime) / 1000)}s, limita e ${config.maxEntryDelaySec}s)`;
+  }
+
+  // Sizing veto: if the measured edge is too small to justify a minimum stake,
+  // there is nothing to trade even though the direction may be right.
+  if (shouldAlert && verdict.sizing && verdict.sizing.stake <= 0) {
+    shouldAlert = false;
+    verdict.suppressed = verdict.sizing.reason;
+  }
+
   // Order-flow veto: optionally require live order flow to not contradict.
   if (shouldAlert && config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
     shouldAlert = false;
@@ -343,6 +406,11 @@ async function scanSymbol(symbol) {
       setup: verdict.setup,
       probability: verdict.prediction ? verdict.prediction.probability : null,
       ev: verdict.gate ? verdict.gate.ev : null,
+      stake: verdict.sizing ? verdict.sizing.stake : null,
+      stakePct: verdict.sizing ? verdict.sizing.pctOfBankroll : null,
+      tier: verdict.sizing ? verdict.sizing.tier : null,
+      tierLabel: verdict.sizing ? verdict.sizing.tierLabel : null,
+      deadlineTs: verdict.entryWindow ? verdict.entryWindow.deadlineTs : null,
       price: verdict.price,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
@@ -361,19 +429,48 @@ async function scanSymbol(symbol) {
     });
     broadcast('alert', alert);
     if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
-    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} ${alert.probability != null ? alert.probability + '%' : 'necalibrat'} (EV ${alert.ev != null ? alert.ev + '%' : '?'}) @ ${verdict.price}`);
+    console.log(`[ALERT${alert.sniper ? ' 🎯' : ''}] ${symbol} ${verdict.directie} ${verdict.interval} · p=${alert.probability != null ? alert.probability + '%' : 'n/a'} EV=${alert.ev != null ? alert.ev + '%' : '?'} · miză ${alert.tierLabel} ${alert.stake} (${alert.stakePct}%) @ ${verdict.price}`);
   }
   return verdict;
+}
+
+// Settlement price for one entry: a time-weighted average over the final
+// `settlementTwapSec` before expiry, matching how MEXC states Up/Down contracts
+// are settled (composite index + TWAP). Falls back to a live tick only if the
+// tape has no samples in the window, and records which method was used so the
+// journal never silently mixes the two.
+async function settlePrice(symbol, resolveTs) {
+  const windowMs = config.settlementTwapSec * 1000;
+  const t = tape.twap(symbol, resolveTs - windowMs, resolveTs);
+  if (t && Number.isFinite(t.price)) return t;
+  try {
+    const p = await mexc.fetchPrice(symbol);
+    return { price: p, method: 'last-price-fallback', samples: 1 };
+  } catch {
+    return null;
+  }
+}
+
+// Independent price sampler feeding the tape. Kept separate from the scan loop
+// so settlement resolution does not depend on scan cadence or on scans succeeding.
+async function samplePrices() {
+  await Promise.all(config.symbols.map(async (sym) => {
+    try {
+      const p = await mexc.fetchPrice(sym);
+      tape.push(sym, p);
+    } catch { /* transient; next tick */ }
+  }));
 }
 
 // Background resolver: closes out pending journal entries automatically.
 async function resolveJournal() {
   try {
-    const resolved = await journal.resolvePending((sym) => mexc.fetchPrice(sym));
+    const resolved = await journal.resolvePending(settlePrice);
     if (resolved.length) {
       broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
       for (const r of resolved) {
-        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice}->${r.exitPrice} => ${r.win ? 'WIN' : 'LOSS'}`);
+        const m = r.settlement ? `${r.settlement.method}/${r.settlement.samples}` : '?';
+        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice} -> ${Number(r.exitPrice).toFixed(4)} (${m}) => ${r.win ? 'WIN' : 'LOSS'}`);
       }
     }
   } catch (e) {
@@ -417,7 +514,16 @@ function startScheduler() {
 let resolveTimer = null;
 function startResolver() {
   if (resolveTimer) clearInterval(resolveTimer);
-  resolveTimer = setInterval(resolveJournal, 10000);
+  resolveTimer = setInterval(resolveJournal, 5000);
+}
+
+// Price sampler: fast and cheap, feeds the TWAP tape used for settlement.
+let sampleTimer = null;
+function startSampler() {
+  if (sampleTimer) clearInterval(sampleTimer);
+  const ms = Math.max(1, config.priceSampleSec) * 1000;
+  sampleTimer = setInterval(samplePrices, ms);
+  samplePrices();
 }
 
 // ---- HTTP -------------------------------------------------------------------
@@ -432,6 +538,13 @@ app.get('/api/state', (req, res) => {
     alerts,
     journal: { stats: journal.stats(), recent: journal.recent(40) },
     learning: learning.summary(journal.all()),
+    calibration: calModel ? { total: calModel.total, fittedAt: calModel.fittedAt, minSample: calModel.minSample } : null,
+    // Settlement readiness: without price samples, outcomes fall back to a single
+    // tick, which is not how the contract settles. Surfaced so it is visible.
+    settlement: {
+      twapSec: config.settlementTwapSec,
+      tape: Object.fromEntries(config.symbols.map((s) => [s, tape.stats(s)])),
+    },
   });
 });
 
@@ -488,6 +601,23 @@ app.post('/api/config', (req, res) => {
     const v = Number(body.calibrationMinSample);
     if (v >= 10 && v <= 500) config.calibrationMinSample = v;
   }
+  if (body.bankroll != null) {
+    const v = Number(body.bankroll);
+    if (v > 0 && v <= 1e9) config.bankroll = v;
+  }
+  if (body.kellyFractionMultiplier != null) {
+    const v = Number(body.kellyFractionMultiplier);
+    // Above full Kelly is never a defensible setting, so it is not accepted.
+    if (v > 0 && v <= 1) config.kellyFractionMultiplier = v;
+  }
+  if (body.maxStakePct != null) {
+    const v = Number(body.maxStakePct);
+    if (v > 0 && v <= 25) config.maxStakePct = v;
+  }
+  if (body.maxEntryDelaySec != null) {
+    const v = Number(body.maxEntryDelaySec);
+    if (v >= 10 && v <= 600) config.maxEntryDelaySec = v;
+  }
   if (Array.isArray(body.activeHoursUTC)) {
     config.activeHoursUTC = body.activeHoursUTC
       .map((h) => Number(h))
@@ -510,6 +640,7 @@ app.post('/api/config', (req, res) => {
   }
   saveConfig();
   startScheduler();
+  startSampler(); // symbols or cadence may have changed
   res.json({ ok: true, config: { ...config, gemini: { ...config.gemini, apiKey: config.gemini.apiKey ? '********' : '' } } });
 });
 
@@ -631,6 +762,7 @@ function startServer(port, attemptsLeft) {
     console.log(ok ? '  MEXC reachable: OK' : '  WARNING: MEXC not reachable from this machine.');
     startScheduler();
     startResolver();
+    startSampler();
     if (process.env.NO_OPEN !== '1') openBrowser(`http://localhost:${port}`);
   });
   server.on('error', (err) => {

@@ -219,6 +219,79 @@ section('5. Event-futures arithmetic');
 }
 
 // ===========================================================================
+section('6. Position sizing: stake must scale with the MEASURED edge');
+
+{
+  const sizing = require('../lib/sizing');
+  const gateFor = (p, n, payout = 82) => {
+    const wins = Math.round((p * n) / 100);
+    const ci = cal.wilson(wins, n);
+    const ci90 = cal.wilson(wins, n, 1.2815516);
+    return cal.decide({ ready: true, probability: p, ciLow: ci.low, ciHigh: ci.high, ciLow90: ci90.low, n }, payout);
+  };
+
+  const weak = sizing.recommend(gateFor(54, 300), 82, { bankroll: 1000 });
+  const thin = sizing.recommend(gateFor(70, 12), 82, { bankroll: 1000 });
+  const good = sizing.recommend(gateFor(63, 400), 82, { bankroll: 1000 });
+  const huge = sizing.recommend(gateFor(85, 500), 82, { bankroll: 1000 });
+
+  check('no stake when the edge does not clear break-even', weak.stake === 0, weak.reason);
+  check('no stake on a great-looking but tiny sample', thin.stake === 0, `n=12 -> ${thin.stake}`);
+  check('a real edge produces a stake', good.stake > 0, `${good.stake} (${good.pctOfBankroll}%) ${good.tierLabel}`);
+  check('bigger edge produces a bigger stake', huge.pctOfBankroll >= good.pctOfBankroll,
+    `${good.pctOfBankroll}% -> ${huge.pctOfBankroll}%`);
+  check('stake never exceeds the hard cap', huge.pctOfBankroll <= 5, `${huge.pctOfBankroll}% cap 5%`);
+  check('cap is enforced even at an absurd edge',
+    sizing.recommend(gateFor(95, 2000), 82, { bankroll: 1000, maxStakePct: 3 }).pctOfBankroll <= 3);
+  check('stake scales linearly with bankroll',
+    Math.abs(sizing.recommend(gateFor(63, 400), 82, { bankroll: 2000 }).stake - good.stake * 2) < 0.05);
+  check('sizing refuses when probability is unknown',
+    sizing.recommend(cal.decide({ ready: false, source: 'x' }, 82), 82).stake === 0);
+  // Thin samples must be discounted, not trusted equally.
+  check('sample-size trust grows with n', sizing.sampleTrust(50, 200) < sizing.sampleTrust(200, 200),
+    `${sizing.sampleTrust(50, 200).toFixed(2)} < ${sizing.sampleTrust(200, 200).toFixed(2)}`);
+}
+
+// ===========================================================================
+section('7. Settlement: TWAP, not a single tick');
+
+{
+  const { PriceTape } = require('../lib/priceTape');
+  const t0 = 1700000000000;
+
+  // Price sits flat at 3000, then spikes to 3060 on the very last tick — the
+  // classic case where a single-tick comparison and a TWAP disagree.
+  const tape = new PriceTape();
+  for (let i = 0; i < 30; i++) tape.push('ETHUSDT', i === 29 ? 3060 : 3000, t0 + i * 1000);
+
+  const last = tape.latest('ETHUSDT').price;
+  const twap = tape.twap('ETHUSDT', t0, t0 + 29000);
+  check('a final spike moves the last tick', last === 3060, `last=${last}`);
+  check('the same spike barely moves the TWAP', Math.abs(twap.price - 3000) < 1,
+    `TWAP=${twap.price.toFixed(2)} vs tick=${last}`);
+  check('TWAP reports its method and sample count', twap.method === 'twap' && twap.samples === 30);
+
+  // An entry at 3010 would be scored a WIN for UP on the tick and a LOSS on the
+  // TWAP. That divergence is exactly what made the old journal untrustworthy.
+  const entry = 3010;
+  check('tick and TWAP genuinely disagree on the outcome',
+    (last > entry) !== (twap.price > entry),
+    `UP from ${entry}: tick says ${last > entry ? 'WIN' : 'LOSS'}, TWAP says ${twap.price > entry ? 'WIN' : 'LOSS'}`);
+
+  check('empty window yields no price rather than a guess',
+    tape.twap('ETHUSDT', t0 - 100000, t0 - 90000) === null);
+  check('unknown symbol yields no price', tape.twap('NOPE', t0, t0 + 1000) === null);
+
+  // Uneven sampling: a burst of ticks must not outvote a long steady stretch.
+  const t2 = new PriceTape();
+  t2.push('X', 100, t0);
+  for (let i = 0; i < 20; i++) t2.push('X', 200, t0 + 59000 + i * 10); // burst at the end
+  const w = t2.twap('X', t0, t0 + 60000);
+  check('time-weighting beats tick-counting', w.price < 150,
+    `TWAP=${w.price.toFixed(1)} (a plain mean of ticks would be ~195)`);
+}
+
+// ===========================================================================
 console.log(`\n${'='.repeat(60)}`);
 console.log(`  ${passed} passed, ${failed} failed`);
 console.log('='.repeat(60));

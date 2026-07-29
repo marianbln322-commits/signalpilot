@@ -103,17 +103,41 @@ function renderCard(v) {
 
   const gateOk = !!(gate && gate.trade);
   const needsData = !!(gate && gate.needsData);
-  const tradeable = gateOk && (!SNIPER_MODE || eligible);
+  const sz = v.sizing;
+  const hasStake = !!(sz && sz.stake > 0);
+  const tradeable = gateOk && hasStake && (!SNIPER_MODE || eligible);
+
+  // Stake block: the emphasis a trader actually needs — how much, and how much
+  // time is left to act on a signal computed at the last bar close.
+  const stakeBlock = hasStake ? `
+    <div class="stake-row tier-${sz.tier}">
+      <div class="stake-main">
+        <span class="stake-tier">${sz.tierLabel}</span>
+        <span class="stake-amt">${fmt(sz.stake)} <span class="muted">USDT</span></span>
+        <span class="stake-pct">${sz.pctOfBankroll}% din ${fmt(sz.bankroll)}</span>
+      </div>
+      <div class="stake-note muted">edge <b>${sz.edgePct}</b> puncte peste pragul de rentabilitate · Kelly integral ${sz.kellyFull}% → folosit ${sz.kellyUsed}% · încredere statistică ${(sz.trust * 100).toFixed(0)}% (${gate.n} rezultate)</div>
+      ${(sz.warnings || []).map((w) => `<div class="stake-warn">⚠️ ${w}</div>`).join('')}
+    </div>` : '';
+
+  const ew = v.entryWindow;
+  const countdown = ew && !ew.stale
+    ? `<div class="entry-window" data-deadline="${ew.deadlineTs}">⏱ timp de intrare: <b>${Math.max(0, ew.secondsLeft)}s</b> <span class="muted">(bara s-a închis la ${new Date(ew.barCloseTime).toLocaleTimeString('ro-RO')})</span></div>`
+    : '';
 
   let banner;
   if (v.directie === 'NEUTRU') {
     banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">fără declanșator valid — nicio poziție</div></div>`;
   } else if (tradeable) {
-    banner = `<div class="cta go ${dir}">${SNIPER_MODE ? '🎯 ' : ''}INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>`;
+    banner = `<div class="cta go ${dir}">${SNIPER_MODE ? '🎯 ' : ''}INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${stakeBlock}${countdown}`;
   } else if (needsData) {
     banner = `<div class="cta wait">📊 FĂRĂ DATE — nu intra<div class="cta-sub">motorul vede ${v.directie} ${v.interval} (${v.setup}), dar nu are încă o probabilitate verificată. Rulează calibrarea sau lasă jurnalul să adune rezultate.</div></div>`;
   } else if (!gateOk) {
     banner = `<div class="cta wait">🚫 EV NEGATIV — sari peste<div class="cta-sub">${gate ? gate.reason : 'EV nefavorabil'}</div></div>`;
+  } else if (ew && ew.stale) {
+    banner = `<div class="cta wait">⌛ SEMNAL EXPIRAT<div class="cta-sub">bara s-a închis acum peste ${ew.maxEntryDelaySec}s — intrarea acum ar fi alt trade (orizont mai scurt, alt preț). Aștepți bara următoare.</div></div>`;
+  } else if (!hasStake) {
+    banner = `<div class="cta wait">🔍 EDGE PREA MIC<div class="cta-sub">${sz ? sz.reason : 'nu justifică o miză minimă'}</div></div>`;
   } else {
     banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
   }
@@ -344,6 +368,10 @@ async function loadState() {
   $('requireEvGate').checked = c.requireEvGate !== false;
   if (c.evMarginPct != null) $('evMarginPct').value = c.evMarginPct;
   if (c.calibrationMinSample != null) $('calibrationMinSample').value = c.calibrationMinSample;
+  if (c.bankroll != null) $('bankroll').value = c.bankroll;
+  if (c.kellyFractionMultiplier != null) $('kellyFractionMultiplier').value = c.kellyFractionMultiplier;
+  if (c.maxStakePct != null) $('maxStakePct').value = c.maxStakePct;
+  if (c.maxEntryDelaySec != null) $('maxEntryDelaySec').value = c.maxEntryDelaySec;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -377,6 +405,10 @@ async function saveSettings() {
     requireEvGate: $('requireEvGate').checked,
     evMarginPct: Number($('evMarginPct').value),
     calibrationMinSample: Number($('calibrationMinSample').value),
+    bankroll: Number($('bankroll').value),
+    kellyFractionMultiplier: Number($('kellyFractionMultiplier').value),
+    maxStakePct: Number($('maxStakePct').value),
+    maxEntryDelaySec: Number($('maxEntryDelaySec').value),
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,
@@ -523,7 +555,26 @@ if ('Notification' in window && Notification.permission === 'default') {
   Notification.requestPermission();
 }
 
+// Live countdown on the entry window. Ticks locally so the remaining time is
+// accurate between server pushes — a signal computed at bar close is only
+// actionable for a limited number of seconds.
+function tickCountdowns() {
+  document.querySelectorAll('.entry-window[data-deadline]').forEach((el) => {
+    const left = Math.round((Number(el.dataset.deadline) - Date.now()) / 1000);
+    const b = el.querySelector('b');
+    if (!b) return;
+    if (left <= 0) {
+      el.classList.add('expired');
+      b.textContent = 'expirat';
+    } else {
+      b.textContent = left + 's';
+      if (left <= 20) el.classList.add('urgent');
+    }
+  });
+}
+
 loadState();
 connect();
 updateSessionBadge();
 setInterval(updateSessionBadge, 60000);
+setInterval(tickCountdowns, 1000);

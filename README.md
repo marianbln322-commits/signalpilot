@@ -69,6 +69,50 @@ Dacă nu există calibrare cu suficiente date, banner-ul spune **„FĂRĂ DATE 
 
 ---
 
+## 💰 Cât să pui: miza vine din edge-ul măsurat
+
+Când probabilitatea prudentă depășește pragul, aplicația calculează și **cât** merită pus, cu evidențiere pe nivele: `MICĂ` / `MEDIE` / `MARE` / `MAXIMĂ`. Nivelul e determinat de mărimea edge-ului în puncte peste pragul de rentabilitate — nu de cât de „sigur" arată semnalul.
+
+Formula e Kelly pentru un payout binar `b`: `f* = (p·(1+b) − 1) / b`. Trei lucruri se aplică înainte ca vreo cifră să ajungă pe ecran:
+
+1. **Se folosește probabilitatea prudentă**, limita inferioară a intervalului, nu estimarea punctuală. Kelly e extrem de sensibil la supraestimarea lui `p`: supralicitarea se compune spre ruină, în timp ce sublicitarea costă doar puțin randament.
+2. **Se înmulțește cu o fracțiune** (implicit 0.25). Un sfert până la jumătate de Kelly e practica standard exact pentru că `p` real nu se cunoaște niciodată exact.
+3. **Se plafonează dur** ca procent din capital (implicit 5%), indiferent ce sugerează formula. Un contract binar nu poate fi închis parțial — nu există stop-loss, poziția e totul sau nimic pe miza respectivă.
+
+Consecința: „miză MAXIMĂ" înseamnă aici ~5% din capital, nu 50%. Exemple reale din motor, la payout 82% (prag 54.95%, cerut cu marjă 56.45%):
+
+| Win-rate observat | Mostre | Probabilitate prudentă | Decizie | Miză |
+|---|---|---|---|---|
+| 54% | 300 | 50.3% | respins | 0 |
+| 56% | 40 | 44.9% | respins | 0 |
+| 58% | 120 | 52.5% | respins | 0 |
+| 63% | 400 | 59.9% | **aprobat** | 2.73% — MARE |
+| 70% | 500 | 67.3% | **aprobat** | 5% — MAXIMĂ |
+
+Observă rândul cu 56% din 40 de mostre: arată tentant, dar limita inferioară e 44.9%. Aplicația refuză. Un instrument care ar recomanda o miză acolo te-ar costa bani.
+
+## ⏱ Sincronizarea cu contractul
+
+Două lucruri au fost nealiniate cu realitatea platformei și sunt reparate.
+
+**Fereastra de intrare.** Verdictul descrie bara care s-a **închis**. Intrarea 6 minute mai târziu e un alt trade: orizontul efectiv e mai scurt și prețul de intrare s-a mutat. Semnalele expiră după `maxEntryDelaySec` (implicit 90s), cu numărătoare inversă în interfață. Un semnal expirat nu produce alertă.
+
+**Prețul de decontare.** MEXC stabilește prețurile de decontare pentru predicțiile Up/Down folosind un **indice compozit în timp real combinat cu un preț mediu ponderat în timp (TWAP)** — vezi [anunțul oficial MEXC](https://blog.mexc.com/press-release/mexc-launches-up-or-down-prediction-feature/).
+
+Jurnalul compara însă un singur tick de pe `/ticker/price` cu prețul de intrare. Aplicația se nota după alt barem decât cel după care plătește contractul, iar diferența nu e cosmetică: un wick în ultimele secunde răstoarnă o comparație pe un singur tick, dar aproape nu mișcă un TWAP. Test din suită:
+
+```
+preț plat la 3000, spike la 3060 pe ultimul tick, intrare la 3010, direcție UP
+  un singur tick -> WIN
+  TWAP pe 30s    -> LOSS
+```
+
+Se înregistrau câștiguri pe care contractul le-ar fi decontat ca pierderi, și invers. Acum decontarea folosește un TWAP pe ultimele `settlementTwapSec` (implicit 30s), din o bandă de prețuri eșantionată la fiecare 3 secunde, independent de bucla de scanare. Metoda folosită se salvează în fiecare intrare de jurnal, ca să nu se amestece tacit cu un fallback.
+
+**Limitare declarată:** ponderile exacte ale indicelui compozit MEXC nu sunt publice, iar banda citește prețul spot de pe o singură platformă. Deci e o **aproximare** a prețului de decontare, nu o replică. Dar a aproxima mărimea corectă e mai bine decât a măsura precis mărimea greșită.
+
+---
+
 ## Cum pornești
 
 ```bash
@@ -131,10 +175,23 @@ Notă de corectitudine: clasificarea agresiunii cere acum explicit un boolean pe
 
 ---
 
-## ⚠️ Avertisment
+## ⚠️ Ce nu poate face acest instrument
 
-Această aplicație este un **instrument de măsurare**, nu un generator de profit și nu sfat financiar.
+Trebuie spus direct, pentru că e diferența dintre a folosi aplicația corect și a pierde bani cu ea.
 
-Reparațiile din această versiune elimină defecte care făceau rezultatele nemăsurabile. **Nu creează un edge.** Rămâne perfect posibil ca, după calibrare corectă pe datele tale, concluzia să fie că niciun setup nu bate pragul impus de payout-urile MEXC — iar dacă asta e realitatea, aplicația îți va spune să nu intri, și acela va fi răspunsul corect.
+**Nu se poate construi un instrument care „generează în majoritate semnale de win".** Nu e o limitare de programare pe care s-o rezolv cu mai mult cod. Win-rate-ul nu e o proprietate a aplicației, ci a pieței: fie există o regularitate exploatabilă în mișcările de 10–30 de minute, fie nu. Codul o poate doar **măsura**, nu produce.
 
-Predicția direcției pe 10–30 de minute este dominată de zgomot. Pragurile de 55–61% win-rate cerute de payout-urile tipice sunt foarte greu de atins consistent cu analiză tehnică. Validează pe demo, strânge minim 30–50 de semnale rezolvate înainte de orice concluzie, și nu risca sume pe care nu ți le permiți să le pierzi.
+Iar bara e ridicată de payout, nu de noi. La payout 65% ai nevoie de **60.6%** acuratețe direcțională doar ca să fii pe zero. Asta e foarte greu de susținut consistent cu analiză tehnică pe orizonturi de minute, unde mișcarea e dominată de zgomot.
+
+Ce face în schimb această versiune, și ce e realizabil:
+
+- **nu mai minte** — fără repainting, fără probabilități inventate, fără cifre de backtest produse de o strategie diferită de cea care rulează
+- **măsoară onest** — out-of-sample, cu baseline și marjă de eroare, deci vei ști dacă ai edge sau doar noroc
+- **refuză când nu e nimic** — dovedit pe date aleatorii: 0 semnale aprobate din 264
+- **dimensionează după edge** — mai mult unde statistica susține, nimic unde nu
+
+Dacă după calibrare pe datele tale concluzia e că niciun setup nu bate pragul, aplicația îți va spune să nu intri. **Acela nu e un eșec al instrumentului — e singurul răspuns corect**, și te scutește de pierderi.
+
+Pierderile sunt normale chiar și cu edge real: la 60% win-rate, 4 din 10 tranzacții pierd, și serii de 4-5 pierderi consecutive apar frecvent. De asta există plafonul de miză.
+
+Validează pe demo. Strânge minim 30–50 de semnale rezolvate înainte de orice concluzie. Nu risca sume pe care nu ți le permiți să le pierzi. Aceasta nu este consultanță financiară.

@@ -20,6 +20,8 @@ Structura:
 ./config.example.json
 ./server.js
 ./lib/candles.js
+./lib/priceTape.js
+./lib/sizing.js
 ./lib/mexc.js
 ./lib/binance.js
 ./lib/indicators.js
@@ -77,6 +79,13 @@ Structura:
   "requireEvGate": true,
   "evMarginPct": 1.5,
   "calibrationMinSample": 30,
+  "bankroll": 1000,
+  "kellyFractionMultiplier": 0.25,
+  "maxStakePct": 5,
+  "minStakePct": 0.5,
+  "maxEntryDelaySec": 90,
+  "settlementTwapSec": 30,
+  "priceSampleSec": 3,
   "useOrderFlow": true,
   "requireOfAgree": false,
   "useLearning": true,
@@ -121,6 +130,8 @@ const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
 const cal = require('./lib/calibration');
+const sizing = require('./lib/sizing');
+const { PriceTape } = require('./lib/priceTape');
 
 // Port 3005 by default so it runs alongside PinPilot (3004) and older
 // SignalPilot versions (3001/3002). Override with the PORT env var if needed.
@@ -151,6 +162,24 @@ const DEFAULT_CONFIG = {
   requireEvGate: true,   // never alert on a signal whose EV is not provably positive
   evMarginPct: 1.5,      // required cushion above break-even
   calibrationMinSample: 30, // resolved outcomes needed before a bucket is trusted
+
+  // Position sizing. Stakes are derived from the measured edge via fractional
+  // Kelly on the CONSERVATIVE probability, then hard-capped. See lib/sizing.js.
+  bankroll: 1000,
+  kellyFractionMultiplier: 0.25,
+  maxStakePct: 5,
+  minStakePct: 0.5,
+
+  // Entry window. A verdict is computed at bar close; entering several minutes
+  // later is a materially different trade (shorter effective horizon, different
+  // entry price), so a stale signal is not actionable.
+  maxEntryDelaySec: 90,
+
+  // Settlement. MEXC determines Up/Down settlement from a composite index with a
+  // time-weighted average, so outcomes are graded on a TWAP over the final
+  // seconds rather than a single tick.
+  settlementTwapSec: 30,
+  priceSampleSec: 3,
   // Live order flow (order book + trade aggression). Confirms/vetoes direction.
   useOrderFlow: true,
   requireOfAgree: false, // if true, only alert when order flow does NOT conflict
@@ -172,6 +201,9 @@ const sseClients = new Set();
 // than to the poll: previously the same bar was re-evaluated every 8 seconds.
 const lastActedBar = {};
 let scanning = false;       // re-entrancy guard for the scheduler
+// Rolling price tape, sampled independently of the scan loop, so settlement can
+// use a time-weighted average over the final seconds of a contract window.
+const tape = new PriceTape();
 
 function loadCalibration() {
   try {
@@ -310,6 +342,32 @@ async function scanSymbol(symbol) {
       verdict.gate = altGate;
       verdict.ev.chosen = alt;
     }
+
+    // ---- Position sizing --------------------------------------------------
+    // Bigger edge -> bigger stake, but derived from the conservative probability
+    // and shrunk by how many outcomes it rests on. See lib/sizing.js for why the
+    // cap matters: a binary contract has no partial exit.
+    verdict.sizing = sizing.recommend(verdict.gate, payoutFor(verdict.interval), {
+      bankroll: config.bankroll,
+      kellyFractionMultiplier: config.kellyFractionMultiplier,
+      maxStakePct: config.maxStakePct,
+      minStakePct: config.minStakePct,
+    });
+
+    // ---- Entry window -----------------------------------------------------
+    // The verdict describes the bar that just closed. Acting on it 6 minutes
+    // later is a different trade: the effective horizon is shorter and the entry
+    // price has moved. Signals therefore expire.
+    const closeTs = verdict.barCloseTime || verdict.ts;
+    const deadlineTs = closeTs + config.maxEntryDelaySec * 1000;
+    const secondsLeft = Math.round((deadlineTs - Date.now()) / 1000);
+    verdict.entryWindow = {
+      barCloseTime: closeTs,
+      deadlineTs,
+      secondsLeft,
+      stale: secondsLeft <= 0,
+      maxEntryDelaySec: config.maxEntryDelaySec,
+    };
   }
 
   // Optional Gemini narration (numbers only, never an image).
@@ -416,6 +474,20 @@ async function scanSymbol(symbol) {
     }
   }
 
+  // Staleness veto: never alert on a bar whose entry window has already passed
+  // (e.g. after the app was asleep, or a slow poll).
+  if (shouldAlert && verdict.entryWindow && verdict.entryWindow.stale) {
+    shouldAlert = false;
+    verdict.suppressed = `semnal expirat (bara s-a închis acum ${Math.round((Date.now() - verdict.entryWindow.barCloseTime) / 1000)}s, limita e ${config.maxEntryDelaySec}s)`;
+  }
+
+  // Sizing veto: if the measured edge is too small to justify a minimum stake,
+  // there is nothing to trade even though the direction may be right.
+  if (shouldAlert && verdict.sizing && verdict.sizing.stake <= 0) {
+    shouldAlert = false;
+    verdict.suppressed = verdict.sizing.reason;
+  }
+
   // Order-flow veto: optionally require live order flow to not contradict.
   if (shouldAlert && config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
     shouldAlert = false;
@@ -438,6 +510,11 @@ async function scanSymbol(symbol) {
       setup: verdict.setup,
       probability: verdict.prediction ? verdict.prediction.probability : null,
       ev: verdict.gate ? verdict.gate.ev : null,
+      stake: verdict.sizing ? verdict.sizing.stake : null,
+      stakePct: verdict.sizing ? verdict.sizing.pctOfBankroll : null,
+      tier: verdict.sizing ? verdict.sizing.tier : null,
+      tierLabel: verdict.sizing ? verdict.sizing.tierLabel : null,
+      deadlineTs: verdict.entryWindow ? verdict.entryWindow.deadlineTs : null,
       price: verdict.price,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
@@ -456,19 +533,48 @@ async function scanSymbol(symbol) {
     });
     broadcast('alert', alert);
     if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
-    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} ${alert.probability != null ? alert.probability + '%' : 'necalibrat'} (EV ${alert.ev != null ? alert.ev + '%' : '?'}) @ ${verdict.price}`);
+    console.log(`[ALERT${alert.sniper ? ' 🎯' : ''}] ${symbol} ${verdict.directie} ${verdict.interval} · p=${alert.probability != null ? alert.probability + '%' : 'n/a'} EV=${alert.ev != null ? alert.ev + '%' : '?'} · miză ${alert.tierLabel} ${alert.stake} (${alert.stakePct}%) @ ${verdict.price}`);
   }
   return verdict;
+}
+
+// Settlement price for one entry: a time-weighted average over the final
+// `settlementTwapSec` before expiry, matching how MEXC states Up/Down contracts
+// are settled (composite index + TWAP). Falls back to a live tick only if the
+// tape has no samples in the window, and records which method was used so the
+// journal never silently mixes the two.
+async function settlePrice(symbol, resolveTs) {
+  const windowMs = config.settlementTwapSec * 1000;
+  const t = tape.twap(symbol, resolveTs - windowMs, resolveTs);
+  if (t && Number.isFinite(t.price)) return t;
+  try {
+    const p = await mexc.fetchPrice(symbol);
+    return { price: p, method: 'last-price-fallback', samples: 1 };
+  } catch {
+    return null;
+  }
+}
+
+// Independent price sampler feeding the tape. Kept separate from the scan loop
+// so settlement resolution does not depend on scan cadence or on scans succeeding.
+async function samplePrices() {
+  await Promise.all(config.symbols.map(async (sym) => {
+    try {
+      const p = await mexc.fetchPrice(sym);
+      tape.push(sym, p);
+    } catch { /* transient; next tick */ }
+  }));
 }
 
 // Background resolver: closes out pending journal entries automatically.
 async function resolveJournal() {
   try {
-    const resolved = await journal.resolvePending((sym) => mexc.fetchPrice(sym));
+    const resolved = await journal.resolvePending(settlePrice);
     if (resolved.length) {
       broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
       for (const r of resolved) {
-        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice}->${r.exitPrice} => ${r.win ? 'WIN' : 'LOSS'}`);
+        const m = r.settlement ? `${r.settlement.method}/${r.settlement.samples}` : '?';
+        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice} -> ${Number(r.exitPrice).toFixed(4)} (${m}) => ${r.win ? 'WIN' : 'LOSS'}`);
       }
     }
   } catch (e) {
@@ -512,7 +618,16 @@ function startScheduler() {
 let resolveTimer = null;
 function startResolver() {
   if (resolveTimer) clearInterval(resolveTimer);
-  resolveTimer = setInterval(resolveJournal, 10000);
+  resolveTimer = setInterval(resolveJournal, 5000);
+}
+
+// Price sampler: fast and cheap, feeds the TWAP tape used for settlement.
+let sampleTimer = null;
+function startSampler() {
+  if (sampleTimer) clearInterval(sampleTimer);
+  const ms = Math.max(1, config.priceSampleSec) * 1000;
+  sampleTimer = setInterval(samplePrices, ms);
+  samplePrices();
 }
 
 // ---- HTTP -------------------------------------------------------------------
@@ -527,6 +642,13 @@ app.get('/api/state', (req, res) => {
     alerts,
     journal: { stats: journal.stats(), recent: journal.recent(40) },
     learning: learning.summary(journal.all()),
+    calibration: calModel ? { total: calModel.total, fittedAt: calModel.fittedAt, minSample: calModel.minSample } : null,
+    // Settlement readiness: without price samples, outcomes fall back to a single
+    // tick, which is not how the contract settles. Surfaced so it is visible.
+    settlement: {
+      twapSec: config.settlementTwapSec,
+      tape: Object.fromEntries(config.symbols.map((s) => [s, tape.stats(s)])),
+    },
   });
 });
 
@@ -583,6 +705,23 @@ app.post('/api/config', (req, res) => {
     const v = Number(body.calibrationMinSample);
     if (v >= 10 && v <= 500) config.calibrationMinSample = v;
   }
+  if (body.bankroll != null) {
+    const v = Number(body.bankroll);
+    if (v > 0 && v <= 1e9) config.bankroll = v;
+  }
+  if (body.kellyFractionMultiplier != null) {
+    const v = Number(body.kellyFractionMultiplier);
+    // Above full Kelly is never a defensible setting, so it is not accepted.
+    if (v > 0 && v <= 1) config.kellyFractionMultiplier = v;
+  }
+  if (body.maxStakePct != null) {
+    const v = Number(body.maxStakePct);
+    if (v > 0 && v <= 25) config.maxStakePct = v;
+  }
+  if (body.maxEntryDelaySec != null) {
+    const v = Number(body.maxEntryDelaySec);
+    if (v >= 10 && v <= 600) config.maxEntryDelaySec = v;
+  }
   if (Array.isArray(body.activeHoursUTC)) {
     config.activeHoursUTC = body.activeHoursUTC
       .map((h) => Number(h))
@@ -605,6 +744,7 @@ app.post('/api/config', (req, res) => {
   }
   saveConfig();
   startScheduler();
+  startSampler(); // symbols or cadence may have changed
   res.json({ ok: true, config: { ...config, gemini: { ...config.gemini, apiKey: config.gemini.apiKey ? '********' : '' } } });
 });
 
@@ -726,6 +866,7 @@ function startServer(port, attemptsLeft) {
     console.log(ok ? '  MEXC reachable: OK' : '  WARNING: MEXC not reachable from this machine.');
     startScheduler();
     startResolver();
+    startSampler();
     if (process.env.NO_OPEN !== '1') openBrowser(`http://localhost:${port}`);
   });
   server.on('error', (err) => {
@@ -831,6 +972,267 @@ function upTo(candles, asOf) {
 }
 
 module.exports = { isClosed, closedOnly, split, aggregate, upTo };
+```
+
+
+## `lib/priceTape.js`
+
+```javascript
+'use strict';
+
+// ============================================================================
+// priceTape.js — a short rolling tape of observed prices per symbol, so outcomes
+// can be settled on a TIME-WEIGHTED AVERAGE rather than one instantaneous tick.
+//
+// WHY THIS MATTERS MORE THAN IT LOOKS
+// MEXC states that Up/Down prediction settlement prices are determined from a
+// composite real-time index combined with a time-weighted average price:
+// https://blog.mexc.com/press-release/mexc-launches-up-or-down-prediction-feature/
+//
+// The journal previously graded every signal by calling /ticker/price once at
+// expiry and comparing that single tick to the entry price. So the app was
+// scoring itself on a different scoreboard from the one that pays out. The gap
+// is not cosmetic:
+//
+//   - A wick in the final seconds flips a single-tick comparison but barely
+//     moves a TWAP, so "wins" were being recorded that the contract would have
+//     settled as losses (and the reverse).
+//   - TWAP systematically damps end-of-window spikes, which is exactly where
+//     10-minute predictions are decided.
+//
+// Averaging over a window is a much closer approximation. It is still an
+// approximation: the exact composite index weights are not published, and this
+// reads a single venue's spot price. That limitation is stated rather than
+// hidden — but approximating the right quantity beats measuring the wrong one
+// precisely.
+// ============================================================================
+
+const MAX_AGE_MS = 15 * 60 * 1000; // keep 15 min of history; windows are <= 30 min
+
+class PriceTape {
+  constructor(maxAgeMs = MAX_AGE_MS) {
+    this.maxAgeMs = maxAgeMs;
+    this.tapes = new Map(); // symbol -> [{ ts, price }]
+  }
+
+  push(symbol, price, ts = Date.now()) {
+    if (!Number.isFinite(price) || price <= 0) return;
+    if (!this.tapes.has(symbol)) this.tapes.set(symbol, []);
+    const tape = this.tapes.get(symbol);
+    tape.push({ ts, price });
+    const cutoff = ts - this.maxAgeMs;
+    while (tape.length && tape[0].ts < cutoff) tape.shift();
+  }
+
+  latest(symbol) {
+    const tape = this.tapes.get(symbol);
+    return tape && tape.length ? tape[tape.length - 1] : null;
+  }
+
+  // Time-weighted average price over [fromTs, toTs].
+  //
+  // Each sample is weighted by how long it stood as the most recent observation,
+  // which is what makes this time-weighted rather than a plain mean of ticks —
+  // sampling is not perfectly regular, so a plain mean would over-weight bursts.
+  twap(symbol, fromTs, toTs) {
+    const tape = this.tapes.get(symbol);
+    if (!tape || !tape.length) return null;
+    const inWindow = tape.filter((s) => s.ts >= fromTs && s.ts <= toTs);
+    if (!inWindow.length) return null;
+
+    if (inWindow.length === 1) {
+      return { price: inWindow[0].price, samples: 1, spanMs: 0, method: 'single-sample' };
+    }
+
+    let weighted = 0;
+    let totalMs = 0;
+    for (let i = 0; i < inWindow.length - 1; i++) {
+      const dt = inWindow[i + 1].ts - inWindow[i].ts;
+      if (dt <= 0) continue;
+      weighted += inWindow[i].price * dt;
+      totalMs += dt;
+    }
+    // The final sample holds until the end of the window.
+    const tailDt = Math.max(0, toTs - inWindow[inWindow.length - 1].ts);
+    if (tailDt > 0) {
+      weighted += inWindow[inWindow.length - 1].price * tailDt;
+      totalMs += tailDt;
+    }
+    if (totalMs <= 0) {
+      const mean = inWindow.reduce((a, s) => a + s.price, 0) / inWindow.length;
+      return { price: mean, samples: inWindow.length, spanMs: 0, method: 'mean-fallback' };
+    }
+    return {
+      price: weighted / totalMs,
+      samples: inWindow.length,
+      spanMs: totalMs,
+      method: 'twap',
+    };
+  }
+
+  stats(symbol) {
+    const tape = this.tapes.get(symbol);
+    if (!tape || !tape.length) return { samples: 0 };
+    return {
+      samples: tape.length,
+      oldest: tape[0].ts,
+      newest: tape[tape.length - 1].ts,
+      spanSec: Math.round((tape[tape.length - 1].ts - tape[0].ts) / 1000),
+    };
+  }
+}
+
+module.exports = { PriceTape, MAX_AGE_MS };
+```
+
+
+## `lib/sizing.js`
+
+```javascript
+'use strict';
+
+// ============================================================================
+// sizing.js — how much to stake, derived from the measured edge.
+//
+// A professional does not size by how confident a signal FEELS; they size by
+// how large the edge is and how well it is measured. Two signals both labelled
+// "high confidence" deserve very different stakes if one rests on 400 resolved
+// outcomes and the other on 31.
+//
+// The formula is Kelly for a binary payout b:
+//
+//     f* = (p·(1+b) − 1) / b
+//
+// f* is the fraction of bankroll that maximises long-run growth. Three things
+// are done to it before it is ever shown to a user:
+//
+// 1. It is computed from the CONSERVATIVE probability (lower confidence bound),
+//    never the point estimate. Kelly is extremely sensitive to overestimating p:
+//    overbetting compounds toward ruin while underbetting only costs some upside.
+//
+// 2. It is multiplied by a fraction (default 0.25). Quarter-to-half Kelly is
+//    standard practice precisely because the true p is never known exactly.
+//
+// 3. It is hard-capped as a percentage of bankroll, regardless of what the maths
+//    suggests. A binary contract cannot be stopped out — there is no exit at a
+//    better price, so a single position is all-or-nothing on that stake.
+//
+// The result is that "large stake" here means something like 3-5% of bankroll,
+// not 50%. Any tool that suggests staking half your account on a 10-minute
+// price prediction is not sizing, it is gambling.
+// ============================================================================
+
+const cal = require('./calibration');
+
+const DEFAULTS = {
+  bankroll: 1000,
+  kellyFractionMultiplier: 0.25, // quarter Kelly
+  maxStakePct: 5,                // hard ceiling per position
+  minStakePct: 0.5,              // below this it is not worth the fees/attention
+  // Sample-size shrinkage: an edge measured on few outcomes is discounted.
+  fullTrustSamples: 200,
+};
+
+// Tiers exist for at-a-glance emphasis in the UI. They are driven by the SIZE OF
+// THE EDGE (conservative probability above break-even), not by the raw score.
+const TIERS = [
+  { key: 'maxima', label: 'MAXIMĂ',  minEdgePct: 8 },
+  { key: 'mare',   label: 'MARE',    minEdgePct: 4 },
+  { key: 'medie',  label: 'MEDIE',   minEdgePct: 2 },
+  { key: 'mica',   label: 'MICĂ',    minEdgePct: 0 },
+];
+
+function tierFor(edgePct) {
+  return TIERS.find((t) => edgePct >= t.minEdgePct) || TIERS[TIERS.length - 1];
+}
+
+// Confidence in the ESTIMATE itself, from sample size. Ranges 0..1 and is used
+// to shrink the stake when the underlying statistics are thin.
+function sampleTrust(n, fullTrustSamples) {
+  if (!n || n <= 0) return 0;
+  return Math.min(1, Math.sqrt(n / fullTrustSamples));
+}
+
+// Compute a recommended stake for a gated signal.
+//
+// `gate` is the object returned by calibration.decide(): it already contains the
+// conservative probability and whether the trade clears break-even.
+function recommend(gate, payoutPct, opts = {}) {
+  const cfg = { ...DEFAULTS, ...opts };
+  const bankroll = Number(cfg.bankroll) > 0 ? Number(cfg.bankroll) : DEFAULTS.bankroll;
+
+  // No stake without an approved, measured edge. This is not conservatism for
+  // its own sake: sizing off an unknown probability is undefined, not risky.
+  if (!gate || !gate.trade || gate.conservative == null) {
+    return {
+      stake: 0,
+      pctOfBankroll: 0,
+      tier: null,
+      tierLabel: 'FĂRĂ POZIȚIE',
+      edgePct: null,
+      kellyFull: null,
+      kellyUsed: null,
+      trust: 0,
+      reason: gate && gate.needsData
+        ? 'nu există probabilitate măsurată — nu se poate dimensiona nimic'
+        : 'poarta EV nu a aprobat semnalul',
+      warnings: [],
+    };
+  }
+
+  const p = gate.conservative;           // conservative, not optimistic
+  const be = gate.breakEven;
+  const edgePct = +(p - be).toFixed(2);  // percentage points above break-even
+
+  const kellyFull = cal.kellyFraction(p, payoutPct);          // 0..1
+  const trust = sampleTrust(gate.n, cfg.fullTrustSamples);
+  const kellyUsed = kellyFull * cfg.kellyFractionMultiplier * trust;
+
+  let pct = kellyUsed * 100;
+  const warnings = [];
+
+  if (pct > cfg.maxStakePct) {
+    warnings.push(`Kelly sugera ${pct.toFixed(1)}% din capital; plafonat la ${cfg.maxStakePct}%. Un contract binar nu poate fi închis în pierdere parțială.`);
+    pct = cfg.maxStakePct;
+  }
+  if (pct < cfg.minStakePct) {
+    return {
+      stake: 0,
+      pctOfBankroll: 0,
+      tier: 'mica',
+      tierLabel: 'PREA MIC',
+      edgePct,
+      kellyFull: +(kellyFull * 100).toFixed(2),
+      kellyUsed: +(kellyUsed * 100).toFixed(2),
+      trust: +trust.toFixed(2),
+      reason: `edge-ul (${edgePct} puncte peste pragul de rentabilitate) justifică doar ${pct.toFixed(2)}% din capital — sub minimul de ${cfg.minStakePct}%, nu merită intrat`,
+      warnings,
+    };
+  }
+
+  if (trust < 0.5) {
+    warnings.push(`Statistică subțire: ${gate.n} rezultate. Miza e redusă proporțional (încredere ${(trust * 100).toFixed(0)}%). Va crește pe măsură ce jurnalul se umple.`);
+  }
+
+  const tier = tierFor(edgePct);
+  const stake = +((pct / 100) * bankroll).toFixed(2);
+
+  return {
+    stake,
+    pctOfBankroll: +pct.toFixed(2),
+    tier: tier.key,
+    tierLabel: tier.label,
+    edgePct,
+    kellyFull: +(kellyFull * 100).toFixed(2),
+    kellyUsed: +(kellyUsed * 100).toFixed(2),
+    trust: +trust.toFixed(2),
+    bankroll,
+    reason: `probabilitate prudentă ${p}% vs prag ${be}% ⇒ edge ${edgePct} puncte · Kelly integral ${(kellyFull * 100).toFixed(1)}% × ${cfg.kellyFractionMultiplier} × încredere ${(trust * 100).toFixed(0)}%`,
+    warnings,
+  };
+}
+
+module.exports = { recommend, tierFor, sampleTrust, TIERS, DEFAULTS };
 ```
 
 
@@ -2089,12 +2491,19 @@ function aggregate(rows) {
   const n = rows.length;
   const wins = rows.filter((r) => r.win).length;
   const ci = wilson(wins, n);
+  // The gate asks a ONE-SIDED question: "is the true rate above the threshold?"
+  // A two-sided 95% bound is the wrong tool for that and rejects genuine edges
+  // needlessly, so a one-sided 90% bound is reported alongside for the decision.
+  // The two-sided interval is still what gets displayed, since it is the honest
+  // summary of uncertainty in both directions.
+  const oneSided = wilson(wins, n, Z_ONE_SIDED_90);
   return {
     n,
     wins,
     winRate: n ? +((wins / n) * 100).toFixed(2) : null,
     ciLow: ci.low,
     ciHigh: ci.high,
+    ciLow90: oneSided.low,
   };
 }
 
@@ -2150,6 +2559,7 @@ function predict(model, ctx) {
         probability: c.bucket.winRate,
         ciLow: c.bucket.ciLow,
         ciHigh: c.bucket.ciHigh,
+        ciLow90: c.bucket.ciLow90,
         n: c.bucket.n,
         source: c.source,
       };
@@ -2188,8 +2598,9 @@ function decide(prediction, payoutPct, opts = {}) {
     };
   }
   const required = be + marginPct;
-  // Conservative one-sided lower bound from the same bucket counts.
-  const conservative = prediction.ciLow;
+  // One-sided 90% lower bound: the appropriate bound for a directional threshold
+  // test. Falls back to the two-sided bound if a caller supplies only that.
+  const conservative = prediction.ciLow90 != null ? prediction.ciLow90 : prediction.ciLow;
   const ev = expectedValue(prediction.probability, payoutPct);
   const evConservative = expectedValue(conservative, payoutPct);
   const trade = conservative != null && conservative >= required;
@@ -2492,6 +2903,12 @@ function record(sig) {
     sniper: !!sig.sniper,
     // Rich context for the learning layer:
     setup: sig.setup || null,        // primary trigger category
+    // Raw confluence score, kept so the calibration layer can bucket by it.
+    score: sig.score != null ? sig.score : null,
+    // What the model believed at signal time — needed to check calibration
+    // afterwards ("did the 62% signals actually win 62% of the time?").
+    probability: sig.probability != null ? sig.probability : null,
+    stake: sig.stake != null ? sig.stake : null,
     hourUTC: sig.hourUTC != null ? sig.hourUTC : new Date(sig.ts).getUTCHours(),
     ofState: sig.ofState || null,    // order-flow state: buy/sell/neutru
     ofAgree: sig.ofAgree || null,    // confirmă/conflict/neutru vs direction
@@ -2514,24 +2931,40 @@ function record(sig) {
   return entry;
 }
 
-// Resolve any pending entries whose window has elapsed, using getPrice(symbol).
-async function resolvePending(getPrice) {
+// Resolve any pending entries whose window has elapsed.
+//
+// `settle(symbol, resolveTs)` must return either a number or
+// { price, method, samples }. It is expected to produce a TIME-WEIGHTED AVERAGE
+// over the seconds immediately before expiry, because that is how MEXC states
+// Up/Down settlement prices are determined. Grading against a single tick — what
+// this function used to do — measures a different outcome from the one that
+// actually pays, and a late wick can flip it either way.
+async function resolvePending(settle, opts = {}) {
   const now = Date.now();
+  // Small grace period so the settlement window has samples in it before we read.
+  const graceMs = opts.graceMs != null ? opts.graceMs : 5000;
   const resolved = [];
   let changed = false;
   for (const e of entries) {
-    if (e.status === 'pending' && now >= e.resolveTs) {
-      try {
-        const p = await getPrice(e.symbol);
-        if (!Number.isFinite(p)) continue;
-        e.exitPrice = p;
-        e.win = e.directie === 'UP' ? p > e.entryPrice : p < e.entryPrice;
-        e.status = 'resolved';
-        changed = true;
-        resolved.push(e);
-      } catch {
-        /* try again next cycle */
-      }
+    if (e.status !== 'pending' || now < e.resolveTs + graceMs) continue;
+    try {
+      const out = await settle(e.symbol, e.resolveTs);
+      const price = typeof out === 'number' ? out : (out && out.price);
+      if (!Number.isFinite(price)) continue;
+      e.exitPrice = price;
+      e.settlement = typeof out === 'object' && out
+        ? { method: out.method, samples: out.samples }
+        : { method: 'last-price', samples: 1 };
+      // A dead-flat outcome is not a win. MEXC does not publish its tie rule for
+      // these contracts, so the pessimistic reading is used deliberately: this
+      // is a self-grading journal, and flattering yourself here costs money.
+      e.win = e.directie === 'UP' ? price > e.entryPrice : price < e.entryPrice;
+      e.tie = price === e.entryPrice;
+      e.status = 'resolved';
+      changed = true;
+      resolved.push(e);
+    } catch {
+      /* try again next cycle */
     }
   }
   if (changed) save();
@@ -3176,6 +3609,79 @@ section('5. Event-futures arithmetic');
 }
 
 // ===========================================================================
+section('6. Position sizing: stake must scale with the MEASURED edge');
+
+{
+  const sizing = require('../lib/sizing');
+  const gateFor = (p, n, payout = 82) => {
+    const wins = Math.round((p * n) / 100);
+    const ci = cal.wilson(wins, n);
+    const ci90 = cal.wilson(wins, n, 1.2815516);
+    return cal.decide({ ready: true, probability: p, ciLow: ci.low, ciHigh: ci.high, ciLow90: ci90.low, n }, payout);
+  };
+
+  const weak = sizing.recommend(gateFor(54, 300), 82, { bankroll: 1000 });
+  const thin = sizing.recommend(gateFor(70, 12), 82, { bankroll: 1000 });
+  const good = sizing.recommend(gateFor(63, 400), 82, { bankroll: 1000 });
+  const huge = sizing.recommend(gateFor(85, 500), 82, { bankroll: 1000 });
+
+  check('no stake when the edge does not clear break-even', weak.stake === 0, weak.reason);
+  check('no stake on a great-looking but tiny sample', thin.stake === 0, `n=12 -> ${thin.stake}`);
+  check('a real edge produces a stake', good.stake > 0, `${good.stake} (${good.pctOfBankroll}%) ${good.tierLabel}`);
+  check('bigger edge produces a bigger stake', huge.pctOfBankroll >= good.pctOfBankroll,
+    `${good.pctOfBankroll}% -> ${huge.pctOfBankroll}%`);
+  check('stake never exceeds the hard cap', huge.pctOfBankroll <= 5, `${huge.pctOfBankroll}% cap 5%`);
+  check('cap is enforced even at an absurd edge',
+    sizing.recommend(gateFor(95, 2000), 82, { bankroll: 1000, maxStakePct: 3 }).pctOfBankroll <= 3);
+  check('stake scales linearly with bankroll',
+    Math.abs(sizing.recommend(gateFor(63, 400), 82, { bankroll: 2000 }).stake - good.stake * 2) < 0.05);
+  check('sizing refuses when probability is unknown',
+    sizing.recommend(cal.decide({ ready: false, source: 'x' }, 82), 82).stake === 0);
+  // Thin samples must be discounted, not trusted equally.
+  check('sample-size trust grows with n', sizing.sampleTrust(50, 200) < sizing.sampleTrust(200, 200),
+    `${sizing.sampleTrust(50, 200).toFixed(2)} < ${sizing.sampleTrust(200, 200).toFixed(2)}`);
+}
+
+// ===========================================================================
+section('7. Settlement: TWAP, not a single tick');
+
+{
+  const { PriceTape } = require('../lib/priceTape');
+  const t0 = 1700000000000;
+
+  // Price sits flat at 3000, then spikes to 3060 on the very last tick — the
+  // classic case where a single-tick comparison and a TWAP disagree.
+  const tape = new PriceTape();
+  for (let i = 0; i < 30; i++) tape.push('ETHUSDT', i === 29 ? 3060 : 3000, t0 + i * 1000);
+
+  const last = tape.latest('ETHUSDT').price;
+  const twap = tape.twap('ETHUSDT', t0, t0 + 29000);
+  check('a final spike moves the last tick', last === 3060, `last=${last}`);
+  check('the same spike barely moves the TWAP', Math.abs(twap.price - 3000) < 1,
+    `TWAP=${twap.price.toFixed(2)} vs tick=${last}`);
+  check('TWAP reports its method and sample count', twap.method === 'twap' && twap.samples === 30);
+
+  // An entry at 3010 would be scored a WIN for UP on the tick and a LOSS on the
+  // TWAP. That divergence is exactly what made the old journal untrustworthy.
+  const entry = 3010;
+  check('tick and TWAP genuinely disagree on the outcome',
+    (last > entry) !== (twap.price > entry),
+    `UP from ${entry}: tick says ${last > entry ? 'WIN' : 'LOSS'}, TWAP says ${twap.price > entry ? 'WIN' : 'LOSS'}`);
+
+  check('empty window yields no price rather than a guess',
+    tape.twap('ETHUSDT', t0 - 100000, t0 - 90000) === null);
+  check('unknown symbol yields no price', tape.twap('NOPE', t0, t0 + 1000) === null);
+
+  // Uneven sampling: a burst of ticks must not outvote a long steady stretch.
+  const t2 = new PriceTape();
+  t2.push('X', 100, t0);
+  for (let i = 0; i < 20; i++) t2.push('X', 200, t0 + 59000 + i * 10); // burst at the end
+  const w = t2.twap('X', t0, t0 + 60000);
+  check('time-weighting beats tick-counting', w.price < 150,
+    `TWAP=${w.price.toFixed(1)} (a plain mean of ticks would be ~195)`);
+}
+
+// ===========================================================================
 console.log(`\n${'='.repeat(60)}`);
 console.log(`  ${passed} passed, ${failed} failed`);
 console.log('='.repeat(60));
@@ -3307,6 +3813,23 @@ ETHUSDT</textarea>
             <div class="field">
               <label class="switch-inline"><input type="checkbox" id="useLearning" checked /> <b>🧠 Învățare din jurnal</b> — se calibrează din rezultatele tale și blochează tiparele pierzătoare</label>
               <small class="muted">Are nevoie de minim ~10 semnale per tipar înainte să acționeze.</small>
+            </div>
+        </div>
+        <div class="grid" style="margin-top:12px">
+            <div class="field">
+              <label>💰 Capital de tranzacționare (USDT)</label>
+              <input type="number" id="bankroll" min="1" step="10" value="1000" />
+              <label>Fracțiune Kelly (0.25 = un sfert)</label>
+              <input type="number" id="kellyFractionMultiplier" min="0.05" max="1" step="0.05" value="0.25" />
+              <small class="muted">Miza crește cu edge-ul măsurat. Se calculează din probabilitatea <b>prudentă</b>, nu din cea optimistă, apoi se înmulțește cu această fracțiune. Kelly integral maximizează creșterea doar dacă probabilitatea e exactă — nu e niciodată, iar supralicitarea duce la ruină. Un sfert de Kelly e practica standard.</small>
+            </div>
+            <div class="field">
+              <label>Plafon absolut per poziție (% din capital)</label>
+              <input type="number" id="maxStakePct" min="0.5" max="25" step="0.5" value="5" />
+              <small class="muted">Un contract binar nu se poate închide în pierdere parțială — nu există stop-loss. Oricât ar sugera formula, miza nu trece peste acest plafon.</small>
+              <label>Timp maxim de intrare după închiderea barei (secunde)</label>
+              <input type="number" id="maxEntryDelaySec" min="10" max="600" step="10" value="90" />
+              <small class="muted">Semnalul descrie bara care s-a închis. Intrarea 5 minute mai târziu e alt trade: orizont efectiv mai scurt și alt preț de intrare. După acest interval, semnalul expiră.</small>
             </div>
         </div>
         <div class="grid" style="margin-top:12px">
@@ -3495,17 +4018,41 @@ function renderCard(v) {
 
   const gateOk = !!(gate && gate.trade);
   const needsData = !!(gate && gate.needsData);
-  const tradeable = gateOk && (!SNIPER_MODE || eligible);
+  const sz = v.sizing;
+  const hasStake = !!(sz && sz.stake > 0);
+  const tradeable = gateOk && hasStake && (!SNIPER_MODE || eligible);
+
+  // Stake block: the emphasis a trader actually needs — how much, and how much
+  // time is left to act on a signal computed at the last bar close.
+  const stakeBlock = hasStake ? `
+    <div class="stake-row tier-${sz.tier}">
+      <div class="stake-main">
+        <span class="stake-tier">${sz.tierLabel}</span>
+        <span class="stake-amt">${fmt(sz.stake)} <span class="muted">USDT</span></span>
+        <span class="stake-pct">${sz.pctOfBankroll}% din ${fmt(sz.bankroll)}</span>
+      </div>
+      <div class="stake-note muted">edge <b>${sz.edgePct}</b> puncte peste pragul de rentabilitate · Kelly integral ${sz.kellyFull}% → folosit ${sz.kellyUsed}% · încredere statistică ${(sz.trust * 100).toFixed(0)}% (${gate.n} rezultate)</div>
+      ${(sz.warnings || []).map((w) => `<div class="stake-warn">⚠️ ${w}</div>`).join('')}
+    </div>` : '';
+
+  const ew = v.entryWindow;
+  const countdown = ew && !ew.stale
+    ? `<div class="entry-window" data-deadline="${ew.deadlineTs}">⏱ timp de intrare: <b>${Math.max(0, ew.secondsLeft)}s</b> <span class="muted">(bara s-a închis la ${new Date(ew.barCloseTime).toLocaleTimeString('ro-RO')})</span></div>`
+    : '';
 
   let banner;
   if (v.directie === 'NEUTRU') {
     banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">fără declanșator valid — nicio poziție</div></div>`;
   } else if (tradeable) {
-    banner = `<div class="cta go ${dir}">${SNIPER_MODE ? '🎯 ' : ''}INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>`;
+    banner = `<div class="cta go ${dir}">${SNIPER_MODE ? '🎯 ' : ''}INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${stakeBlock}${countdown}`;
   } else if (needsData) {
     banner = `<div class="cta wait">📊 FĂRĂ DATE — nu intra<div class="cta-sub">motorul vede ${v.directie} ${v.interval} (${v.setup}), dar nu are încă o probabilitate verificată. Rulează calibrarea sau lasă jurnalul să adune rezultate.</div></div>`;
   } else if (!gateOk) {
     banner = `<div class="cta wait">🚫 EV NEGATIV — sari peste<div class="cta-sub">${gate ? gate.reason : 'EV nefavorabil'}</div></div>`;
+  } else if (ew && ew.stale) {
+    banner = `<div class="cta wait">⌛ SEMNAL EXPIRAT<div class="cta-sub">bara s-a închis acum peste ${ew.maxEntryDelaySec}s — intrarea acum ar fi alt trade (orizont mai scurt, alt preț). Aștepți bara următoare.</div></div>`;
+  } else if (!hasStake) {
+    banner = `<div class="cta wait">🔍 EDGE PREA MIC<div class="cta-sub">${sz ? sz.reason : 'nu justifică o miză minimă'}</div></div>`;
   } else {
     banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
   }
@@ -3736,6 +4283,10 @@ async function loadState() {
   $('requireEvGate').checked = c.requireEvGate !== false;
   if (c.evMarginPct != null) $('evMarginPct').value = c.evMarginPct;
   if (c.calibrationMinSample != null) $('calibrationMinSample').value = c.calibrationMinSample;
+  if (c.bankroll != null) $('bankroll').value = c.bankroll;
+  if (c.kellyFractionMultiplier != null) $('kellyFractionMultiplier').value = c.kellyFractionMultiplier;
+  if (c.maxStakePct != null) $('maxStakePct').value = c.maxStakePct;
+  if (c.maxEntryDelaySec != null) $('maxEntryDelaySec').value = c.maxEntryDelaySec;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -3769,6 +4320,10 @@ async function saveSettings() {
     requireEvGate: $('requireEvGate').checked,
     evMarginPct: Number($('evMarginPct').value),
     calibrationMinSample: Number($('calibrationMinSample').value),
+    bankroll: Number($('bankroll').value),
+    kellyFractionMultiplier: Number($('kellyFractionMultiplier').value),
+    maxStakePct: Number($('maxStakePct').value),
+    maxEntryDelaySec: Number($('maxEntryDelaySec').value),
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,
@@ -3915,10 +4470,29 @@ if ('Notification' in window && Notification.permission === 'default') {
   Notification.requestPermission();
 }
 
+// Live countdown on the entry window. Ticks locally so the remaining time is
+// accurate between server pushes — a signal computed at bar close is only
+// actionable for a limited number of seconds.
+function tickCountdowns() {
+  document.querySelectorAll('.entry-window[data-deadline]').forEach((el) => {
+    const left = Math.round((Number(el.dataset.deadline) - Date.now()) / 1000);
+    const b = el.querySelector('b');
+    if (!b) return;
+    if (left <= 0) {
+      el.classList.add('expired');
+      b.textContent = 'expirat';
+    } else {
+      b.textContent = left + 's';
+      if (left <= 20) el.classList.add('urgent');
+    }
+  });
+}
+
 loadState();
 connect();
 updateSessionBadge();
 setInterval(updateSessionBadge, 60000);
+setInterval(tickCountdowns, 1000);
 ```
 
 
@@ -4082,6 +4656,67 @@ button:hover { filter: brightness(1.1); }
 .lrow { display: flex; justify-content: space-between; align-items: center; padding: 7px 10px; border-radius: 8px; background: var(--panel2); border: 1px solid var(--border); font-size: 12.5px; margin-bottom: 4px; }
 .lrow .ok { color: var(--up); }
 .lrow .bad { color: var(--down); }
+
+
+/* ---- Position sizing block -------------------------------------------------
+   The stake is the second thing a trader reads after the direction, so it gets
+   real visual weight. Tiers are colour-coded by how large the MEASURED edge is,
+   never by how "confident" the signal feels. */
+.stake-row {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid #2a3550;
+  background: #141b2d;
+}
+.stake-main {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.stake-tier {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: #2a3550;
+  color: #cfe0ff;
+}
+.stake-amt { font-size: 26px; font-weight: 700; color: #eaf2ff; }
+.stake-pct { font-size: 13px; color: #8fa3c8; }
+.stake-note { margin-top: 6px; font-size: 11px; line-height: 1.5; }
+.stake-warn {
+  margin-top: 6px;
+  font-size: 11px;
+  color: #ffca7a;
+  line-height: 1.5;
+}
+
+.stake-row.tier-maxima { border-color: #2f9e6b; background: #10241c; }
+.stake-row.tier-maxima .stake-tier { background: #2f9e6b; color: #f2fff8; }
+.stake-row.tier-mare   { border-color: #2d7d5a; background: #11201b; }
+.stake-row.tier-mare .stake-tier { background: #2d7d5a; color: #f2fff8; }
+.stake-row.tier-medie  { border-color: #7a6a2e; background: #1e1c12; }
+.stake-row.tier-medie .stake-tier { background: #7a6a2e; color: #fff8e6; }
+.stake-row.tier-mica   { border-color: #4a5570; }
+
+/* ---- Entry window countdown ---------------------------------------------- */
+.entry-window {
+  margin-top: 8px;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: #14203a;
+  border: 1px solid #2a3550;
+  font-size: 12px;
+  color: #b9cbe8;
+}
+.entry-window b { color: #eaf2ff; font-variant-numeric: tabular-nums; }
+.entry-window.urgent { border-color: #a35a2a; background: #251809; }
+.entry-window.urgent b { color: #ffb066; }
+.entry-window.expired { opacity: 0.55; }
+.entry-window.expired b { color: #ff8b8b; }
 ```
 
 
@@ -4159,6 +4794,50 @@ Dacă nu există calibrare cu suficiente date, banner-ul spune **„FĂRĂ DATE 
 
 ---
 
+## 💰 Cât să pui: miza vine din edge-ul măsurat
+
+Când probabilitatea prudentă depășește pragul, aplicația calculează și **cât** merită pus, cu evidențiere pe nivele: `MICĂ` / `MEDIE` / `MARE` / `MAXIMĂ`. Nivelul e determinat de mărimea edge-ului în puncte peste pragul de rentabilitate — nu de cât de „sigur" arată semnalul.
+
+Formula e Kelly pentru un payout binar `b`: `f* = (p·(1+b) − 1) / b`. Trei lucruri se aplică înainte ca vreo cifră să ajungă pe ecran:
+
+1. **Se folosește probabilitatea prudentă**, limita inferioară a intervalului, nu estimarea punctuală. Kelly e extrem de sensibil la supraestimarea lui `p`: supralicitarea se compune spre ruină, în timp ce sublicitarea costă doar puțin randament.
+2. **Se înmulțește cu o fracțiune** (implicit 0.25). Un sfert până la jumătate de Kelly e practica standard exact pentru că `p` real nu se cunoaște niciodată exact.
+3. **Se plafonează dur** ca procent din capital (implicit 5%), indiferent ce sugerează formula. Un contract binar nu poate fi închis parțial — nu există stop-loss, poziția e totul sau nimic pe miza respectivă.
+
+Consecința: „miză MAXIMĂ" înseamnă aici ~5% din capital, nu 50%. Exemple reale din motor, la payout 82% (prag 54.95%, cerut cu marjă 56.45%):
+
+| Win-rate observat | Mostre | Probabilitate prudentă | Decizie | Miză |
+|---|---|---|---|---|
+| 54% | 300 | 50.3% | respins | 0 |
+| 56% | 40 | 44.9% | respins | 0 |
+| 58% | 120 | 52.5% | respins | 0 |
+| 63% | 400 | 59.9% | **aprobat** | 2.73% — MARE |
+| 70% | 500 | 67.3% | **aprobat** | 5% — MAXIMĂ |
+
+Observă rândul cu 56% din 40 de mostre: arată tentant, dar limita inferioară e 44.9%. Aplicația refuză. Un instrument care ar recomanda o miză acolo te-ar costa bani.
+
+## ⏱ Sincronizarea cu contractul
+
+Două lucruri au fost nealiniate cu realitatea platformei și sunt reparate.
+
+**Fereastra de intrare.** Verdictul descrie bara care s-a **închis**. Intrarea 6 minute mai târziu e un alt trade: orizontul efectiv e mai scurt și prețul de intrare s-a mutat. Semnalele expiră după `maxEntryDelaySec` (implicit 90s), cu numărătoare inversă în interfață. Un semnal expirat nu produce alertă.
+
+**Prețul de decontare.** MEXC stabilește prețurile de decontare pentru predicțiile Up/Down folosind un **indice compozit în timp real combinat cu un preț mediu ponderat în timp (TWAP)** — vezi [anunțul oficial MEXC](https://blog.mexc.com/press-release/mexc-launches-up-or-down-prediction-feature/).
+
+Jurnalul compara însă un singur tick de pe `/ticker/price` cu prețul de intrare. Aplicația se nota după alt barem decât cel după care plătește contractul, iar diferența nu e cosmetică: un wick în ultimele secunde răstoarnă o comparație pe un singur tick, dar aproape nu mișcă un TWAP. Test din suită:
+
+```
+preț plat la 3000, spike la 3060 pe ultimul tick, intrare la 3010, direcție UP
+  un singur tick -> WIN
+  TWAP pe 30s    -> LOSS
+```
+
+Se înregistrau câștiguri pe care contractul le-ar fi decontat ca pierderi, și invers. Acum decontarea folosește un TWAP pe ultimele `settlementTwapSec` (implicit 30s), din o bandă de prețuri eșantionată la fiecare 3 secunde, independent de bucla de scanare. Metoda folosită se salvează în fiecare intrare de jurnal, ca să nu se amestece tacit cu un fallback.
+
+**Limitare declarată:** ponderile exacte ale indicelui compozit MEXC nu sunt publice, iar banda citește prețul spot de pe o singură platformă. Deci e o **aproximare** a prețului de decontare, nu o replică. Dar a aproxima mărimea corectă e mai bine decât a măsura precis mărimea greșită.
+
+---
+
 ## Cum pornești
 
 ```bash
@@ -4221,11 +4900,24 @@ Notă de corectitudine: clasificarea agresiunii cere acum explicit un boolean pe
 
 ---
 
-## ⚠️ Avertisment
+## ⚠️ Ce nu poate face acest instrument
 
-Această aplicație este un **instrument de măsurare**, nu un generator de profit și nu sfat financiar.
+Trebuie spus direct, pentru că e diferența dintre a folosi aplicația corect și a pierde bani cu ea.
 
-Reparațiile din această versiune elimină defecte care făceau rezultatele nemăsurabile. **Nu creează un edge.** Rămâne perfect posibil ca, după calibrare corectă pe datele tale, concluzia să fie că niciun setup nu bate pragul impus de payout-urile MEXC — iar dacă asta e realitatea, aplicația îți va spune să nu intri, și acela va fi răspunsul corect.
+**Nu se poate construi un instrument care „generează în majoritate semnale de win".** Nu e o limitare de programare pe care s-o rezolv cu mai mult cod. Win-rate-ul nu e o proprietate a aplicației, ci a pieței: fie există o regularitate exploatabilă în mișcările de 10–30 de minute, fie nu. Codul o poate doar **măsura**, nu produce.
 
-Predicția direcției pe 10–30 de minute este dominată de zgomot. Pragurile de 55–61% win-rate cerute de payout-urile tipice sunt foarte greu de atins consistent cu analiză tehnică. Validează pe demo, strânge minim 30–50 de semnale rezolvate înainte de orice concluzie, și nu risca sume pe care nu ți le permiți să le pierzi.
+Iar bara e ridicată de payout, nu de noi. La payout 65% ai nevoie de **60.6%** acuratețe direcțională doar ca să fii pe zero. Asta e foarte greu de susținut consistent cu analiză tehnică pe orizonturi de minute, unde mișcarea e dominată de zgomot.
+
+Ce face în schimb această versiune, și ce e realizabil:
+
+- **nu mai minte** — fără repainting, fără probabilități inventate, fără cifre de backtest produse de o strategie diferită de cea care rulează
+- **măsoară onest** — out-of-sample, cu baseline și marjă de eroare, deci vei ști dacă ai edge sau doar noroc
+- **refuză când nu e nimic** — dovedit pe date aleatorii: 0 semnale aprobate din 264
+- **dimensionează după edge** — mai mult unde statistica susține, nimic unde nu
+
+Dacă după calibrare pe datele tale concluzia e că niciun setup nu bate pragul, aplicația îți va spune să nu intri. **Acela nu e un eșec al instrumentului — e singurul răspuns corect**, și te scutește de pierderi.
+
+Pierderile sunt normale chiar și cu edge real: la 60% win-rate, 4 din 10 tranzacții pierd, și serii de 4-5 pierderi consecutive apar frecvent. De asta există plafonul de miză.
+
+Validează pe demo. Strânge minim 30–50 de semnale rezolvate înainte de orice concluzie. Nu risca sume pe care nu ți le permiți să le pierzi. Aceasta nu este consultanță financiară.
 ```

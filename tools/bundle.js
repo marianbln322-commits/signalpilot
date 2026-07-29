@@ -21,6 +21,8 @@ const FILES = [
   'config.example.json',
   'server.js',
   'lib/candles.js',
+  'lib/priceTape.js',
+  'lib/sizing.js',
   'lib/mexc.js',
   'lib/binance.js',
   'lib/indicators.js',
