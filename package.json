@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "doctor": "node tools/doctor.js",
     "selftest": "node tools/selftest.js",
     "bundle": "node tools/bundle.js"
   },

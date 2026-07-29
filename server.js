@@ -69,6 +69,13 @@ const DEFAULT_CONFIG = {
   evMarginPct: 1.5,      // required cushion above break-even
   calibrationMinSample: 30, // resolved outcomes needed before a bucket is trusted
 
+  // Observation mode. Before any calibration exists, the EV gate blocks every
+  // alert — correct, but it makes the app look dead and indistinguishable from
+  // broken. With this on, uncalibrated signals are still surfaced, explicitly
+  // labelled as OBSERVATION rather than as a recommendation, so the engine's work
+  // is visible while the journal fills up. It never invents a probability.
+  observationMode: true,
+
   // Position sizing. Stakes are derived from the measured edge via fractional
   // Kelly on the CONSERVATIVE probability, then hard-capped. See lib/sizing.js.
   bankroll: 1000,
@@ -110,6 +117,28 @@ let scanning = false;       // re-entrancy guard for the scheduler
 // Rolling price tape, sampled independently of the scan loop, so settlement can
 // use a time-weighted average over the final seconds of a contract window.
 const tape = new PriceTape();
+
+// Rolling diagnostics. An app that shows nothing is indistinguishable from an app
+// that is broken, so it has to be able to explain its own silence: what it saw,
+// and which filter stopped it.
+const diag = {
+  startedAt: Date.now(),
+  scans: 0,
+  fetchErrors: 0,
+  lastFetchError: null,
+  lastScanAt: null,
+  verdicts: { UP: 0, DOWN: 0, NEUTRU: 0 },
+  suppressions: {},   // reason -> count
+  alertsFired: 0,
+  observations: 0,
+  recentBars: [],     // last 40 bar-level outcomes, for the UI timeline
+};
+
+function noteSuppression(reason) {
+  // Collapse to a short key so the counter stays readable.
+  const key = String(reason || 'necunoscut').split(':')[0].slice(0, 70);
+  diag.suppressions[key] = (diag.suppressions[key] || 0) + 1;
+}
 
 function loadCalibration() {
   try {
@@ -373,10 +402,18 @@ async function scanSymbol(symbol) {
   // single most important filter for event futures, so it runs before the rest.
   if (shouldAlert && config.requireEvGate) {
     if (!verdict.gate || !verdict.gate.trade) {
-      shouldAlert = false;
-      verdict.suppressed = verdict.gate && verdict.gate.needsData
-        ? `fără probabilitate calibrată: ${verdict.gate.reason}`
-        : `EV nefavorabil: ${verdict.gate ? verdict.gate.reason : 'necunoscut'}`;
+      const uncalibrated = verdict.gate && verdict.gate.needsData;
+      if (uncalibrated && config.observationMode) {
+        // Surface it, but never as a recommendation. The distinction is carried
+        // through to the UI and the alert feed.
+        verdict.observation = true;
+        verdict.observationNote = 'necalibrat — semnal afișat pentru observare, NU e recomandare de intrare';
+      } else {
+        shouldAlert = false;
+        verdict.suppressed = uncalibrated
+          ? `fără probabilitate calibrată: ${verdict.gate.reason}`
+          : `EV nefavorabil: ${verdict.gate ? verdict.gate.reason : 'necunoscut'}`;
+      }
     }
   }
 
@@ -388,8 +425,9 @@ async function scanSymbol(symbol) {
   }
 
   // Sizing veto: if the measured edge is too small to justify a minimum stake,
-  // there is nothing to trade even though the direction may be right.
-  if (shouldAlert && verdict.sizing && verdict.sizing.stake <= 0) {
+  // there is nothing to trade even though the direction may be right. Skipped in
+  // observation mode, where by definition there is no stake to compute.
+  if (shouldAlert && !verdict.observation && verdict.sizing && verdict.sizing.stake <= 0) {
     shouldAlert = false;
     verdict.suppressed = verdict.sizing.reason;
   }
@@ -406,8 +444,28 @@ async function scanSymbol(symbol) {
     verdict.suppressed = `istoricul tău dă doar ${verdict.learned.estimate}% pe acest tipar`;
   }
 
+  // Record what happened on this bar, once per bar, for the diagnostics panel.
+  if (barKey != null && !alreadyActed) {
+    diag.verdicts[verdict.directie] = (diag.verdicts[verdict.directie] || 0) + 1;
+    if (verdict.suppressed) noteSuppression(verdict.suppressed);
+    else if (verdict.directie === 'NEUTRU') noteSuppression('motorul e NEUTRU (niciun declanșator valid)');
+    diag.recentBars.unshift({
+      symbol,
+      barCloseTime: verdict.barCloseTime,
+      directie: verdict.directie,
+      setup: verdict.setup,
+      interval: verdict.interval,
+      score: verdict.score,
+      alerted: shouldAlert,
+      observation: !!verdict.observation,
+      blocked: verdict.suppressed || null,
+    });
+    if (diag.recentBars.length > 40) diag.recentBars.pop();
+  }
+
   if (shouldAlert) {
     if (barKey != null) lastActedBar[symbol] = barKey;
+    if (verdict.observation) diag.observations++; else diag.alertsFired++;
     const alert = {
       symbol,
       directie: verdict.directie,
@@ -424,6 +482,7 @@ async function scanSymbol(symbol) {
       price: verdict.price,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
+      observation: !!verdict.observation,
       ofState: verdict.orderflow ? verdict.orderflow.state : null,
       ofAgree: verdict.ofAgree || null,
       barCloseTime: verdict.barCloseTime,
@@ -500,7 +559,11 @@ async function scanAll() {
     for (const symbol of config.symbols) {
       try {
         await scanSymbol(symbol);
+        diag.scans++;
+        diag.lastScanAt = Date.now();
       } catch (e) {
+        diag.fetchErrors++;
+        diag.lastFetchError = { symbol, message: e.message, at: Date.now() };
         console.error(`Scan error ${symbol}:`, e.message);
         broadcast('error', { symbol, message: e.message });
       }
@@ -603,6 +666,7 @@ app.post('/api/config', (req, res) => {
     if (v > 0 && v <= 500) config.payout30 = v;
   }
   if (typeof body.requireEvGate === 'boolean') config.requireEvGate = body.requireEvGate;
+  if (typeof body.observationMode === 'boolean') config.observationMode = body.observationMode;
   if (body.evMarginPct != null) {
     const v = Number(body.evMarginPct);
     if (v >= 0 && v <= 15) config.evMarginPct = v;
@@ -729,6 +793,51 @@ app.post('/api/calibrate', async (req, res) => {
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Self-explanation endpoint: "why am I not seeing signals?"
+app.get('/api/diagnose', (req, res) => {
+  const resolved = journal.all().filter((e) => e.status === 'resolved').length;
+  const pending = journal.all().filter((e) => e.status === 'pending').length;
+  const needed = config.calibrationMinSample || 30;
+
+  // The single most useful line: what is the actual blocker right now.
+  let headline;
+  let action = null;
+  if (diag.fetchErrors > 0 && diag.scans === 0) {
+    headline = 'Nu pot ajunge la MEXC — fără date nu există semnale.';
+    action = 'Verifică https://api.mexc.com/api/v3/ping în browser. Dacă nici acolo nu răspunde, e blocat de rețeaua ta.';
+  } else if (!calModel && resolved < needed) {
+    headline = `Nu există încă o probabilitate măsurată (${resolved}/${needed} rezultate în jurnal).`;
+    action = 'Apasă "Calibrează pe ultimele 30 de zile" ca să obții probabilități imediat, din istoric.';
+  } else {
+    headline = 'Sistemul are date și calibrare. Semnalele apar când un setup trece pragul.';
+  }
+
+  res.json({
+    headline,
+    action,
+    uptimeSec: Math.round((Date.now() - diag.startedAt) / 1000),
+    scans: diag.scans,
+    lastScanAt: diag.lastScanAt,
+    fetchErrors: diag.fetchErrors,
+    lastFetchError: diag.lastFetchError,
+    verdicts: diag.verdicts,
+    alertsFired: diag.alertsFired,
+    observations: diag.observations,
+    blockedBy: Object.entries(diag.suppressions)
+      .sort((a, b) => b[1] - a[1])
+      .map(([reason, count]) => ({ reason, count })),
+    recentBars: diag.recentBars,
+    calibration: calModel
+      ? { total: calModel.total, minSample: calModel.minSample, fittedAt: calModel.fittedAt }
+      : null,
+    journal: { resolved, pending, needed },
+    observationMode: config.observationMode,
+    requireEvGate: config.requireEvGate,
+    sniperMode: config.sniperMode,
+    settlementTape: Object.fromEntries(config.symbols.map((s) => [s, tape.stats(s)])),
+  });
 });
 
 app.get('/api/calibration', (req, res) => {

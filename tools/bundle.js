@@ -35,6 +35,7 @@ const FILES = [
   'lib/gemini.js',
   'lib/backtest.js',
   'tools/selftest.js',
+  'tools/doctor.js',
   'public/index.html',
   'public/app.js',
   'public/style.css',

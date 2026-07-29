@@ -128,6 +128,12 @@ function renderCard(v) {
   let banner;
   if (v.directie === 'NEUTRU') {
     banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">fără declanșator valid — nicio poziție</div></div>`;
+  } else if (v.observation) {
+    // The engine found a setup but has no measured probability yet. Shown so the
+    // work is visible, never dressed up as a recommendation.
+    banner = `<div class="cta observe ${dir}">👁 OBSERVARE: ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'} · ${v.interval}
+      <div class="cta-sub">${v.setup} — motorul vede setup-ul, dar <b>încă nu are o probabilitate măsurată</b>, deci NU e recomandare de intrare.</div></div>
+      <div class="observe-note">Semnalul intră în jurnal și se rezolvă automat după ${v.interval}. Pe măsură ce se adună rezultate, aplicația învață cât valorează acest setup și începe să dea recomandări reale cu miză. Ca să sari peste așteptare, rulează <b>Calibrarea</b> pe istoric.</div>`;
   } else if (tradeable) {
     banner = `<div class="cta go ${dir}">${SNIPER_MODE ? '🎯 ' : ''}INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${stakeBlock}${countdown}`;
   } else if (needsData) {
@@ -517,6 +523,57 @@ async function runBacktest() {
   }
 }
 
+// Diagnostics: make the app explain its own silence. Shows whether data is
+// arriving, what the engine decided per bar, and which filter blocked each one.
+async function runDiagnose() {
+  $('diagHeadline').textContent = 'verific...';
+  try {
+    const d = await (await fetch('/api/diagnose')).json();
+
+    const cls = d.fetchErrors > 0 && d.scans === 0 ? 'bad' : (d.calibration || d.journal.resolved >= d.journal.needed) ? 'ok' : 'warn';
+    $('diagHeadline').className = `diag-headline ${cls}`;
+    $('diagHeadline').innerHTML = `<b>${d.headline}</b>${d.action ? `<div class="diag-action">→ ${d.action}</div>` : ''}`;
+
+    const box = (big, lbl, c) => `<div class="bt-box"><div class="big ${c || ''}">${big}</div><div class="lbl">${lbl}</div></div>`;
+    let html = '<div class="bt-result">';
+    html += box(d.scans, 'scanări reușite', d.scans > 0 ? 'ok' : 'bad');
+    html += box(d.fetchErrors, 'erori de rețea', d.fetchErrors > 0 ? 'bad' : 'ok');
+    html += box(`${d.verdicts.UP}/${d.verdicts.DOWN}`, 'bare UP / DOWN');
+    html += box(d.verdicts.NEUTRU, 'bare neutre');
+    html += box(d.alertsFired, 'alerte reale', d.alertsFired > 0 ? 'ok' : '');
+    html += box(d.observations, 'semnale de observare');
+    html += box(`${d.journal.resolved}/${d.journal.needed}`, 'rezultate strânse pentru calibrare');
+    html += box(d.journal.pending, 'în așteptare de rezolvare');
+    html += '</div>';
+
+    if (d.lastFetchError) {
+      html += `<div class="diag-err">Ultima eroare de rețea: <b>${d.lastFetchError.symbol}</b> — ${d.lastFetchError.message}
+        <div class="muted">Dacă apare constant, MEXC e probabil blocat de furnizorul tău de internet. Testează https://api.mexc.com/api/v3/ping în browser.</div></div>`;
+    }
+
+    if (d.blockedBy && d.blockedBy.length) {
+      html += '<div class="learn-h" style="margin-top:14px">Ce a blocat semnalele, în ordine de frecvență</div>';
+      html += d.blockedBy.map((b) => `<div class="lrow"><span>${b.reason}</span><span><b>${b.count}</b> bare</span></div>`).join('');
+    }
+
+    if (d.recentBars && d.recentBars.length) {
+      html += '<div class="learn-h" style="margin-top:14px">Ultimele bare analizate</div>';
+      html += d.recentBars.slice(0, 15).map((b) => {
+        const t = b.barCloseTime ? new Date(b.barCloseTime).toLocaleTimeString('ro-RO') : '—';
+        const badge = b.alerted
+          ? (b.observation ? '<span class="pill Mediu">observare</span>' : '<span class="pill Ridicat">ALERTĂ</span>')
+          : '<span class="muted">blocat</span>';
+        return `<div class="lrow"><span>${t} · ${b.symbol} · <b>${b.directie}</b> ${b.setup !== 'context' ? b.setup : ''}</span><span>${badge}</span></div>`;
+      }).join('');
+    }
+
+    $('diagBody').innerHTML = html;
+  } catch (e) {
+    $('diagHeadline').className = 'diag-headline bad';
+    $('diagHeadline').textContent = 'diagnostic eșuat: ' + e.message;
+  }
+}
+
 // Fit the probability model from historical data and persist it, so the app has
 // calibrated probabilities before the user's own journal is large enough.
 async function runCalibration() {
@@ -543,6 +600,7 @@ $('saveSettings').addEventListener('click', saveSettings);
 $('testAi').addEventListener('click', testAi);
 $('runBacktest').addEventListener('click', runBacktest);
 $('runCalibration').addEventListener('click', runCalibration);
+$('runDiagnose').addEventListener('click', runDiagnose);
 $('clearAlerts').addEventListener('click', () => { alertsEl.innerHTML = '<p class="muted">golit.</p>'; });
 $('soundToggle').addEventListener('change', (e) => { soundOn = e.target.checked; });
 $('geminiModel').addEventListener('change', updateCostHint);
