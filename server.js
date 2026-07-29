@@ -25,6 +25,7 @@ const backtest = require('./lib/backtest');
 const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
+const gate = require('./lib/gate');
 
 // Port 3010 by default. Override with the PORT environment variable when needed.
 const PORT = Number(process.env.PORT) || 3010;
@@ -53,7 +54,11 @@ const DEFAULT_CONFIG = {
   payout10: 65,          // current MEXC payout % for 10-min contracts (user updates)
   payout30: 82,          // current MEXC payout % for 30-min contracts
   paperStake: 10,        // simulated stake per alert; no real order is ever placed
-  fallbackWinRate: 55,   // assumed win-rate when the journal has too few samples yet (sniper OOS ~55%)
+  fallbackWinRate: 55,   // display/backtest context only; never used as a calibrated probability
+  // During bootstrap, emit clearly labelled technical PAPER alerts so the app
+  // is useful immediately. They never bypass or masquerade as validated TRADE.
+  paperSignalsDuringCalibration: true,
+  paperSignalCooldownMin: 10,
   // Live order flow (order book + trade aggression). Confirms/vetoes direction.
   useOrderFlow: true,
   requireOfAgree: false, // if true, only alert when order flow does NOT conflict
@@ -72,6 +77,7 @@ let config = loadConfig();
 const latest = {};          // symbol -> last verdict
 const alerts = [];          // recent alert feed
 const sseClients = new Set();
+const lastPaperAlertAt = new Map(); // symbol+horizon+direction -> timestamp
 
 function loadConfig() {
   try {
@@ -108,11 +114,73 @@ function effectiveQualityConfig() {
 }
 
 function learningSummary() {
+  const quality = effectiveQualityConfig();
   const canonical = journal.all().filter((entry) => entry.observation &&
     entry.entrySource === 'boundary-1m-open' &&
-    entry.calibrationVersion === CALIBRATION_VERSION &&
-    entry.settlementSource === 'aggTrade-exact');
-  return learning.summary(canonical, effectiveQualityConfig().minSamples);
+    entry.calibrationVersion === CALIBRATION_VERSION);
+  const exactResolved = canonical.filter((entry) =>
+    entry.status === 'resolved' && entry.settlementSource === 'aggTrade-exact');
+  return {
+    ...learning.summary(exactResolved, quality.minSamples),
+    cohorts: learning.calibrationProgress(canonical, config.symbols, quality.minSamples),
+    pending: canonical.filter((entry) => entry.status === 'pending').length,
+    void: canonical.filter((entry) => entry.status === 'void').length,
+  };
+}
+
+// Self-improving technique layer. Setup families are scored from the user's own
+// resolved forward results; families that measurably underperform are required
+// to show stronger confluence, and families with proven edge are prioritised.
+// Nothing here invents probabilities: every number comes from settled outcomes.
+const TECHNIQUE_MIN_SAMPLE = 20;
+
+function techniqueTuning() {
+  const resolved = journal.all().filter((entry) =>
+    entry.status === 'resolved' &&
+    entry.settlementSource === 'aggTrade-exact' &&
+    entry.calibrationVersion === CALIBRATION_VERSION);
+  const families = {};
+  for (const entry of resolved) {
+    const key = `${entry.setup || 'context'}|${entry.interval}`;
+    families[key] = families[key] || { key, setup: entry.setup || 'context', interval: entry.interval, n: 0, wins: 0 };
+    families[key].n += 1;
+    if (entry.win) families[key].wins += 1;
+  }
+  const out = {};
+  for (const family of Object.values(families)) {
+    const lower = learning.wilsonLowerBound(family.wins, family.n, 1.645);
+    const upper = family.n
+      ? 1 - learning.wilsonLowerBound(family.n - family.wins, family.n, 1.645)
+      : null;
+    const winRate = +((family.wins / family.n) * 100).toFixed(1);
+    let verdictLabel = 'neutru';
+    let confidenceBump = 0;
+    if (family.n >= TECHNIQUE_MIN_SAMPLE && upper != null && upper < 0.5) {
+      verdictLabel = 'slab';       // statistically below chance -> demand more proof
+      confidenceBump = 0.06;
+    } else if (family.n >= TECHNIQUE_MIN_SAMPLE && lower != null && lower > 0.5) {
+      verdictLabel = 'solid';      // proven edge -> keep the standard bar
+      confidenceBump = -0.02;
+    }
+    out[family.key] = { ...family, winRate, verdict: verdictLabel, confidenceBump };
+  }
+  return out;
+}
+
+function applyTechniqueTuning(forecast, horizon, tuning) {
+  const key = `${forecast.reasons && forecast.reasons[0] ? forecast.reasons[0] : 'context'}|${horizon} minute`;
+  const family = tuning[key];
+  forecast.technique = family
+    ? { family: family.setup, n: family.n, winRate: family.winRate, verdict: family.verdict }
+    : { family: forecast.reasons && forecast.reasons[0] ? forecast.reasons[0] : 'context', n: 0, winRate: null, verdict: 'neînvățat' };
+  if (!family || !family.confidenceBump) return;
+  const required = 0.58 + family.confidenceBump;
+  forecast.techniqueRequirement = +required.toFixed(4);
+  if (family.verdict === 'slab' && Number.isFinite(forecast.technicalConfidence) &&
+      forecast.technicalConfidence < required) {
+    forecast.setupValid = false;
+    forecast.suppressed = `tehnică auto-ajustată: tiparul "${family.setup}" a dat ${family.winRate}% pe ${family.n} rezultate, cere confluență mai puternică`;
+  }
 }
 
 // ---- Core scan for one symbol ----------------------------------------------
@@ -256,6 +324,14 @@ async function scanSymbolNow(symbol) {
     }
   }
 
+  // Self-improving technique: tighten or keep the bar per setup family based on
+  // the user's own settled results before any signal is published.
+  const tuning = techniqueTuning();
+  for (const horizon of [10, 30]) {
+    const forecast = verdict.forecasts && verdict.forecasts[horizon];
+    if (forecast) applyTechniqueTuning(forecast, horizon, tuning);
+  }
+
   // Self-learning: what does the user's own history say about this context?
   const qualityConfig = effectiveQualityConfig();
   if (config.useLearning) {
@@ -288,13 +364,15 @@ async function scanSymbolNow(symbol) {
         calibrationVersion: CALIBRATION_VERSION,
       }, qualityConfig.minSamples);
       forecast.learned = learned;
+      forecast.calibrationSampleSize = Number.isInteger(learned.sampleSize) ? learned.sampleSize : 0;
+      forecast.calibrationRequired = qualityConfig.minSamples;
+      forecast.calibrationRemaining = Math.max(0, qualityConfig.minSamples - forecast.calibrationSampleSize);
       if (learned.ready && learned.estimate != null) {
         const calibratedConfidence = learned.estimate / 100;
         forecast.confidence = calibratedConfidence;
         forecast.probabilityUp = forecast.directie === 'UP' ? calibratedConfidence : 1 - calibratedConfidence;
         forecast.probabilityDown = 1 - forecast.probabilityUp;
         forecast.calibrated = true;
-        forecast.calibrationSampleSize = learned.sampleSize;
         forecast.reliabilityLowerBound = learned.lowerBound != null ? learned.lowerBound / 100 : null;
         forecast.reasons.push(`Calibrare exactă: ${learned.displayEstimate}% din ${learned.sampleSize} rezultate ${symbol} ${forecast.directie} ${horizon}m; limită conservatoare ${learned.displayLowerBound}%`);
         if (learned.estimate < config.learningSuppressBelow) {
@@ -310,42 +388,13 @@ async function scanSymbolNow(symbol) {
     const forecast = verdict.forecasts && verdict.forecasts[horizon];
     if (!forecast) continue;
     const payoutPct = horizon === 10 ? config.payout10 : config.payout30;
-    const breakEven = 1 / (1 + payoutPct / 100);
-    const qualityFloor = qualityConfig.minWinRate / 100;
-    const reliabilityFloor = qualityConfig.minLowerBound / 100;
-    forecast.breakEven = +breakEven.toFixed(4);
-    forecast.qualityFloor = +qualityFloor.toFixed(4);
-    forecast.requiredProbability = +Math.max(breakEven, qualityFloor).toFixed(4);
-    forecast.reliabilityFloor = +reliabilityFloor.toFixed(4);
-    forecast.payoutPct = payoutPct;
-    forecast.expectedValue = null;
-    forecast.action = 'WAIT';
-
-    if (!forecast.inputFresh) {
-      forecast.suppressed = `date MEXC neactualizate pe: ${(forecast.staleTimeframes || []).join(', ')}`;
-      continue;
-    }
-
-    if (!forecast.calibrated || !Number.isFinite(forecast.confidence)) {
-      forecast.suppressed = forecast.suppressed || 'calibrare în curs — date forward insuficiente';
-      continue;
-    }
-
-    forecast.expectedValue = +(forecast.confidence * (payoutPct / 100) - (1 - forecast.confidence)).toFixed(4);
-    if (!forecast.setupValid) {
-      forecast.suppressed = forecast.suppressed || 'setup tehnic incomplet';
-    } else if (forecast.suppressed) {
-      // A learning veto set above remains authoritative.
-    } else if (forecast.confidence <= breakEven) {
-      forecast.suppressed = `sub break-even: ${(forecast.confidence * 100).toFixed(1)}% ≤ ${(breakEven * 100).toFixed(1)}%`;
-    } else if (forecast.confidence < qualityFloor) {
-      forecast.suppressed = `sub pragul de calitate: ${(forecast.confidence * 100).toFixed(1)}% < ${qualityConfig.minWinRate}%`;
-    } else if (!Number.isFinite(forecast.reliabilityLowerBound) || forecast.reliabilityLowerBound < reliabilityFloor) {
-      const bound = Number.isFinite(forecast.reliabilityLowerBound) ? `${(forecast.reliabilityLowerBound * 100).toFixed(1)}%` : 'indisponibilă';
-      forecast.suppressed = `eșantion încă fragil: limita conservatoare ${bound} < ${qualityConfig.minLowerBound}%`;
-    } else {
-      forecast.action = 'TRADE';
-    }
+    Object.assign(forecast, gate.evaluateForecastGate(forecast, {
+      payoutPct,
+      minWinRate: qualityConfig.minWinRate,
+      minLowerBound: qualityConfig.minLowerBound,
+      minSamples: qualityConfig.minSamples,
+      allowPaper: config.paperSignalsDuringCalibration !== false,
+    }));
   }
 
   // Continuous learning: reconstruct canonical observations at exact 10m/30m
@@ -403,44 +452,46 @@ async function scanSymbolNow(symbol) {
   // paper records. Apply every veto before publishing the signal snapshot.
   const chosenHorizon = verdict.interval === '10 minute' ? 10 : 30;
   const executionForecast = verdict.forecasts && verdict.forecasts[chosenHorizon];
+  const hasSelectedSignal = () => executionForecast && ['TRADE', 'PAPER'].includes(executionForecast.action);
   const vetoExecution = (reason) => {
-    if (executionForecast && executionForecast.action === 'TRADE') {
+    if (hasSelectedSignal()) {
       executionForecast.action = 'WAIT';
       executionForecast.suppressed = reason;
     }
     verdict.suppressed = reason;
   };
 
-  if (executionForecast && executionForecast.action === 'TRADE' && executionForecast.directie !== verdict.directie) {
+  if (hasSelectedSignal() && executionForecast.directie !== verdict.directie) {
     vetoExecution(`forecast ${chosenHorizon}m în dezacord cu direcția motorului`);
   }
-  if (executionForecast && executionForecast.action === 'TRADE' &&
-      config.sniperMode && !(verdict.sniper && verdict.sniper.eligible)) {
+  if (hasSelectedSignal() && config.sniperMode && !(verdict.sniper && verdict.sniper.eligible)) {
     vetoExecution(`setup Sniper neeligibil: ${verdict.sniper ? verdict.sniper.reason : 'fără confirmare'}`);
   }
-  if (executionForecast && executionForecast.action === 'TRADE' &&
+  if (hasSelectedSignal() &&
       (verdict.directie === 'NEUTRU' || CONF_RANK[verdict.incredere] < CONF_RANK[config.alertMinConfidence])) {
     vetoExecution(`încredere ${verdict.incredere} sub pragul ${config.alertMinConfidence}`);
   }
-  if (executionForecast && executionForecast.action === 'TRADE' && !verdict.entryPriceFresh) {
+  if (hasSelectedSignal() && !verdict.entryPriceFresh) {
     vetoExecution('preț de intrare 1m proaspăt indisponibil');
   }
-  if (executionForecast && executionForecast.action === 'TRADE' &&
-      config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
+  if (hasSelectedSignal() && config.useOrderFlow && config.requireOfAgree && verdict.ofAgree === 'conflict') {
     vetoExecution('order flow în conflict cu direcția');
   }
-  if (executionForecast && executionForecast.action === 'TRADE' &&
-      config.useLearning && verdict.learned && verdict.learned.ready &&
+  if (hasSelectedSignal() && config.useLearning && verdict.learned && verdict.learned.ready &&
       verdict.learned.estimate != null && verdict.learned.estimate < config.learningSuppressBelow) {
     vetoExecution(`istoricul tău dă doar ${verdict.learned.estimate}% pe acest tipar`);
   }
 
   const forecastAllowsTrade = executionForecast &&
     executionForecast.action === 'TRADE' && executionForecast.directie === verdict.directie;
-  if (!forecastAllowsTrade) {
+  const forecastAllowsPaper = executionForecast &&
+    executionForecast.action === 'PAPER' && executionForecast.directie === verdict.directie;
+  if (!forecastAllowsTrade && !forecastAllowsPaper) {
     verdict.suppressed = verdict.suppressed || (executionForecast
       ? `forecast ${chosenHorizon}m: ${executionForecast.action}${executionForecast.suppressed ? ` (${executionForecast.suppressed})` : ''}`
       : `forecast ${chosenHorizon}m indisponibil`);
+  } else {
+    delete verdict.suppressed;
   }
 
   // One finalized execution snapshot drives the card/banner, signal SSE,
@@ -448,7 +499,8 @@ async function scanSymbolNow(symbol) {
   // on this snapshot changing from WAIT to TRADE.
   verdict.execution = {
     horizon: chosenHorizon,
-    action: forecastAllowsTrade ? 'TRADE' : 'WAIT',
+    action: forecastAllowsTrade ? 'TRADE' : forecastAllowsPaper ? 'PAPER' : 'WAIT',
+    signalClass: forecastAllowsTrade ? 'validated-trade' : forecastAllowsPaper ? 'technical-paper' : null,
     directie: executionForecast ? executionForecast.directie : 'NEUTRU',
     calibrated: !!(executionForecast && executionForecast.calibrated),
     calibrationVersion: executionForecast && executionForecast.calibrated ? CALIBRATION_VERSION : null,
@@ -462,14 +514,27 @@ async function scanSymbolNow(symbol) {
     qualityFloor: executionForecast ? executionForecast.qualityFloor : null,
     requiredProbability: executionForecast ? executionForecast.requiredProbability : null,
     reliabilityLowerBound: executionForecast ? executionForecast.reliabilityLowerBound : null,
-    calibrationSampleSize: executionForecast ? executionForecast.calibrationSampleSize : null,
+    calibrationSampleSize: executionForecast ? executionForecast.calibrationSampleSize : 0,
+    calibrationRequired: executionForecast ? executionForecast.calibrationRequired : qualityConfig.minSamples,
+    calibrationRemaining: executionForecast ? executionForecast.calibrationRemaining : qualityConfig.minSamples,
     expectedValue: executionForecast ? executionForecast.expectedValue : null,
     payoutPct: executionForecast ? executionForecast.payoutPct : null,
-    reason: forecastAllowsTrade ? null : verdict.suppressed,
+    reason: forecastAllowsTrade ? null : forecastAllowsPaper
+      ? `PAPER tehnic; calibrare ${executionForecast.calibrationSampleSize}/${executionForecast.calibrationRequired}`
+      : verdict.suppressed,
   };
   const previousExecution = prev && prev.execution;
-  const shouldAlert = verdict.execution.action === 'TRADE' &&
-    (!previousExecution || previousExecution.action !== 'TRADE');
+  const executionChanged = !previousExecution ||
+    previousExecution.action !== verdict.execution.action ||
+    previousExecution.directie !== verdict.execution.directie ||
+    previousExecution.horizon !== verdict.execution.horizon;
+  const paperKey = `${symbol}-${chosenHorizon}-${verdict.execution.directie}`;
+  const paperCooldownMs = Math.max(1, Number(config.paperSignalCooldownMin) || 10) * 60 * 1000;
+  const paperCooldownPassed = !lastPaperAlertAt.has(paperKey) ||
+    Date.now() - lastPaperAlertAt.get(paperKey) >= paperCooldownMs;
+  const shouldAlert = verdict.execution.action === 'TRADE'
+    ? executionChanged
+    : verdict.execution.action === 'PAPER' && executionChanged && paperCooldownPassed;
 
   latest[symbol] = verdict;
   broadcast('signal', verdict);
@@ -486,6 +551,7 @@ async function scanSymbolNow(symbol) {
       ofState: verdict.orderflow ? verdict.orderflow.state : null,
       ofAgree: verdict.ofAgree || null,
       action: verdict.execution.action,
+      signalClass: verdict.execution.signalClass,
       horizon: verdict.execution.horizon,
       probability: verdict.execution.probability,
       probabilityUp: verdict.execution.probabilityUp,
@@ -500,12 +566,15 @@ async function scanSymbolNow(symbol) {
       requiredProbability: verdict.execution.requiredProbability,
       reliabilityLowerBound: verdict.execution.reliabilityLowerBound,
       calibrationSampleSize: verdict.execution.calibrationSampleSize,
+      calibrationRequired: verdict.execution.calibrationRequired,
+      calibrationRemaining: verdict.execution.calibrationRemaining,
       expectedValue: verdict.execution.expectedValue,
       payoutPct: verdict.execution.payoutPct,
       ts: verdict.ts,
     };
     alerts.unshift(alert);
     if (alerts.length > 50) alerts.pop();
+    if (alert.action === 'PAPER') lastPaperAlertAt.set(paperKey, Date.now());
     // Auto-journal every alert with rich context for the learning layer.
     const logged = journal.record({
       ...alert,
@@ -516,7 +585,7 @@ async function scanSymbolNow(symbol) {
     });
     broadcast('alert', alert);
     if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learningSummary() });
-    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} (${verdict.incredere}) OF:${alert.ofAgree || '-'} @ ${verdict.price}`);
+    console.log(`[${alert.action === 'PAPER' ? 'PAPER' : 'ALERT'}${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} (${verdict.incredere}) OF:${alert.ofAgree || '-'} @ ${verdict.price}`);
   }
   return verdict;
 }
@@ -620,6 +689,16 @@ app.get('/api/learning', (req, res) => {
   res.json(learningSummary());
 });
 
+// Transparency endpoint: exactly how the technique tuned itself, and from how
+// many settled results each decision comes.
+app.get('/api/technique', (req, res) => {
+  res.json({
+    calibrationVersion: CALIBRATION_VERSION,
+    minSampleForTuning: TECHNIQUE_MIN_SAMPLE,
+    families: Object.values(techniqueTuning()).sort((a, b) => b.n - a.n),
+  });
+});
+
 app.post('/api/journal/reset', (req, res) => {
   journal.reset();
   broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learningSummary() });
@@ -673,6 +752,13 @@ app.post('/api/config', (req, res) => {
   if (typeof body.useOrderFlow === 'boolean') config.useOrderFlow = body.useOrderFlow;
   if (typeof body.requireOfAgree === 'boolean') config.requireOfAgree = body.requireOfAgree;
   if (typeof body.useLearning === 'boolean') config.useLearning = body.useLearning;
+  if (typeof body.paperSignalsDuringCalibration === 'boolean') {
+    config.paperSignalsDuringCalibration = body.paperSignalsDuringCalibration;
+  }
+  if (body.paperSignalCooldownMin != null) {
+    const v = Number(body.paperSignalCooldownMin);
+    if (Number.isFinite(v) && v >= 1 && v <= 120) config.paperSignalCooldownMin = v;
+  }
   if (body.minCalibrationSamples != null) {
     const v = Number(body.minCalibrationSamples);
     if (Number.isInteger(v) && v >= 30 && v <= 500) config.minCalibrationSamples = v;

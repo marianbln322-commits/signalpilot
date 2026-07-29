@@ -121,6 +121,19 @@ Aplicația învață din **rezultatele tale reale**, nu dintr-o cutie neagră. P
 - **evidențiază** tiparele cu rezultate bune în panoul statistic
 - **blochează** execuția sub gate-ul strict de 60%, break-even sau fiabilitate
 
+### Două niveluri de semnal
+
+| Nivel | Când apare | Ce înseamnă |
+| --- | --- | --- |
+| 📝 **PAPER tehnic** | imediat, la fiecare setup tehnic valid pe lumânări închise | citire profesionistă a graficelor și indicatorilor, jurnalizată și punctată automat, dar **fără validare statistică** |
+| ✅ **TRADE VALIDAT** | numai după ce cohorta monedă+direcție+fereastră trece toate pragurile | win-rate empiric ≥60%, limită Wilson 90% ≥50%, strict peste break-even, minimum 30 rezultate exacte |
+
+Panoul de învățare arată progresul exact per cohortă (`n/30`), inclusiv rezultatele în curs, deci vezi mereu cât mai lipsește până la validare.
+
+### Auto-ajustarea tehnicii
+
+La fiecare scanare, aplicația recalculează performanța fiecărei familii de setup-uri din rezultatele tale deja stabilite (`/api/technique`). Familiile a căror limită superioară Wilson 90% rămâne sub 50% pe minimum 20 rezultate primesc automat un prag mai strict de confluență; cele cu limită inferioară peste 50% rămân la pragul standard. Ajustarea folosește exclusiv rezultate reale, niciodată estimări inventate.
+
 Panoul „🧠 Ce a învățat" arată transparent rezultatele. **Sunt necesare implicit minimum 30 rezultate forward exacte pentru aceeași monedă, direcție și fereastră** înainte de probabilitate calibrată. `TRADE` cere win-rate empiric de minimum 60%, probabilitate strict peste break-even și o limită Wilson 90% de minimum 50%, care reduce riscul unui procent mare obținut dintr-un eșantion fragil. Modelul 1m/3m/5m folosește calibrarea versiunea 3, deci înregistrările din strategiile vechi nu îl pot debloca. Aceste filtre nu garantează 60% în viitor; ele confirmă doar că istoricul forward comparabil a trecut pragul.
 
 **Învățare non-stop:** cât timp aplicația e deschisă, înregistrează în fundal câte o observație la fiecare graniță exactă de 10m și 30m pentru fiecare monedă, folosind doar lumânări deja închise și prețul de deschidere al graniței. Rezultatul este stabilit din primul `aggTrade` de la ținta exactă; dacă acesta rămâne indisponibil după perioada de grație, observația devine `VOID` și nu intră în P&L sau învățare. Observațiile alimentează calibrarea, dar NU apar în lista ta de tranzacții. Jurnalul persistă în `journal.json`, deci progresul nu se pierde la repornire.

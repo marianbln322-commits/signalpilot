@@ -33,7 +33,7 @@
       </div>
       <div class="howto">
         <b>Cum se folosește:</b> aplicația sincronizează graficele MEXC 1m/3m/5m/15m/30m și analizează numai lumânări închise.
-        Aștepți banner-ul verde/roșu <b>INTRĂ</b>: apare numai când setup-ul tehnic, istoricul forward comparabil, pragul de minimum 60%, fiabilitatea și payout-ul trec toate filtrele. Cât timp vezi <b>⏳ AȘTEAPTĂ</b>, nu faci nimic. Aplicația face doar analiză și paper trading; ordinul real nu este automatizat.
+        Există două niveluri de semnal: <b>📝 SEMNAL TEHNIC (PAPER)</b> apare imediat din citirea lumânărilor și a indicatorilor, dar nu este validat statistic; <b>TRADE VALIDAT</b> apare numai după ce aceeași monedă, direcție și fereastră strâng suficiente rezultate forward și trec pragul de minimum 60%, fiabilitatea și payout-ul. Cât timp vezi <b>⏳ AȘTEAPTĂ</b>, nu faci nimic. Aplicația face doar analiză și paper trading; ordinul real nu este automatizat.
       </div>
       <div id="cards" class="cards"></div>
     </section>
@@ -122,6 +122,9 @@ ETHUSDT</textarea>
             </div>
             <div class="field">
               <label class="switch-inline"><input type="checkbox" id="useLearning" checked /> <b>🧠 Învățare din jurnal</b> — calibrează separat simbolul, direcția și orizontul</label>
+              <label class="switch-inline"><input type="checkbox" id="paperSignalsDuringCalibration" checked /> <b>📝 Semnale PAPER în timpul calibrării</b> — arată setup-urile tehnice imediat, marcate ca nevalidate</label>
+              <label>Pauză minimă între semnale PAPER identice (minute)</label>
+              <input type="number" id="paperSignalCooldownMin" min="1" max="120" value="10" />
               <label>Minimum rezultate exacte per cohortă</label>
               <input type="number" id="minCalibrationSamples" min="30" max="500" value="30" />
               <label>Prag minim win-rate calibrat (%)</label>

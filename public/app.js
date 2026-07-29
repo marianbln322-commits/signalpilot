@@ -10,6 +10,7 @@ let cards = {}; // symbol -> element
 let soundOn = true;
 let SNIPER_MODE = false; // set from server config on load
 let CONTINUOUS_MODE = true;
+let ACTIVE_SYMBOLS = [];
 let ACTIVE_HOURS = Array.from({ length: 24 }, (_, hour) => hour); // UTC, set from config
 const detailsOpen = {}; // per-symbol: keep the analysis panel open across live re-renders
 
@@ -79,6 +80,12 @@ function ofRow(v) {
     const up = v.htfTrend === 'up';
     parts.push(`<span title="trendul pe 1 oră">Trend 1h: <b class="${up ? 'ok' : 'bad'}">${up ? '↗ ascendent' : '↘ descendent'}</b></span>`);
   }
+  const execForecast = v.forecasts && v.execution ? v.forecasts[v.execution.horizon] : null;
+  if (execForecast && execForecast.technique) {
+    const t = execForecast.technique;
+    const cls = t.verdict === 'solid' ? 'ok' : t.verdict === 'slab' ? 'bad' : '';
+    parts.push(`<span title="auto-ajustare din rezultatele tale">🛠 tehnică: <span class="${cls}">${t.verdict}</span>${t.n ? ` (${t.winRate}% / ${t.n})` : ''}</span>`);
+  }
   if (v.suppressed) parts.push(`<span class="bad">⛔ blocat: ${v.suppressed}</span>`);
   const missingFrames = Object.keys(v.dataErrors || {});
   if (missingFrames.length) parts.push(`<span class="bad">⚠️ feed parțial: ${missingFrames.join(', ')}</span>`);
@@ -100,14 +107,18 @@ function forecastGrid(v) {
     const directionalValue = forecast.directie === 'UP' ? upValue : forecast.directie === 'DOWN' ? downValue : 0.5;
     const directionalScore = (Number.isFinite(directionalValue) ? directionalValue * 100 : 50).toFixed(1);
     const metricLabel = calibrated ? 'PROBABILITATE CALIBRATĂ' : 'SCOR TEHNIC';
-    const action = forecast.action === 'TRADE' ? 'TRADE' : 'WAIT';
+    const action = forecast.action === 'TRADE' ? 'TRADE' : forecast.action === 'PAPER' ? 'PAPER' : 'WAIT';
+    const progress = Number.isInteger(forecast.calibrationRequired)
+      ? `<div class="forecast-progress">Calibrare validare: <b>${forecast.calibrationSampleSize || 0}/${forecast.calibrationRequired}</b> rezultate exacte${forecast.calibrationRemaining ? ` · lipsesc ${forecast.calibrationRemaining}` : ' · complet'}</div>`
+      : '';
     return `<div class="forecast ${dir}">
       <div class="forecast-head"><b>${horizon} MINUTE</b><span class="forecast-action ${action.toLowerCase()}">${action}</span></div>
       <div class="forecast-direction ${dir}">${forecast.directie} <small>${directionalScore}%</small></div>
       <div class="forecast-learned">${calibrated ? '🧠' : '📐'} ${metricLabel}</div>
       <div class="prob-track"><i class="prob-down" style="width:${down}%"></i><i class="prob-up" style="width:${up}%"></i></div>
       <div class="forecast-probs"><span>DOWN ${down}%</span><span>UP ${up}%</span></div>
-      <div class="forecast-tfs">Analiză: ${(forecast.timeframes || []).join(' · ')}${forecast.requiredProbability ? ` · prag ${(forecast.requiredProbability * 100).toFixed(1)}%` : ''}${forecast.calibrationSampleSize ? ` · eșantion ${forecast.calibrationSampleSize}` : ''}</div>
+      <div class="forecast-tfs">Analiză: ${(forecast.timeframes || []).join(' · ')}${forecast.requiredProbability ? ` · prag ${(forecast.requiredProbability * 100).toFixed(1)}%` : ''}</div>
+      ${progress}
       ${calibrated && Number.isFinite(forecast.reliabilityLowerBound) ? `<div class="forecast-learned">Limită conservatoare 90%: ${(forecast.reliabilityLowerBound * 100).toFixed(1)}%</div>` : ''}
       ${forecast.suppressed ? `<div class="forecast-suppressed">⛔ ${forecast.suppressed}</div>` : ''}
       <ul>${(forecast.reasons || []).slice(0, 4).map((reason) => `<li>${reason}</li>`).join('')}</ul>
@@ -191,23 +202,29 @@ function renderCard(v) {
   const warnLine = evWarn ? `<div class="ev-warn">⚠️ payout prea mic pentru edge-ul tău — EV negativ, mai bine sari peste</div>` : '';
   const chosenHorizon = v.execution ? v.execution.horizon : (v.interval === '10 minute' ? 10 : 30);
   const executionForecast = v.forecasts && v.forecasts[chosenHorizon];
-  const forecastAllowsTrade = v.execution
-    ? v.execution.action === 'TRADE' && v.execution.directie === v.directie
-    : executionForecast && executionForecast.action === 'TRADE' && executionForecast.directie === v.directie;
+  const executionAction = v.execution
+    ? (v.execution.directie === v.directie ? v.execution.action : 'WAIT')
+    : executionForecast && executionForecast.directie === v.directie ? executionForecast.action : 'WAIT';
+  const forecastAllowsTrade = executionAction === 'TRADE';
+  const forecastAllowsPaper = executionAction === 'PAPER';
   const waitReason = v.execution && v.execution.reason
     ? v.execution.reason
     : executionForecast
       ? `${chosenHorizon}m ${executionForecast.action}${executionForecast.suppressed ? ` · ${executionForecast.suppressed}` : ''}`
       : `forecast ${chosenHorizon}m indisponibil`;
+  const calibrationNote = v.execution && Number.isInteger(v.execution.calibrationRequired)
+    ? ` · validare ${v.execution.calibrationSampleSize || 0}/${v.execution.calibrationRequired}`
+    : '';
+  const paperBanner = `<div class="cta paper ${dir}">📝 SEMNAL TEHNIC ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">PAPER · fereastră ${v.interval}${evNote}${calibrationNote} · încă nevalidat statistic</div></div>${warnLine}`;
   let banner;
-  if (SNIPER_MODE) {
-    banner = eligible && forecastAllowsTrade
-      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${warnLine}`
-      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">${!eligible ? `nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}` : waitReason}</div></div>`;
+  if (SNIPER_MODE && !eligible) {
+    banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
+  } else if (forecastAllowsTrade) {
+    banner = `<div class="cta go ${dir}">${SNIPER_MODE ? '🎯 INTRĂ ' : ''}${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">TRADE VALIDAT · fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`;
+  } else if (forecastAllowsPaper) {
+    banner = paperBanner;
   } else {
-    banner = forecastAllowsTrade
-      ? `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`
-      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">${waitReason}</div></div>`;
+    banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">${waitReason}</div></div>`;
   }
 
   return `
@@ -259,16 +276,26 @@ function upsertCard(v) {
   }
 }
 
+function alertBadge(a) {
+  return a.action === 'TRADE'
+    ? '<span class="tag validated">TRADE VALIDAT</span>'
+    : '<span class="tag paper">PAPER tehnic</span>';
+}
+
+function alertRow(a) {
+  const dir = a.directie.toLowerCase();
+  return `
+    <span class="adir ${dir}">${a.sniper ? '🎯 ' : ''}${a.directie} ${a.directie === 'UP' ? '▲' : '▼'}</span>
+    <span><b>${a.symbol}</b> · ${a.interval} · ${alertBadge(a)} · <span class="pill ${a.incredere}">${a.incredere}</span> @ ${fmt(a.price)}</span>
+    <span class="alert-time">${new Date(a.ts).toLocaleTimeString('ro-RO')}</span>
+  `;
+}
+
 function addAlert(a) {
   if (alertsEl.querySelector('.muted')) alertsEl.innerHTML = '';
   const el = document.createElement('div');
   el.className = 'alert-item flash';
-  const dir = a.directie.toLowerCase();
-  el.innerHTML = `
-    <span class="adir ${dir}">${a.sniper ? '🎯 ' : ''}${a.directie} ${a.directie === 'UP' ? '▲' : '▼'}</span>
-    <span><b>${a.symbol}</b> · ${a.interval} · <span class="pill ${a.incredere}">${a.incredere}</span> @ ${fmt(a.price)}</span>
-    <span class="alert-time">${new Date(a.ts).toLocaleTimeString('ro-RO')}</span>
-  `;
+  el.innerHTML = alertRow(a);
   alertsEl.prepend(el);
   while (alertsEl.children.length > 50) alertsEl.removeChild(alertsEl.lastChild);
   notify(a);
@@ -314,10 +341,7 @@ function connect() {
       if (alertsEl.querySelector('.muted')) alertsEl.innerHTML = '';
       const el = document.createElement('div');
       el.className = 'alert-item';
-      const dir = a.directie.toLowerCase();
-      el.innerHTML = `<span class="adir ${dir}">${a.directie} ${a.directie === 'UP' ? '▲' : '▼'}</span>
-        <span><b>${a.symbol}</b> · ${a.interval} · <span class="pill ${a.incredere}">${a.incredere}</span> @ ${fmt(a.price)}</span>
-        <span class="alert-time">${new Date(a.ts).toLocaleTimeString('ro-RO')}</span>`;
+      el.innerHTML = alertRow(a);
       alertsEl.prepend(el);
     });
   });
@@ -331,11 +355,30 @@ function connect() {
 }
 
 // ---------- learning panel ----------
+function cohortProgressHtml(l) {
+  const cohorts = (l.cohorts || []).filter((c) => c.n > 0 || c.pending > 0 || ACTIVE_SYMBOLS.includes(c.symbol));
+  if (!cohorts.length) return '';
+  const rows = cohorts
+    .sort((a, b) => b.n - a.n || a.key.localeCompare(b.key))
+    .map((c) => {
+      const pct = Math.min(100, Math.round((c.n / c.required) * 100));
+      const state = c.ready
+        ? `<span class="ok">validare activă · ${c.winRate}%</span>`
+        : `<span class="muted">${c.n}/${c.required}</span>`;
+      return `<div class="lrow">
+        <span>${c.symbol} ${c.directie} ${c.interval}</span>
+        <span><span class="cohort-bar"><i style="width:${pct}%"></i></span> ${state}${c.pending ? ` <span class="muted">(+${c.pending} în curs)</span>` : ''}</span>
+      </div>`;
+    }).join('');
+  return `<div class="learn-h">📊 Progres validare per monedă + direcție + fereastră</div>${rows}
+    <p class="muted" style="margin-top:8px">Semnalele PAPER apar imediat din analiza tehnică. TRADE VALIDAT apare numai când o cohortă atinge ${l.minSample || 30} rezultate exacte și trece pragurile de calitate.</p>`;
+}
+
 function renderLearning(l) {
   if (!l) return;
   const el = $('learningBody');
   if (!l.ready) {
-    el.innerHTML = `<p class="muted">Încă strâng date (${l.total || 0} semnale rezolvate). Am nevoie de minim ${l.minSample || 10} per tipar ca să învăț ceva sigur.</p>`;
+    el.innerHTML = `<p class="muted">Strâng rezultate forward: ${l.total || 0} rezolvate, ${l.pending || 0} în curs. Validarea cere ${l.minSample || 30} rezultate exacte per cohortă.</p>${cohortProgressHtml(l)}`;
     return;
   }
   const row = (r) => {
@@ -347,7 +390,8 @@ function renderLearning(l) {
       <div><div class="learn-h ok">✅ Ce îți merge</div>${(l.best || []).map(row).join('') || '<p class="muted">—</p>'}</div>
       <div><div class="learn-h bad">⛔ Ce evită</div>${(l.worst || []).map(row).join('') || '<p class="muted">—</p>'}</div>
     </div>
-    <p class="muted" style="margin-top:10px">Din ${l.total} semnale rezolvate. Aplicația folosește asta ca să confirme sau să blocheze semnale noi automat.</p>`;
+    <p class="muted" style="margin-top:10px">Din ${l.total} rezultate forward rezolvate. Aplicația folosește asta ca să confirme sau să blocheze semnale noi automat.</p>
+    ${cohortProgressHtml(l)}`;
 }
 
 // ---------- live journal ----------
@@ -360,6 +404,8 @@ function renderJournal(d) {
   const box = (val, lbl) => `<div class="bt-box"><div class="big" style="font-size:20px">${val}</div><div class="lbl">${lbl}</div></div>`;
   let html = box(wr(s.overall), 'general (toate)') +
     box(`${s.overall.pnl >= 0 ? '+' : ''}${Number(s.overall.pnl || 0).toFixed(2)} USDT`, 'paper P&L') +
+    box(wr(s.validated), 'TRADE validate') +
+    box(wr(s.technicalPaper), 'PAPER tehnice') +
     box(wr(s.sniper), '🎯 doar Sniper') +
     `<div class="bt-box"><div class="big" style="font-size:20px">${s.pending}</div><div class="lbl">în așteptare</div></div>` +
     `<div class="bt-box"><div class="big" style="font-size:20px">${s.void || 0}</div><div class="lbl">VOID (fără settlement)</div></div>`;
@@ -385,8 +431,11 @@ function renderJournal(d) {
         : (e.win ? `<span class="adir up">✓ WIN${pnl}</span>` : `<span class="adir down">✗ LOSS${pnl}</span>`);
     const dir = e.directie === 'UP' ? '▲' : '▼';
     const exit = e.exitPrice != null ? fmt(e.exitPrice) : '—';
+    const kind = e.signalClass === 'validated-trade'
+      ? '<span class="tag validated">VALIDAT</span>'
+      : '<span class="tag paper">PAPER</span>';
     return `<div class="jrow">
-      <span>${e.sniper ? '🎯 ' : ''}<b>${e.symbol}</b> ${dir}</span>
+      <span>${e.sniper ? '🎯 ' : ''}<b>${e.symbol}</b> ${dir} ${kind}</span>
       <span class="muted">${e.interval}</span>
       <span>${fmt(e.entryPrice)} → ${exit}</span>
       <span>${st}</span>
@@ -425,6 +474,7 @@ async function loadState() {
   const r = await fetch('/api/state');
   const s = await r.json();
   const c = s.config;
+  ACTIVE_SYMBOLS = c.symbols || [];
   $('symbols').value = (c.symbols || []).join('\n');
   $('scanInterval').value = c.scanIntervalSec;
   $('alertMinConfidence').value = c.alertMinConfidence;
@@ -442,6 +492,8 @@ async function loadState() {
   $('useOrderFlow').checked = c.useOrderFlow !== false;
   $('requireOfAgree').checked = !!c.requireOfAgree;
   $('useLearning').checked = c.useLearning !== false;
+  $('paperSignalsDuringCalibration').checked = c.paperSignalsDuringCalibration !== false;
+  if (c.paperSignalCooldownMin) $('paperSignalCooldownMin').value = c.paperSignalCooldownMin;
   if (c.minCalibrationSamples) $('minCalibrationSamples').value = c.minCalibrationSamples;
   if (c.minCalibratedWinRate) $('minCalibratedWinRate').value = c.minCalibratedWinRate;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
@@ -476,6 +528,8 @@ async function saveSettings() {
     useOrderFlow: $('useOrderFlow').checked,
     requireOfAgree: $('requireOfAgree').checked,
     useLearning: $('useLearning').checked,
+    paperSignalsDuringCalibration: $('paperSignalsDuringCalibration').checked,
+    paperSignalCooldownMin: Number($('paperSignalCooldownMin').value),
     minCalibrationSamples: Number($('minCalibrationSamples').value),
     minCalibratedWinRate: Number($('minCalibratedWinRate').value),
     activeHoursUTC,

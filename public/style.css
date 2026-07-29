@@ -188,5 +188,14 @@ button:hover { filter: brightness(1.1); }
 .bad { color: var(--down); }
 @media (max-width: 720px) { .forecast-grid, .market-chart-grid { grid-template-columns: 1fr; } .market-chart-panel:first-child { grid-column: auto; } .candle-chart, .market-chart-panel:first-child .candle-chart { height: 180px; } }
 
+.forecast-action.paper { background: #b78103; color: #10131a; }
+.cta.paper { background: linear-gradient(180deg, rgba(183,129,3,.22), rgba(183,129,3,.10)); border-color: #b78103; }
+.forecast-progress { margin-top: 5px; color: var(--muted); font-size: 10px; }
+.tag { display: inline-block; padding: 1px 6px; border-radius: 999px; font-size: 9px; letter-spacing: .04em; vertical-align: middle; }
+.tag.validated { background: rgba(22,199,132,.18); color: var(--up); border: 1px solid rgba(22,199,132,.45); }
+.tag.paper { background: rgba(183,129,3,.18); color: #f0b429; border: 1px solid rgba(183,129,3,.45); }
+.cohort-bar { display: inline-block; width: 70px; height: 5px; background: #22293a; border-radius: 999px; overflow: hidden; vertical-align: middle; margin-right: 6px; }
+.cohort-bar i { display: block; height: 100%; background: var(--accent2); }
+
 .forecast-learned { margin-top: 6px; color: var(--accent2); font-size: 10px; }
 .forecast-suppressed { margin-top: 5px; color: var(--down); font-size: 10px; }

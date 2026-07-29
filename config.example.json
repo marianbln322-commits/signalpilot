@@ -14,6 +14,8 @@
   "useOrderFlow": true,
   "requireOfAgree": false,
   "useLearning": true,
+  "paperSignalsDuringCalibration": true,
+  "paperSignalCooldownMin": 10,
   "minCalibrationSamples": 30,
   "minCalibratedWinRate": 60,
   "minReliabilityLowerBound": 50,
