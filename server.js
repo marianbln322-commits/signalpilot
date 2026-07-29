@@ -2,7 +2,7 @@
 
 // ============================================================================
 // SignalPilot server — always-on local app (PinPilot style).
-// Serves the UI at http://localhost:3005, polls MEXC, runs the engine on a
+// Serves the UI at http://localhost:3011, polls MEXC, runs the engine on a
 // scheduler, pushes live updates over SSE, and alerts on good setups.
 // ============================================================================
 
@@ -29,9 +29,9 @@ const cal = require('./lib/calibration');
 const sizing = require('./lib/sizing');
 const { PriceTape } = require('./lib/priceTape');
 
-// Port 3005 by default so it runs alongside PinPilot (3004) and older
-// SignalPilot versions (3001/3002). Override with the PORT env var if needed.
-const PORT = process.env.PORT || 3005;
+// Port 3011 by default so it runs alongside PinPilot (3004) and older
+// SignalPilot versions (3001/3002/3005). Override with the PORT env var if needed.
+const PORT = process.env.PORT || 3011;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const CALIBRATION_PATH = path.join(__dirname, 'calibration.json');
 const DEFAULT_CONFIG = {

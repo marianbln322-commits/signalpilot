@@ -120,7 +120,7 @@ npm install
 npm start
 ```
 
-Apoi deschide **http://localhost:3005** (schimbi portul cu variabila `PORT`). Pe Windows, dublu-click pe `start.bat`.
+Apoi deschide **http://localhost:3011** (schimbi portul cu variabila `PORT`, ex. `PORT=3011 npm start`). Pe Windows, dublu-click pe `start.bat`.
 
 ### Pasul obligatoriu: calibrarea
 
