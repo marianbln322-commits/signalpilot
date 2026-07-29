@@ -1,5 +1,6 @@
 node_modules/
 config.json
 journal.json
+calibration.json
 *.log
 .DS_Store

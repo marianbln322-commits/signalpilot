@@ -1,28 +1,41 @@
 # SignalPilot — pachet complet de cod pentru analiză
 
-Aplicație locală Node.js care citește date live de pe MEXC, calculează indicatori tehnici + Smart Money Concepts + order flow, produce decizii UP/DOWN pe 10/30 min pentru event-futures, cu Sniper Mode, jurnal auto-rezolvat și strat de învățare din rezultate.
+Aplicație locală Node.js care citește date live de pe MEXC, calculează indicatori tehnici + Smart Money Concepts + order flow, și produce decizii UP/DOWN pe 10/30 min pentru contracte event-futures.
 
-**Pentru AI-ul care analizează:** evaluează logica de predicție (lib/engine.js, lib/smc.js, lib/orderflow.js, lib/learning.js), spune ce ar îmbunătăți acuratețea semnalelor pe 10/30 min și ce mai lipsește. Notează: order flow-ul nu se poate backtesta (date live), restul e determinist.
+**Generat automat de `tools/bundle.js`.** Nu edita acest fișier direct — regenerează-l.
+
+**Pentru cine analizează codul:** partea esențială nu e lista de indicatori, ci lanțul de decizie:
+
+1. `lib/candles.js` — taie lumânarea în formare, ca verdictele să nu se schimbe în timpul barei (*repainting*).
+2. `lib/smc.js` — Smart Money Concepts; FVG-urile cer *displacement* raportat la ATR și sunt acționabile doar la primul retest.
+3. `lib/engine.js` — confluență ponderată → direcție + fereastra (10/30 min) dată de declanșatorul principal.
+4. `lib/calibration.js` — scorul de confluență **nu** e o probabilitate; aici se măsoară empiric ce valorează fiecare bucket și se compară limita inferioară Wilson cu pragul `1/(1+payout)`.
+5. `lib/backtest.js` — evaluare out-of-sample, cu baseline și test de semnificație.
+
+Verificare offline, fără rețea și fără chei: `node tools/selftest.js`
 
 Structura:
 ```
-./config.example.json
-./lib/backtest.js
-./lib/binance.js
-./lib/engine.js
-./lib/gemini.js
-./lib/indicators.js
-./lib/journal.js
-./lib/learning.js
-./lib/mexc.js
-./lib/orderflow.js
-./lib/smc.js
 ./package.json
-./public/app.js
+./config.example.json
+./server.js
+./lib/candles.js
+./lib/mexc.js
+./lib/binance.js
+./lib/indicators.js
+./lib/smc.js
+./lib/engine.js
+./lib/calibration.js
+./lib/orderflow.js
+./lib/learning.js
+./lib/journal.js
+./lib/gemini.js
+./lib/backtest.js
+./tools/selftest.js
 ./public/index.html
+./public/app.js
 ./public/style.css
 ./README.md
-./server.js
 ```
 
 
@@ -35,7 +48,9 @@ Structura:
   "description": "Local real-time MEXC signal engine for 10/30-min event-futures UP/DOWN decisions (deterministic indicators + SMC, optional Gemini narrator, backtest).",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "selftest": "node tools/selftest.js",
+    "bundle": "node tools/bundle.js"
   },
   "author": "",
   "license": "MIT",
@@ -44,6 +59,36 @@ Structura:
   }
 }
 ```
+
+
+## `config.example.json`
+
+```json
+{
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "scanIntervalSec": 8,
+  "alertMinConfidence": "Mediu",
+  "sniperMode": true,
+  "sniperRequireVolume": false,
+  "activeHoursUTC": [6, 7, 8, 9, 13, 14, 15, 16, 17],
+  "adaptiveInterval": false,
+  "payout10": 65,
+  "payout30": 82,
+  "requireEvGate": true,
+  "evMarginPct": 1.5,
+  "calibrationMinSample": 30,
+  "useOrderFlow": true,
+  "requireOfAgree": false,
+  "useLearning": true,
+  "learningSuppressBelow": 45,
+  "gemini": {
+    "enabled": false,
+    "apiKey": "",
+    "model": "gemini-3.5-flash"
+  }
+}
+```
+
 
 ## `server.js`
 
@@ -75,11 +120,13 @@ const backtest = require('./lib/backtest');
 const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
+const cal = require('./lib/calibration');
 
 // Port 3005 by default so it runs alongside PinPilot (3004) and older
 // SignalPilot versions (3001/3002). Override with the PORT env var if needed.
 const PORT = process.env.PORT || 3005;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
+const CALIBRATION_PATH = path.join(__dirname, 'calibration.json');
 const DEFAULT_CONFIG = {
   symbols: ['BTCUSDT', 'ETHUSDT'],
   scanIntervalSec: 8,
@@ -98,7 +145,12 @@ const DEFAULT_CONFIG = {
   adaptiveInterval: false,
   payout10: 65,          // current MEXC payout % for 10-min contracts (user updates)
   payout30: 82,          // current MEXC payout % for 30-min contracts
-  fallbackWinRate: 55,   // assumed win-rate when the journal has too few samples yet (sniper OOS ~55%)
+  // Event-futures EV gate. A signal is only actionable when its CALIBRATED
+  // probability clears the break-even imposed by the payout, with a cushion.
+  // Break-even = 1/(1+payout): 65% payout needs 60.6%, 82% payout needs 54.9%.
+  requireEvGate: true,   // never alert on a signal whose EV is not provably positive
+  evMarginPct: 1.5,      // required cushion above break-even
+  calibrationMinSample: 30, // resolved outcomes needed before a bucket is trusted
   // Live order flow (order book + trade aggression). Confirms/vetoes direction.
   useOrderFlow: true,
   requireOfAgree: false, // if true, only alert when order flow does NOT conflict
@@ -111,9 +163,66 @@ const DEFAULT_CONFIG = {
 const CONF_RANK = { Scăzut: 1, Mediu: 2, Ridicat: 3 };
 
 let config = loadConfig();
+let calModel = loadCalibration();
 const latest = {};          // symbol -> last verdict
 const alerts = [];          // recent alert feed
 const sseClients = new Set();
+// (symbol -> barCloseTime) of the last bar we already acted on. The engine now
+// produces one verdict per CLOSED bar, so alerting is keyed to the bar rather
+// than to the poll: previously the same bar was re-evaluated every 8 seconds.
+const lastActedBar = {};
+let scanning = false;       // re-entrancy guard for the scheduler
+
+function loadCalibration() {
+  try {
+    if (fs.existsSync(CALIBRATION_PATH)) {
+      const m = JSON.parse(fs.readFileSync(CALIBRATION_PATH, 'utf8'));
+      console.log(`Calibration loaded: ${m.total} rezultate, fitted ${new Date(m.fittedAt).toISOString()}`);
+      return m;
+    }
+  } catch (e) {
+    console.error('Calibration read error:', e.message);
+  }
+  return null;
+}
+
+function saveCalibration(model) {
+  try {
+    fs.writeFileSync(CALIBRATION_PATH, JSON.stringify(model, null, 2));
+  } catch (e) {
+    console.error('Calibration write error:', e.message);
+  }
+}
+
+// The live probability model blends two sources, preferring the user's own
+// resolved journal once it is large enough, and falling back to the calibration
+// fitted from historical backtest. If neither has enough data, we report that
+// honestly instead of printing an invented number.
+function buildLivePrediction(verdict) {
+  const ctx = { setup: verdict.setup, interval: verdict.interval, score: verdict.score };
+  const journalSamples = journal.all()
+    .filter((e) => e.status === 'resolved' && e.setup && e.interval)
+    .map((e) => ({ setup: e.setup, interval: e.interval, score: e.score, win: e.win }));
+
+  if (journalSamples.length >= (config.calibrationMinSample || 30)) {
+    const live = cal.fit(journalSamples, { minSample: config.calibrationMinSample });
+    const p = cal.predict(live, ctx);
+    if (p.ready) return { ...p, origin: 'jurnalul tău (forward-test real)' };
+  }
+  if (calModel) {
+    const p = cal.predict(calModel, ctx);
+    if (p.ready) return { ...p, origin: 'backtest istoric (calibrare)' };
+  }
+  return {
+    ready: false,
+    probability: null,
+    ciLow: null,
+    ciHigh: null,
+    n: journalSamples.length,
+    source: `nicio calibrare cu suficiente date (am ${journalSamples.length} rezultate, nevoie de ${config.calibrationMinSample || 30})`,
+    origin: null,
+  };
+}
 
 function loadConfig() {
   try {
@@ -147,44 +256,60 @@ async function scanSymbol(symbol) {
   const verdict = engine.decide(mtf);
   verdict.symbol = symbol;
 
-  // Interval = the setup's NATURAL window (fast momentum like sweeps -> 10 min,
-  // structural setups -> 30 min). Payout/EV is shown as INFO, and only used to
-  // adapt 10 -> 30 when adaptiveInterval is ON and the 10-min payout is poor.
-  // This keeps BOTH 10-min and 30-min signals instead of forcing everything 30.
+  // ---- Event-futures decision layer ----------------------------------------
+  // The window comes from the primary trigger (engine). What we add here is the
+  // only question that decides whether the trade is worth taking at all:
+  // does the CALIBRATED probability clear the break-even imposed by the payout?
+  //
+  // The previous version answered this by assuming a 55% win rate whenever the
+  // journal was thin (`fallbackWinRate`), then printing a confident EV computed
+  // from that assumption. That is a fabricated number driving a money decision,
+  // so it is gone. If there is no calibration data, the app now says so.
   if (verdict.directie !== 'NEUTRU') {
-    const ji = journal.recentByInterval(20);
-    const wr10 = (ji.tenMin.n >= 8 && ji.tenMin.winRate != null) ? ji.tenMin.winRate : config.fallbackWinRate;
-    const wr30 = (ji.thirtyMin.n >= 8 && ji.thirtyMin.winRate != null) ? ji.thirtyMin.winRate : config.fallbackWinRate;
-    const p10 = config.payout10 / 100;
-    const p30 = config.payout30 / 100;
-    const evOf = (wr, p) => (wr / 100) * p - (1 - wr / 100); // per $1 staked
-    const ev10 = evOf(wr10, p10);
-    const ev30 = evOf(wr30, p30);
-    const breakEven = (p) => +(100 / (1 + p)).toFixed(1);
+    const payoutFor = (iv) => (iv === '10 minute' ? config.payout10 : config.payout30);
 
-    const natural = verdict.interval; // set by engine from setup type
-    let chosen = natural;
-    // Optional trader-style adaptation: only nudge 10 -> 30 when 10-min EV is
-    // negative but 30-min is meaningfully better. Off by default.
-    if (config.adaptiveInterval && natural === '10 minute' && ev10 < 0 && ev30 > ev10) {
-      chosen = '30 minute';
-      verdict.intervalAdapted = { from: '10 minute', reason: `payout 10 min slab (EV ${(ev10 * 100).toFixed(1)}%) → 30 min` };
-    }
-    verdict.interval = chosen;
+    const prediction = buildLivePrediction(verdict);
+    verdict.prediction = prediction;
 
-    const chosenEv = chosen === '30 minute' ? ev30 : ev10;
+    const gate = cal.decide(prediction, payoutFor(verdict.interval), { marginPct: config.evMarginPct });
+    verdict.gate = gate;
+
+    // Compare both windows explicitly so the trader can see the trade-off.
+    const alt = verdict.interval === '10 minute' ? '30 minute' : '10 minute';
+    const altPrediction = buildLivePrediction({ ...verdict, interval: alt });
+    const altGate = cal.decide(altPrediction, payoutFor(alt), { marginPct: config.evMarginPct });
+
     verdict.ev = {
       payout10: config.payout10,
       payout30: config.payout30,
-      breakEven10: breakEven(p10),
-      breakEven30: breakEven(p30),
-      wr10,
-      wr30,
-      ev10: +(ev10 * 100).toFixed(1),
-      ev30: +(ev30 * 100).toFixed(1),
-      chosen,
-      positive: chosenEv > 0,
+      breakEven10: cal.breakEvenWinRate(config.payout10),
+      breakEven30: cal.breakEvenWinRate(config.payout30),
+      chosen: verdict.interval,
+      probability: prediction.probability,
+      probabilitySource: prediction.origin,
+      conservative: gate.conservative,
+      required: gate.required,
+      ev: gate.ev,
+      positive: gate.trade,
+      alternative: {
+        interval: alt,
+        probability: altPrediction.probability,
+        ev: altGate.ev,
+        trade: altGate.trade,
+      },
     };
+
+    // Optional: switch to the other window when it is the one with positive EV.
+    if (config.adaptiveInterval && !gate.trade && altGate.trade) {
+      verdict.intervalAdapted = {
+        from: verdict.interval,
+        reason: `EV pozitiv doar pe ${alt} la payout-urile curente`,
+      };
+      verdict.interval = alt;
+      verdict.prediction = altPrediction;
+      verdict.gate = altGate;
+      verdict.ev.chosen = alt;
+    }
   }
 
   // Optional Gemini narration (numbers only, never an image).
@@ -198,12 +323,18 @@ async function scanSymbol(symbol) {
     }
   }
 
-  // Sniper eligibility (uses live UTC hour).
-  const hourUTC = new Date().getUTCHours();
+  // Sniper eligibility. Hour is taken from the BAR, not from wall-clock time, so
+  // the same bar is always judged against the same session window.
+  const hourUTC = verdict.barCloseTime
+    ? new Date(verdict.barCloseTime).getUTCHours()
+    : new Date().getUTCHours();
   verdict.sniper = engine.sniperEligibility(verdict, hourUTC, config.activeHoursUTC, config.sniperRequireVolume);
+  verdict.hourUTC = hourUTC;
 
-  // Primary setup category (for learning + display).
-  verdict.setup = primarySetup(verdict);
+  // NOTE: verdict.setup now comes from the engine's single trigger taxonomy
+  // (lib/engine.js TRIGGERS), so the live app, the journal and the backtest all
+  // agree on what "the setup" is. It used to be re-derived here from a separate
+  // copy of a regex that had drifted out of sync.
 
   // Live order flow (what a scalper reads): confirms or vetoes direction.
   if (config.useOrderFlow) {
@@ -233,41 +364,56 @@ async function scanSymbol(symbol) {
   // trade journal display.
   if (config.useLearning && verdict.directie !== 'NEUTRU') {
     try {
-      const c5 = mtf['5m'];
-      const candleOpen = c5[c5.length - 1].openTime;
       journal.record({
         observation: true,
-        candleOpen,
+        candleOpen: verdict.barOpenTime,
         symbol,
         directie: verdict.directie,
         interval: verdict.interval,
         incredere: verdict.incredere,
+        score: verdict.score,
         sniper: false,
         setup: verdict.setup,
         hourUTC,
         ofState: verdict.orderflow ? verdict.orderflow.state : null,
         ofAgree: verdict.ofAgree,
         price: verdict.price,
-        ts: verdict.ts,
+        // Anchor the outcome window to the BAR CLOSE, which is when the signal
+        // became actionable, rather than to the moment we happened to poll.
+        ts: verdict.barCloseTime || verdict.ts,
       });
     } catch { /* non-fatal */ }
   }
 
-  const prev = latest[symbol];
   latest[symbol] = verdict;
   broadcast('signal', verdict);
 
-  // Alert logic depends on mode.
+  // ---- Alerting: exactly once per closed bar --------------------------------
+  // Verdicts are now deterministic per (symbol, barCloseTime). The old logic
+  // compared each poll against the previous poll, so a bar could alert, stop
+  // alerting and alert again as the forming candle wobbled.
+  const barKey = verdict.barCloseTime;
+  const alreadyActed = barKey != null && lastActedBar[symbol] === barKey;
+
   let shouldAlert;
   if (config.sniperMode) {
-    // Only the A+ setup fires an alert.
-    const wasEligible = prev && prev.sniper && prev.sniper.eligible;
-    shouldAlert = verdict.sniper.eligible && (!wasEligible || prev.directie !== verdict.directie);
+    shouldAlert = verdict.sniper.eligible && !alreadyActed;
   } else {
-    const meetsConf = verdict.directie !== 'NEUTRU' &&
-      CONF_RANK[verdict.incredere] >= CONF_RANK[config.alertMinConfidence];
-    const changed = !prev || prev.directie !== verdict.directie || prev.incredere !== verdict.incredere;
-    shouldAlert = meetsConf && changed;
+    shouldAlert = verdict.directie !== 'NEUTRU' &&
+      CONF_RANK[verdict.incredere] >= CONF_RANK[config.alertMinConfidence] &&
+      !alreadyActed;
+  }
+
+  // EV gate: for a binary contract, direction is not enough — the calibrated
+  // probability has to beat the break-even the payout imposes. This is the
+  // single most important filter for event futures, so it runs before the rest.
+  if (shouldAlert && config.requireEvGate) {
+    if (!verdict.gate || !verdict.gate.trade) {
+      shouldAlert = false;
+      verdict.suppressed = verdict.gate && verdict.gate.needsData
+        ? `fără probabilitate calibrată: ${verdict.gate.reason}`
+        : `EV nefavorabil: ${verdict.gate ? verdict.gate.reason : 'necunoscut'}`;
+    }
   }
 
   // Order-flow veto: optionally require live order flow to not contradict.
@@ -283,48 +429,36 @@ async function scanSymbol(symbol) {
   }
 
   if (shouldAlert) {
+    if (barKey != null) lastActedBar[symbol] = barKey;
     const alert = {
       symbol,
       directie: verdict.directie,
       interval: verdict.interval,
       incredere: verdict.incredere,
+      setup: verdict.setup,
+      probability: verdict.prediction ? verdict.prediction.probability : null,
+      ev: verdict.gate ? verdict.gate.ev : null,
       price: verdict.price,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
       ofState: verdict.orderflow ? verdict.orderflow.state : null,
       ofAgree: verdict.ofAgree || null,
-      ts: verdict.ts,
+      barCloseTime: verdict.barCloseTime,
+      ts: verdict.barCloseTime || verdict.ts,
     };
     alerts.unshift(alert);
     if (alerts.length > 50) alerts.pop();
     // Auto-journal every alert with rich context for the learning layer.
     const logged = journal.record({
       ...alert,
-      setup: verdict.setup,
+      score: verdict.score,
       hourUTC,
     });
     broadcast('alert', alert);
     if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
-    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} (${verdict.incredere}) OF:${alert.ofAgree || '-'} @ ${verdict.price}`);
+    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} ${alert.probability != null ? alert.probability + '%' : 'necalibrat'} (EV ${alert.ev != null ? alert.ev + '%' : '?'}) @ ${verdict.price}`);
   }
   return verdict;
-}
-
-// Categorize the primary trigger of a verdict into a setup label.
-function primarySetup(verdict) {
-  const sig = (verdict.signals || []).find((s) => /sweep|squeeze|structure shift|fvg|divergen|crossover|absorb|distribu|reversie|band/i.test(s.label));
-  if (!sig) return 'context';
-  const l = sig.label.toLowerCase();
-  if (l.includes('sweep')) return 'Liquidity Sweep';
-  if (l.includes('squeeze')) return 'Squeeze breakout';
-  if (l.includes('structure shift')) return 'Market Structure Shift';
-  if (l.includes('ifvg')) return 'Inversion FVG';
-  if (l.includes('fvg')) return 'FVG retest';
-  if (l.includes('divergen')) return 'RSI divergence';
-  if (l.includes('crossover')) return 'MACD crossover';
-  if (l.includes('absorb') || l.includes('distribu')) return 'Volume absorption';
-  if (l.includes('reversie') || l.includes('band')) return 'Bollinger bounce';
-  return 'context';
 }
 
 // Background resolver: closes out pending journal entries automatically.
@@ -342,14 +476,25 @@ async function resolveJournal() {
   }
 }
 
+// Re-entrancy guard: scanAll is async but was driven by a bare setInterval, so
+// a slow round (3 klines + depth + aggTrades per symbol, plus an optional AI
+// call) could still be in flight when the next tick fired. Overlapping rounds
+// duplicate every request, which is the fastest way to earn an exchange rate
+// limit, and they can interleave writes to the journal.
 async function scanAll() {
-  for (const symbol of config.symbols) {
-    try {
-      await scanSymbol(symbol);
-    } catch (e) {
-      console.error(`Scan error ${symbol}:`, e.message);
-      broadcast('error', { symbol, message: e.message });
+  if (scanning) return;
+  scanning = true;
+  try {
+    for (const symbol of config.symbols) {
+      try {
+        await scanSymbol(symbol);
+      } catch (e) {
+        console.error(`Scan error ${symbol}:`, e.message);
+        broadcast('error', { symbol, message: e.message });
+      }
     }
+  } finally {
+    scanning = false;
   }
 }
 
@@ -429,9 +574,14 @@ app.post('/api/config', (req, res) => {
     const v = Number(body.payout30);
     if (v > 0 && v <= 500) config.payout30 = v;
   }
-  if (body.fallbackWinRate != null) {
-    const v = Number(body.fallbackWinRate);
-    if (v >= 40 && v <= 70) config.fallbackWinRate = v;
+  if (typeof body.requireEvGate === 'boolean') config.requireEvGate = body.requireEvGate;
+  if (body.evMarginPct != null) {
+    const v = Number(body.evMarginPct);
+    if (v >= 0 && v <= 15) config.evMarginPct = v;
+  }
+  if (body.calibrationMinSample != null) {
+    const v = Number(body.calibrationMinSample);
+    if (v >= 10 && v <= 500) config.calibrationMinSample = v;
   }
   if (Array.isArray(body.activeHoursUTC)) {
     config.activeHoursUTC = body.activeHoursUTC
@@ -472,11 +622,71 @@ app.get('/api/backtest', async (req, res) => {
   const days = Math.min(60, Math.max(3, Number(req.query.days) || 15));
   const endDaysAgo = Math.max(0, Number(req.query.endDaysAgo) || 0);
   try {
-    const result = await backtest.run(symbol, { days, endDaysAgo });
+    const result = await backtest.run(symbol, {
+      days,
+      endDaysAgo,
+      // The backtest must evaluate against the SAME payouts and the SAME EV
+      // threshold the live app uses, otherwise it is grading a different rule.
+      payout10: config.payout10,
+      payout30: config.payout30,
+      marginPct: config.evMarginPct,
+      minSample: config.calibrationMinSample,
+    });
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Fit the live probability model from historical data and persist it.
+// This is what gives the app calibrated probabilities on day one, before the
+// user's own journal is large enough to speak for itself.
+app.post('/api/calibrate', async (req, res) => {
+  const symbols = Array.isArray(req.body?.symbols) && req.body.symbols.length
+    ? req.body.symbols.map((s) => String(s).toUpperCase())
+    : config.symbols;
+  const days = Math.min(60, Math.max(7, Number(req.body?.days) || 30));
+  try {
+    const perSymbol = {};
+    const allTrades = [];
+    for (const sym of symbols) {
+      const r = await backtest.run(sym, {
+        days,
+        payout10: config.payout10,
+        payout30: config.payout30,
+        marginPct: config.evMarginPct,
+        minSample: config.calibrationMinSample,
+        // Use the whole span for fitting here; honest evaluation stays in
+        // /api/backtest, which keeps a held-out slice.
+        trainFraction: 0.9,
+      });
+      if (r.error) { perSymbol[sym] = { error: r.error }; continue; }
+      perSymbol[sym] = {
+        evaluated: r.evaluated,
+        outOfSample: r.outOfSample.all,
+        byInterval: r.outOfSample.byInterval,
+      };
+      // Rebuild raw samples from the fitted model's own training rows is not
+      // possible, so refit from the reported trades of this run.
+      for (const t of r.trades) {
+        allTrades.push({ setup: t.setup, interval: t.interval, score: t.score, win: t.win });
+      }
+    }
+    if (!allTrades.length) {
+      return res.status(400).json({ error: 'nu s-au produs semnale pentru calibrare' });
+    }
+    calModel = cal.fit(allTrades, { minSample: config.calibrationMinSample });
+    calModel.symbols = symbols;
+    calModel.days = days;
+    saveCalibration(calModel);
+    res.json({ ok: true, model: calModel, perSymbol });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+app.get('/api/calibration', (req, res) => {
+  res.json(calModel || { total: 0, note: 'nicio calibrare salvată — rulează POST /api/calibrate' });
 });
 
 // SSE stream for live updates.
@@ -535,6 +745,95 @@ function startServer(port, attemptsLeft) {
 startServer(PORT, 10);
 ```
 
+
+## `lib/candles.js`
+
+```javascript
+'use strict';
+
+// ============================================================================
+// candles.js — candle hygiene. This module exists to kill ONE specific class of
+// bug: acting on the candle that is still forming.
+//
+// WHY THIS MATTERS
+// MEXC/Binance kline endpoints return the in-progress candle as the last row.
+// Its high/low/close/volume keep changing until the bar closes. Any detector
+// that reads that row (sweeps, volume spikes, wick ratios, RSI, MACD...) will
+// produce a verdict that mutates during the bar — the classic "repainting"
+// problem. The live app then flips UP/DOWN mid-bar, while the backtest — which
+// replays only completed bars — never sees those flips. Backtest and live stop
+// describing the same strategy, so the measured win-rate is meaningless.
+//
+// The rule enforced here: decisions are computed ONLY from confirmed, closed
+// candles. The forming candle is still useful for displaying the current price,
+// but it never feeds a detector.
+// ============================================================================
+
+// Is this candle definitively closed?
+// A candle is closed once wall-clock time has passed its closeTime.
+function isClosed(candle, now = Date.now()) {
+  if (!candle) return false;
+  if (Number.isFinite(candle.closeTime) && candle.closeTime > 0) return now > candle.closeTime;
+  return false; // unknown closeTime -> treat as unconfirmed (fail safe)
+}
+
+// Drop any trailing candles that have not closed yet.
+// Returns a NEW array; never mutates the input.
+function closedOnly(candles, now = Date.now()) {
+  if (!Array.isArray(candles) || candles.length === 0) return [];
+  let end = candles.length;
+  while (end > 0 && !isClosed(candles[end - 1], now)) end--;
+  return candles.slice(0, end);
+}
+
+// Split a series into { closed, forming }.
+// `forming` is the in-progress candle (or null) — display only.
+function split(candles, now = Date.now()) {
+  const closed = closedOnly(candles, now);
+  const forming = closed.length < candles.length ? candles[candles.length - 1] : null;
+  return { closed, forming };
+}
+
+// Aggregate k consecutive candles into one higher-timeframe candle.
+// Only emits COMPLETE groups, so the tail is never a partial bar.
+// Used to derive 15m/60m views from a 5m series with guaranteed alignment.
+function aggregate(candles, k) {
+  const out = [];
+  if (!Array.isArray(candles) || k < 1) return out;
+  for (let i = 0; i + k <= candles.length; i += k) {
+    let high = -Infinity;
+    let low = Infinity;
+    let volume = 0;
+    for (let j = i; j < i + k; j++) {
+      if (candles[j].high > high) high = candles[j].high;
+      if (candles[j].low < low) low = candles[j].low;
+      volume += candles[j].volume;
+    }
+    out.push({
+      openTime: candles[i].openTime,
+      open: candles[i].open,
+      high,
+      low,
+      close: candles[i + k - 1].close,
+      volume,
+      closeTime: candles[i + k - 1].closeTime,
+    });
+  }
+  return out;
+}
+
+// Keep only candles that had already closed at or before `asOf`.
+// This is the core no-look-ahead primitive for the backtest: it reconstructs
+// exactly the information set available at decision time.
+function upTo(candles, asOf) {
+  if (!Array.isArray(candles)) return [];
+  return candles.filter((c) => c.closeTime <= asOf);
+}
+
+module.exports = { isClosed, closedOnly, split, aggregate, upTo };
+```
+
+
 ## `lib/mexc.js`
 
 ```javascript
@@ -550,6 +849,8 @@ startServer(PORT, 10);
 // Symbols use no underscore at spot v3, e.g. BTCUSDT, ETHUSDT.
 // Valid intervals: 1m, 5m, 15m, 30m, 60m  (NOTE: "1h" is rejected -> use "60m").
 // ============================================================================
+
+const candles = require('./candles');
 
 const BASE = 'https://api.mexc.com';
 
@@ -613,13 +914,27 @@ async function fetchKlinesHistory(symbol, interval = '5m', total = 3000, maxPerR
 }
 
 // Fetch several timeframes at once for one symbol.
-async function fetchMultiTimeframe(symbol, timeframes = ['5m', '15m', '30m'], limit = 200) {
+//
+// The last row the exchange returns is the candle currently FORMING: its
+// high/low/close/volume keep changing until the bar closes. Feeding it to the
+// detectors makes verdicts mutate mid-bar (repainting) and breaks any
+// correspondence with the backtest, which only ever replays completed bars.
+// So we over-fetch by one row and hand back only confirmed candles, plus the
+// forming candle separately for price display.
+async function fetchMultiTimeframe(symbol, timeframes = ['5m', '15m', '30m'], limit = 200, opts = {}) {
+  const closedOnly = opts.closedOnly !== false;
   const results = {};
+  const forming = {};
   await Promise.all(
     timeframes.map(async (tf) => {
-      results[tf] = await fetchKlines(symbol, tf, limit);
+      const raw = await fetchKlines(symbol, tf, limit + (closedOnly ? 1 : 0));
+      if (!closedOnly) { results[tf] = raw; return; }
+      const { closed, forming: f } = candles.split(raw);
+      results[tf] = closed.slice(-limit);
+      forming[tf] = f;
     })
   );
+  if (closedOnly) Object.defineProperty(results, '__forming', { value: forming, enumerable: false });
   return results;
 }
 
@@ -655,6 +970,58 @@ module.exports = {
   volumes,
 };
 ```
+
+
+## `lib/binance.js`
+
+```javascript
+'use strict';
+
+// ============================================================================
+// binance.js — DEEP HISTORY source used ONLY for backtesting.
+// MEXC's public klines endpoint ignores startTime/endTime and serves only the
+// most recent ~500 bars, so it cannot support a meaningful backtest. The public
+// Binance data mirror (data-api.binance.vision) honors startTime and provides
+// deep history. BTC/ETH prices on MEXC vs Binance track within a few bps, so it
+// is a valid proxy for evaluating strategy edge. Live signals still use MEXC.
+// ============================================================================
+
+const BASE = 'https://data-api.binance.vision';
+
+async function fetchHistory(symbol, interval = '5m', days = 15, maxPerReq = 1000, endTimeMs = null) {
+  const end = endTimeMs || Date.now();
+  let start = end - days * 86400 * 1000;
+  const all = [];
+  let guard = 0;
+  while (start < end && guard < 120) {
+    guard++;
+    const url = `${BASE}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${maxPerReq}&startTime=${start}`;
+    const res = await fetch(url, { headers: { Accept: 'application/json' } });
+    if (!res.ok) break;
+    const raw = await res.json();
+    if (!Array.isArray(raw) || raw.length === 0) break;
+    for (const r of raw) {
+      all.push({
+        openTime: Number(r[0]), open: Number(r[1]), high: Number(r[2]),
+        low: Number(r[3]), close: Number(r[4]), volume: Number(r[5]),
+        closeTime: Number(r[6]), quoteVolume: Number(r[7]),
+      });
+    }
+    const lastOpen = Number(raw[raw.length - 1][0]);
+    if (lastOpen <= start) break;
+    start = lastOpen + 1;
+    if (raw.length < maxPerReq) break;
+  }
+  // Trim anything past the requested end window (when backtesting older ranges).
+  const filtered = all.filter((c) => c.openTime <= end);
+  const seenF = new Map();
+  for (const c of filtered) seenF.set(c.openTime, c);
+  return [...seenF.values()].sort((a, b) => a.openTime - b.openTime);
+}
+
+module.exports = { fetchHistory, BASE };
+```
+
 
 ## `lib/indicators.js`
 
@@ -830,6 +1197,7 @@ module.exports = {
 };
 ```
 
+
 ## `lib/smc.js`
 
 ```javascript
@@ -884,18 +1252,31 @@ function marketStructure(candles, span = 2) {
   else if (lowerHighs && lowerLows) trend = 'down';
 
   // Market Structure Shift: latest close breaks the prior opposing swing.
-  const lastClose = candles[candles.length - 1].close;
+  //
+  // IMPORTANT: an MSS is an EVENT, not a state. The previous version only
+  // checked `lastClose > lastSwingHigh`, which stays true for every bar that
+  // price holds above the level — so a single break kept injecting weight into
+  // the score for dozens of consecutive bars, inflating confluence. We now
+  // require the break to be NEW: the prior bar must still have been on the other
+  // side of the level. `mssState` keeps the persistent view for display.
+  const lastIdx = candles.length - 1;
+  const lastClose = candles[lastIdx].close;
+  const prevClose = lastIdx > 0 ? candles[lastIdx - 1].close : lastClose;
   const lastSwingHigh = highs[highs.length - 1].price;
   const lastSwingLow = lows[lows.length - 1].price;
+
+  let mssState = null;
+  if (lastClose > lastSwingHigh && (trend === 'down' || trend === 'range')) mssState = 'bullish';
+  if (lastClose < lastSwingLow && (trend === 'up' || trend === 'range')) mssState = 'bearish';
+
   let mss = null;
-  // Bullish MSS: in a down/range context, close breaks the most recent swing high.
-  if (lastClose > lastSwingHigh && (trend === 'down' || trend === 'range')) mss = 'bullish';
-  // Bearish MSS: in an up/range context, close breaks the most recent swing low.
-  if (lastClose < lastSwingLow && (trend === 'up' || trend === 'range')) mss = 'bearish';
+  if (mssState === 'bullish' && prevClose <= lastSwingHigh) mss = 'bullish';
+  if (mssState === 'bearish' && prevClose >= lastSwingLow) mss = 'bearish';
 
   return {
     trend,
-    mss,
+    mss,        // fresh break on this bar only (a trigger)
+    mssState,   // persistent "price is beyond the level" view (context)
     detail: { higherHighs, higherLows, lowerHighs, lowerLows, lastSwingHigh, lastSwingLow },
     highs,
     lows,
@@ -904,45 +1285,139 @@ function marketStructure(candles, span = 2) {
 
 // ---- Fair Value Gaps --------------------------------------------------------
 // A 3-candle imbalance. Bullish: low[i] > high[i-2]. Bearish: high[i] < low[i-2].
-// We return recent gaps that are still at least partially unfilled, plus whether
-// price is currently retesting one, and detect Inversion FVGs (invalidated gaps).
-function fairValueGaps(candles, lookback = 60) {
+//
+// Lifecycle of a gap (this is what the previous version got wrong — it tracked
+// inversion but never tracked FILLING, so a gap that had been fully consumed
+// weeks ago still counted as a live "retest"):
+//   fresh      -> price has not returned into the zone yet
+//   retesting  -> price is inside the zone right now (tradeable)
+//   filled     -> price reached the far edge; the imbalance is spent (NOT tradeable)
+//   inverted   -> price CLOSED through the zone; polarity flips (IFVG, tradeable)
+// `opts.atr` enables the significance filters described below. Without it the
+// function degrades to the raw 3-bar pattern (kept only for compatibility).
+function fairValueGaps(candles, lookback = 60, opts = {}) {
+  const atr = Number.isFinite(opts.atr) && opts.atr > 0 ? opts.atr : null;
+  // A Fair Value Gap is supposed to mark DISPLACEMENT — a violent, one-sided move
+  // that leaves unfilled orders behind. The mechanical "low[i] > high[i-2]" test
+  // alone matches a huge number of trivial 3-bar patterns: measured on 4000 bars,
+  // price sat inside some qualifying gap 76% of the time, and FVG/IFVG accounted
+  // for 93% of all triggers, drowning out every other setup. That is ambient
+  // noise being reported as a signal.
+  //
+  // Two significance filters restore the intended meaning:
+  //   minGapAtr          - the gap itself must be a real void, not a rounding error
+  //   minDisplacementAtr - the middle candle must be an expansion candle
+  const minGapAtr = opts.minGapAtr != null ? opts.minGapAtr : 0.35;
+  const minDisplacementAtr = opts.minDisplacementAtr != null ? opts.minDisplacementAtr : 0.9;
+
   const start = Math.max(2, candles.length - lookback);
   const gaps = [];
   for (let i = start; i < candles.length; i++) {
     const a = candles[i - 2];
+    const mid = candles[i - 1];
     const c = candles[i];
-    // Bullish FVG
+    const displacement = Math.abs(mid.close - mid.open);
+
+    // Bullish FVG: imbalance left BELOW price.
     if (c.low > a.high) {
-      gaps.push({ type: 'bullish', top: c.low, bottom: a.high, index: i });
+      const size = c.low - a.high;
+      if (!atr || (size >= minGapAtr * atr && displacement >= minDisplacementAtr * atr)) {
+        gaps.push({ type: 'bullish', top: c.low, bottom: a.high, index: i, size, displacement });
+      }
     }
-    // Bearish FVG
+    // Bearish FVG: imbalance left ABOVE price.
     if (c.high < a.low) {
-      gaps.push({ type: 'bearish', top: a.low, bottom: c.high, index: i });
+      const size = a.low - c.high;
+      if (!atr || (size >= minGapAtr * atr && displacement >= minDisplacementAtr * atr)) {
+        gaps.push({ type: 'bearish', top: a.low, bottom: c.high, index: i, size, displacement });
+      }
     }
   }
 
-  const lastClose = candles[candles.length - 1].close;
-  const lastHigh = candles[candles.length - 1].high;
-  const lastLow = candles[candles.length - 1].low;
+  const lastIdx = candles.length - 1;
+  const lastClose = candles[lastIdx].close;
+  const lastHigh = candles[lastIdx].high;
+  const lastLow = candles[lastIdx].low;
 
-  // Determine fill / inversion status for each gap based on subsequent price.
+  // Maximum age (in bars) for a gap, or for an inversion, to still be relevant.
+  const maxAge = opts.maxAge != null ? opts.maxAge : 30;
+  const maxInversionAge = opts.maxInversionAge != null ? opts.maxInversionAge : 12;
+
+  const inZone = (candle, g) => candle.low <= g.top && candle.high >= g.bottom;
+
   const enriched = gaps.map((g) => {
-    let inverted = false;
+    let touchedAt = null;        // first re-entry into the zone
+    let filledAt = null;         // first time the far edge was reached
+    let invertedAt = null;       // first CLOSE beyond the zone (polarity flip)
+    let postInversionTouchAt = null; // first re-entry AFTER the flip
+
     for (let k = g.index + 1; k < candles.length; k++) {
-      const cl = candles[k].close;
-      if (g.type === 'bullish' && cl < g.bottom) inverted = true; // bullish gap failed
-      if (g.type === 'bearish' && cl > g.top) inverted = true; // bearish gap failed
+      const c = candles[k];
+      const cl = c.close;
+      if (touchedAt == null && inZone(c, g)) touchedAt = k;
+      if (g.type === 'bullish') {
+        if (filledAt == null && c.low <= g.bottom) filledAt = k;
+        if (invertedAt == null && cl < g.bottom) invertedAt = k;
+      } else {
+        if (filledAt == null && c.high >= g.top) filledAt = k;
+        if (invertedAt == null && cl > g.top) invertedAt = k;
+      }
+      if (invertedAt != null && k > invertedAt && postInversionTouchAt == null && inZone(c, g)) {
+        postInversionTouchAt = k;
+      }
     }
-    // effective type after inversion (IFVG flips polarity)
+
+    const inverted = invertedAt != null;
     const effectiveType = inverted ? (g.type === 'bullish' ? 'bearish' : 'bullish') : g.type;
-    return { ...g, inverted, effectiveType };
+
+    // A gap is only ACTIONABLE on a specific bar, not permanently:
+    //
+    //   plain FVG -> the FIRST time price returns into an unmitigated gap.
+    //   IFVG      -> the FIRST return after a recent polarity flip.
+    //
+    // Without this, a single gap kept re-emitting a signal on every bar price
+    // happened to drift through it. Because almost every gap eventually gets
+    // closed through on a long enough lookback, nearly all of them ended up
+    // classified as tradeable inversions: FVG/IFVG produced 88-93% of all
+    // triggers and masked every other setup.
+    let actionable = false;
+    let reason = null;
+    if (inverted) {
+      const freshFlip = lastIdx - invertedAt <= maxInversionAge;
+      if (freshFlip && postInversionTouchAt === lastIdx) {
+        actionable = true;
+        reason = 'primul retest după inversare';
+      }
+    } else if (filledAt == null || filledAt === lastIdx) {
+      const fresh = lastIdx - g.index <= maxAge;
+      if (fresh && touchedAt === lastIdx) {
+        actionable = true;
+        reason = 'primul retest al gap-ului nemitigat';
+      }
+    }
+
+    return {
+      ...g,
+      inverted,
+      invertedAt,
+      filled: filledAt != null,
+      filledAt,
+      touchedAt,
+      spent: filledAt != null && invertedAt == null,
+      actionable,
+      reason,
+      effectiveType,
+      age: lastIdx - g.index,
+    };
   });
 
-  // Is price currently inside a gap (retest)?
-  const retest = enriched.find(
-    (g) => lastLow <= g.top && lastHigh >= g.bottom
-  ) || null;
+  // Only gaps that are actionable ON THIS BAR, and price is currently inside.
+  const candidates = enriched.filter((g) => g.actionable && lastLow <= g.top && lastHigh >= g.bottom);
+  // Pick the MOST RECENT one. The previous version used .find(), which returned
+  // the OLDEST match — usually a stale, irrelevant gap.
+  const retest = candidates.length
+    ? candidates.reduce((best, g) => (g.index > best.index ? g : best), candidates[0])
+    : null;
 
   return { gaps: enriched, retest, lastClose };
 }
@@ -1031,6 +1506,7 @@ module.exports = {
 };
 ```
 
+
 ## `lib/engine.js`
 
 ```javascript
@@ -1048,6 +1524,44 @@ module.exports = {
 
 const ind = require('./indicators');
 const smc = require('./smc');
+
+// ---- Trigger taxonomy (SINGLE SOURCE OF TRUTH) -----------------------------
+// Previously this classification lived as three separate copies of a regex in
+// engine.js, server.js and backtest.js. They drifted, which meant the live app,
+// the journal and the backtest could each disagree about what "the setup" was.
+//
+// Each entry also declares the contract window the setup naturally belongs to:
+//   10 minute -> impulsive, single-bar rejection/expansion events
+//   30 minute -> structural setups that need room to play out
+//
+// This replaces the old horizon rule, which compared the SUMMED weight of all
+// "fast" signals against all "structural" signals. Because context signals
+// (trend, EMA alignment, VWAP, 1h alignment) are present on almost every bar
+// while true triggers are rare, structural weight nearly always won: measured on
+// 4000 bars, only 2.4% of signals came out as 10-minute. The window is now taken
+// from the PRIMARY trigger, so both windows genuinely occur.
+const TRIGGERS = [
+  { re: /liquidity sweep/i,                  setup: 'Liquidity Sweep',        horizon: '10 minute' },
+  { re: /squeeze/i,                          setup: 'Squeeze breakout',       horizon: '10 minute' },
+  { re: /absorb|distribuție|oprire/i,        setup: 'Volume absorption',      horizon: '10 minute' },
+  { re: /bandă bollinger|reversie la medie/i, setup: 'Bollinger bounce',      horizon: '10 minute' },
+  { re: /crossover/i,                        setup: 'MACD crossover',         horizon: '10 minute' },
+  { re: /market structure shift/i,           setup: 'Market Structure Shift', horizon: '30 minute' },
+  { re: /ifvg/i,                             setup: 'Inversion FVG',          horizon: '30 minute' },
+  { re: /fvg/i,                              setup: 'FVG retest',             horizon: '30 minute' },
+  { re: /divergen/i,                         setup: 'RSI divergence',         horizon: '30 minute' },
+];
+
+// Classify a signal label into { setup, horizon }, or null if it is mere context.
+function classifyTrigger(label) {
+  if (!label) return null;
+  for (const t of TRIGGERS) {
+    if (t.re.test(label)) return { setup: t.setup, horizon: t.horizon };
+  }
+  return null;
+}
+
+const isTrigger = (label) => classifyTrigger(label) !== null;
 
 // ---- RSI divergence (regular) ----------------------------------------------
 function rsiDivergence(candles, rsiSeries, span = 2) {
@@ -1085,6 +1599,7 @@ function analyzeTimeframe(candles, tf, kindOfTf) {
   const ema50 = ind.ema(closes, 50) || [];
   const volAvg = ind.volumeAverage(volumes, 20) || [];
   const vwapSeries = ind.vwap(candles, 96) || [];
+  const atrSeries = ind.atr(highs, lows, closes, 14) || [];
 
   const iLast = candles.length - 1;
   const price = closes[iLast];
@@ -1106,8 +1621,11 @@ function analyzeTimeframe(candles, tf, kindOfTf) {
   const vwapNow = ind.last(vwapSeries);
   const vwapPrev = vwapSeries[iLast - 5] ?? vwapSeries[iLast - 1];
 
+  const atrNow = ind.last(atrSeries);
   const structure = smc.marketStructure(candles, 2);
-  const fvg = smc.fairValueGaps(candles, 60);
+  // ATR is passed so the FVG detector can require genuine displacement instead
+  // of matching every trivial 3-bar imbalance.
+  const fvg = smc.fairValueGaps(candles, 60, { atr: atrNow });
   const sweep = smc.liquiditySweep(candles, { span: 2, volAvg: vAvgNow });
   const div = rsiDivergence(candles, rsi14, 2);
 
@@ -1212,6 +1730,7 @@ function analyzeTimeframe(candles, tf, kindOfTf) {
     ema50: ema50Now != null ? +ema50Now.toFixed(2) : null,
     volume: vNow != null ? +vNow.toFixed(2) : null,
     volAvg: vAvgNow != null ? +vAvgNow.toFixed(2) : null,
+    atr: atrNow != null ? +atrNow.toFixed(2) : null,
     squeeze: isSqueeze,
     vwap: vwapNow != null ? +vwapNow.toFixed(2) : null,
     aboveVwap: vwapNow != null ? price > vwapNow : null,
@@ -1282,25 +1801,29 @@ function decide(mtf) {
   // shift, FVG retest, divergence, absorption), NOT in the mere existence of a
   // trend/EMA alignment. On a 10/30-min horizon, "context only" is ~coin-flip.
   // If the winning side has no trigger, we stand down (NEUTRU = no trade).
-  const TRIGGER_RE = /sweep|squeeze|structure shift|fvg|divergen|crossover|absorb|distribu|reversie|band/i;
   let noTrigger = false;
-  let hasTrigger = false;
+  // The highest-weight genuine trigger on the winning side defines the setup.
+  let primaryTrigger = null;
   if (directie !== 'NEUTRU') {
-    hasTrigger = winning.some((s) => TRIGGER_RE.test(s.label));
-    if (!hasTrigger) {
+    primaryTrigger = winning.find((s) => isTrigger(s.label)) || null;
+    if (!primaryTrigger) {
       directie = 'NEUTRU';
       noTrigger = true;
     }
   }
 
-  // Interval: dominated by fast vs structural among winning signals.
+  // Interval comes from the PRIMARY TRIGGER's natural window (see TRIGGERS).
+  const triggerInfo = primaryTrigger ? classifyTrigger(primaryTrigger.label) : null;
+  const setup = triggerInfo ? triggerInfo.setup : 'context';
+  const interval = triggerInfo ? triggerInfo.horizon : '30 minute';
+
+  // Kept for display/diagnostics only — no longer decides the window.
   let winFast = 0;
   let winStruct = 0;
   for (const s of winning) {
     if (s.kind === 'fast') winFast += s.weight;
     else winStruct += s.weight;
   }
-  const interval = directie === 'NEUTRU' ? '30 minute' : winFast >= winStruct ? '10 minute' : '30 minute';
 
   // Confidence.
   let incredere = 'Scăzut';
@@ -1333,11 +1856,19 @@ function decide(mtf) {
       : 'Graficul este contradictoriu și lipsit de momentum direcțional clar (structură de tip "chop"). Nu există un dezechilibru major (FVG/sweep) care să impună o direcție cu probabilitate ridicată; se recomandă prudență.';
   } else {
     const top = winning.slice(0, 4).map((s) => `${s.label} (${s.tf})`);
-    justificare = `Confluență ${directie} pe ${confluence} semnale. Elemente cheie: ${top.join('; ')}. ` +
-      (winFast >= winStruct
-        ? 'Setup-ul este de tip momentum acut, deci fereastra scurtă (10 min) captează cel mai bine mișcarea.'
-        : 'Setup-ul este structural/așezat, deci se acordă spațiu de desfășurare (30 min).');
+    justificare = `Declanșator principal: ${primaryTrigger.label} [${primaryTrigger.tf}]. ` +
+      `Confluență ${directie} pe ${confluence} semnale: ${top.join('; ')}. ` +
+      (interval === '10 minute'
+        ? 'Este un eveniment impulsiv de o singură lumânare, deci fereastra scurtă (10 min) captează cel mai bine mișcarea.'
+        : 'Este un setup structural, deci are nevoie de spațiu de desfășurare (30 min).');
   }
+
+  // Identity of the bar this verdict was computed from. Because the engine now
+  // only ever sees CLOSED candles, (symbol, barCloseTime) uniquely identifies a
+  // verdict — which lets the server emit exactly one alert per bar instead of
+  // re-evaluating the same bar on every poll.
+  const fastest = tf5 && tf5.length ? tf5 : tf15;
+  const lastBar = fastest && fastest.length ? fastest[fastest.length - 1] : null;
 
   return {
     directie,
@@ -1345,13 +1876,21 @@ function decide(mtf) {
     justificare,
     incredere,
     invalidare,
+    setup,
+    primaryTrigger: primaryTrigger
+      ? { label: primaryTrigger.label, tf: primaryTrigger.tf, weight: +primaryTrigger.weight.toFixed(2) }
+      : null,
+    score: +absNet.toFixed(2),
     scores: { up: +upScore.toFixed(2), down: +downScore.toFixed(2), net: +net.toFixed(2) },
     confluence,
+    weightSplit: { fast: +winFast.toFixed(2), structural: +winStruct.toFixed(2) },
     signals: winning.map((s) => ({ label: s.label, tf: s.tf, weight: +s.weight.toFixed(2), kind: s.kind })),
     allSignals: allSignals.map((s) => ({ side: s.side, label: s.label, tf: s.tf, weight: +s.weight.toFixed(2) })),
     snapshots: Object.fromEntries(analyses.map((a) => [a.tf, a.snapshot])),
     htfTrend,
     price,
+    barOpenTime: lastBar ? lastBar.openTime : null,
+    barCloseTime: lastBar ? lastBar.closeTime : null,
     ts: Date.now(),
   };
 }
@@ -1377,8 +1916,317 @@ function sniperEligibility(verdict, hourUTC, activeHours, requireVolume = true) 
   return { eligible: true, reason: `Sniper A+: ${sweep.label} [${sweep.tf}]` };
 }
 
-module.exports = { decide, analyzeTimeframe, rsiDivergence, sniperEligibility };
+module.exports = {
+  decide,
+  analyzeTimeframe,
+  rsiDivergence,
+  sniperEligibility,
+  classifyTrigger,
+  isTrigger,
+  TRIGGERS,
+};
 ```
+
+
+## `lib/calibration.js`
+
+```javascript
+'use strict';
+
+// ============================================================================
+// calibration.js — the event-futures decision layer.
+//
+// WHY THIS EXISTS
+// A binary event contract does not pay you for being directionally right; it
+// pays you for being right MORE OFTEN THAN THE PAYOUT REQUIRES. With a payout of
+// p (e.g. 0.65 for +65%), staking 1 unit returns +p on a win and -1 on a loss,
+// so expected value is:
+//
+//     EV = w*p - (1-w)        where w = true win probability
+//
+// EV turns positive only when w > 1/(1+p). That break-even is brutal:
+//
+//     payout 40% -> need 71.4%      payout 65% -> need 60.6%
+//     payout 80% -> need 55.6%      payout 85% -> need 54.1%
+//
+// So the only number that matters for this instrument is a CALIBRATED
+// probability — "70%" has to mean the thing actually happens 70% of the time.
+// A raw confluence score ("net = 6.19") is not a probability and must never be
+// treated as one.
+//
+// WHAT THIS MODULE DOES
+//   fit()      -> learns score/setup buckets -> empirical win rate, from history
+//   predict()  -> maps a new signal to a probability WITH an uncertainty interval
+//   decide()   -> compares the CONSERVATIVE bound against break-even
+//
+// WHAT IT DELIBERATELY WILL NOT DO
+// It never invents a probability. If a bucket has too few resolved samples, it
+// reports ready:false and the app must say "not enough data" rather than print a
+// confident-looking number. Uncertainty is surfaced, not hidden.
+// ============================================================================
+
+const DEFAULT_MIN_SAMPLE = 30;   // per-bucket minimum before a rate is trusted
+const Z_95 = 1.959963985;        // two-sided 95%
+const Z_ONE_SIDED_90 = 1.2815516; // for the conservative lower bound
+
+// ---- Event-futures arithmetic ----------------------------------------------
+
+// Win rate (%) needed just to break even at a given payout (%).
+function breakEvenWinRate(payoutPct) {
+  const p = Number(payoutPct) / 100;
+  if (!Number.isFinite(p) || p <= 0) return null;
+  return +((100 / (1 + p))).toFixed(2);
+}
+
+// Expected value per 1 unit staked, as a percentage of the stake.
+function expectedValue(winRatePct, payoutPct) {
+  const w = Number(winRatePct) / 100;
+  const p = Number(payoutPct) / 100;
+  if (!Number.isFinite(w) || !Number.isFinite(p)) return null;
+  return +(((w * p) - (1 - w)) * 100).toFixed(2);
+}
+
+// Kelly-optimal fraction of bankroll for a binary payout. Reported for context
+// only — it assumes the probability is exactly right, which it never is.
+function kellyFraction(winRatePct, payoutPct) {
+  const w = Number(winRatePct) / 100;
+  const p = Number(payoutPct) / 100;
+  if (!Number.isFinite(w) || !Number.isFinite(p) || p <= 0) return 0;
+  const f = (w * (1 + p) - 1) / p;
+  return +Math.max(0, Math.min(1, f)).toFixed(4);
+}
+
+// ---- Statistics ------------------------------------------------------------
+
+// Wilson score interval — well behaved for small n and for rates near 0/1,
+// unlike the normal approximation.
+function wilson(wins, n, z = Z_95) {
+  if (!n) return { low: null, high: null, mid: null };
+  const phat = wins / n;
+  const z2n = (z * z) / n;
+  const denom = 1 + z2n;
+  const center = (phat + z2n / 2) / denom;
+  const half = (z / denom) * Math.sqrt((phat * (1 - phat)) / n + (z * z) / (4 * n * n));
+  return {
+    low: +Math.max(0, (center - half) * 100).toFixed(2),
+    high: +Math.min(1, (center + half) * 100).toFixed(2),
+    mid: +(phat * 100).toFixed(2),
+  };
+}
+
+// One-sided binomial test against a fair coin: "is this better than 50%?"
+// Returns the z statistic and an approximate p-value. This is the honesty check
+// that separates a real edge from a lucky streak.
+function vsCoinFlip(wins, n) {
+  if (!n) return { z: null, pValue: null, significant: false };
+  const phat = wins / n;
+  const se = Math.sqrt(0.25 / n);
+  const z = (phat - 0.5) / se;
+  // Normal tail approximation (Abramowitz & Stegun 7.1.26 style erf).
+  const erf = (x) => {
+    const s = x < 0 ? -1 : 1;
+    const ax = Math.abs(x);
+    const t = 1 / (1 + 0.3275911 * ax);
+    const y = 1 - ((((1.061405429 * t - 1.453152027) * t + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-ax * ax);
+    return s * y;
+  };
+  const pValue = +(0.5 * (1 - erf(z / Math.SQRT2))).toFixed(4);
+  return { z: +z.toFixed(2), pValue, significant: pValue < 0.05 };
+}
+
+// Brier score: mean squared error of probabilistic forecasts. Lower is better;
+// 0.25 is what you get by always saying 50%.
+function brierScore(samples) {
+  const usable = samples.filter((s) => Number.isFinite(s.probability) && typeof s.win === 'boolean');
+  if (!usable.length) return null;
+  const sum = usable.reduce((acc, s) => {
+    const p = s.probability / 100;
+    return acc + (p - (s.win ? 1 : 0)) ** 2;
+  }, 0);
+  return +(sum / usable.length).toFixed(4);
+}
+
+// Reliability table: are forecasts of "X%" actually right X% of the time?
+function reliability(samples, binCount = 5) {
+  const usable = samples.filter((s) => Number.isFinite(s.probability) && typeof s.win === 'boolean');
+  const bins = [];
+  for (let i = 0; i < binCount; i++) {
+    const lo = 40 + (i * 30) / binCount;   // focus on the 40-70% region that matters
+    const hi = 40 + ((i + 1) * 30) / binCount;
+    const inBin = usable.filter((s) => s.probability >= lo && s.probability < hi);
+    const wins = inBin.filter((s) => s.win).length;
+    bins.push({
+      range: `${lo.toFixed(0)}-${hi.toFixed(0)}%`,
+      n: inBin.length,
+      predicted: inBin.length ? +(inBin.reduce((a, s) => a + s.probability, 0) / inBin.length).toFixed(1) : null,
+      actual: inBin.length ? +((wins / inBin.length) * 100).toFixed(1) : null,
+    });
+  }
+  return bins;
+}
+
+// ---- Score bucketing -------------------------------------------------------
+
+// Confluence score |net| is ordinal, not probabilistic. We bin it and let the
+// data say what each bin is worth.
+const SCORE_BINS = [
+  { key: 's1', min: 0, max: 2.5 },
+  { key: 's2', min: 2.5, max: 4 },
+  { key: 's3', min: 4, max: 5.5 },
+  { key: 's4', min: 5.5, max: 7 },
+  { key: 's5', min: 7, max: Infinity },
+];
+
+function scoreBin(score) {
+  const s = Math.abs(Number(score) || 0);
+  const b = SCORE_BINS.find((x) => s >= x.min && s < x.max);
+  return b ? b.key : 's1';
+}
+
+// ---- Fitting ---------------------------------------------------------------
+
+function aggregate(rows) {
+  const n = rows.length;
+  const wins = rows.filter((r) => r.win).length;
+  const ci = wilson(wins, n);
+  return {
+    n,
+    wins,
+    winRate: n ? +((wins / n) * 100).toFixed(2) : null,
+    ciLow: ci.low,
+    ciHigh: ci.high,
+  };
+}
+
+function groupBy(rows, keyFn) {
+  const map = new Map();
+  for (const r of rows) {
+    const k = keyFn(r);
+    if (k == null) continue;
+    if (!map.has(k)) map.set(k, []);
+    map.get(k).push(r);
+  }
+  const out = {};
+  for (const [k, v] of map) out[k] = aggregate(v);
+  return out;
+}
+
+// Build a calibration model from resolved samples.
+// Each sample: { setup, interval, direction, score, win }
+function fit(samples, opts = {}) {
+  const minSample = opts.minSample || DEFAULT_MIN_SAMPLE;
+  const rows = (samples || []).filter((s) => typeof s.win === 'boolean');
+  return {
+    version: 2,
+    fittedAt: Date.now(),
+    minSample,
+    total: rows.length,
+    global: aggregate(rows),
+    byInterval: groupBy(rows, (r) => r.interval),
+    bySetupInterval: groupBy(rows, (r) => `${r.setup}|${r.interval}`),
+    bySetupIntervalScore: groupBy(rows, (r) => `${r.setup}|${r.interval}|${scoreBin(r.score)}`),
+  };
+}
+
+// ---- Prediction ------------------------------------------------------------
+
+// Hierarchical lookup: most specific bucket with enough samples wins.
+// Returns { ready, probability, ciLow, ciHigh, n, source }.
+function predict(model, ctx) {
+  if (!model || !model.total) {
+    return { ready: false, probability: null, ciLow: null, ciHigh: null, n: 0, source: 'niciun model calibrat' };
+  }
+  const minSample = model.minSample || DEFAULT_MIN_SAMPLE;
+  const candidates = [
+    { bucket: model.bySetupIntervalScore?.[`${ctx.setup}|${ctx.interval}|${scoreBin(ctx.score)}`], source: `${ctx.setup} · ${ctx.interval} · scor ${scoreBin(ctx.score)}` },
+    { bucket: model.bySetupInterval?.[`${ctx.setup}|${ctx.interval}`], source: `${ctx.setup} · ${ctx.interval}` },
+    { bucket: model.byInterval?.[ctx.interval], source: `toate setup-urile · ${ctx.interval}` },
+    { bucket: model.global, source: 'global' },
+  ];
+  for (const c of candidates) {
+    if (c.bucket && c.bucket.n >= minSample && c.bucket.winRate != null) {
+      return {
+        ready: true,
+        probability: c.bucket.winRate,
+        ciLow: c.bucket.ciLow,
+        ciHigh: c.bucket.ciHigh,
+        n: c.bucket.n,
+        source: c.source,
+      };
+    }
+  }
+  const best = candidates.find((c) => c.bucket && c.bucket.n > 0);
+  return {
+    ready: false,
+    probability: null,
+    ciLow: null,
+    ciHigh: null,
+    n: best ? best.bucket.n : 0,
+    source: `date insuficiente (nevoie de ${minSample} rezultate, am ${best ? best.bucket.n : 0})`,
+  };
+}
+
+// ---- The actual trade/skip decision ---------------------------------------
+//
+// Deliberately conservative: it compares the LOWER bound of the confidence
+// interval against break-even, not the point estimate. A raw 56% off 25 samples
+// has a lower bound near 40% — that is not an edge, it is noise, and this gate
+// refuses it. Being slow to say yes is the correct failure mode when the
+// alternative is losing money.
+function decide(prediction, payoutPct, opts = {}) {
+  const marginPct = opts.marginPct != null ? opts.marginPct : 1.5; // required cushion
+  const be = breakEvenWinRate(payoutPct);
+  if (be == null) {
+    return { trade: false, reason: 'payout invalid', breakEven: null };
+  }
+  if (!prediction || !prediction.ready) {
+    return {
+      trade: false,
+      reason: prediction ? prediction.source : 'fără predicție calibrată',
+      breakEven: be,
+      needsData: true,
+    };
+  }
+  const required = be + marginPct;
+  // Conservative one-sided lower bound from the same bucket counts.
+  const conservative = prediction.ciLow;
+  const ev = expectedValue(prediction.probability, payoutPct);
+  const evConservative = expectedValue(conservative, payoutPct);
+  const trade = conservative != null && conservative >= required;
+  return {
+    trade,
+    breakEven: be,
+    required: +required.toFixed(2),
+    probability: prediction.probability,
+    conservative,
+    ev,
+    evConservative,
+    kelly: trade ? kellyFraction(conservative, payoutPct) : 0,
+    n: prediction.n,
+    source: prediction.source,
+    reason: trade
+      ? `probabilitate conservatoare ${conservative}% ≥ prag ${required.toFixed(1)}% (payout ${payoutPct}%)`
+      : `probabilitate conservatoare ${conservative}% < prag ${required.toFixed(1)}% necesar la payout ${payoutPct}% — EV negativ, se sare`,
+  };
+}
+
+module.exports = {
+  breakEvenWinRate,
+  expectedValue,
+  kellyFraction,
+  wilson,
+  vsCoinFlip,
+  brierScore,
+  reliability,
+  scoreBin,
+  SCORE_BINS,
+  fit,
+  predict,
+  decide,
+  DEFAULT_MIN_SAMPLE,
+};
+```
+
 
 ## `lib/orderflow.js`
 
@@ -1417,19 +2265,30 @@ async function getOrderFlow(symbol, depthLimit = 50, tradesLimit = 200) {
   const imbalance = bidVol + askVol > 0 ? (bidVol - askVol) / (bidVol + askVol) : 0;
 
   // Aggression delta from recent taker trades.
+  // GUARD: the previous version used `if (t.m === false) buy; else sell;` — so if
+  // the exchange ever omitted or renamed `m`, EVERY trade was silently counted as
+  // an aggressive sell, manufacturing a permanent bearish bias. We now require a
+  // real boolean and count unusable rows separately instead of guessing.
   let buyVol = 0;
   let sellVol = 0;
+  let skipped = 0;
   if (Array.isArray(trades)) {
     for (const t of trades) {
       const q = Number(t.q);
+      if (!Number.isFinite(q) || typeof t.m !== 'boolean') { skipped++; continue; }
       if (t.m === false) buyVol += q; // buyer is taker -> aggressive BUY
       else sellVol += q;              // buyer is maker -> aggressive SELL
     }
   }
-  const delta = buyVol + sellVol > 0 ? (buyVol - sellVol) / (buyVol + sellVol) : 0;
+  // If we could not classify a meaningful share of trades, the delta is not
+  // trustworthy — report it as unavailable rather than as a directional read.
+  const usable = (Array.isArray(trades) ? trades.length : 0) - skipped;
+  const deltaReliable = usable > 0 && skipped / Math.max(1, trades.length) < 0.2;
+  const delta = deltaReliable && buyVol + sellVol > 0 ? (buyVol - sellVol) / (buyVol + sellVol) : 0;
 
-  // Combined pressure and a discrete state.
-  const pressure = (imbalance + delta) / 2; // -1..1
+  // Combined pressure and a discrete state. If the trade delta is unusable we
+  // fall back to book imbalance alone rather than averaging in a fake zero.
+  const pressure = deltaReliable ? (imbalance + delta) / 2 : imbalance;
   let state = 'neutru';
   if (pressure > 0.15) state = 'buy';
   else if (pressure < -0.15) state = 'sell';
@@ -1437,6 +2296,8 @@ async function getOrderFlow(symbol, depthLimit = 50, tradesLimit = 200) {
   return {
     imbalance: +imbalance.toFixed(3),
     delta: +delta.toFixed(3),
+    deltaReliable,
+    skippedTrades: skipped,
     pressure: +pressure.toFixed(3),
     state,
     bidVol: +bidVol.toFixed(2),
@@ -1457,6 +2318,7 @@ function agreement(direction, of) {
 
 module.exports = { getOrderFlow, agreement, BASE };
 ```
+
 
 ## `lib/learning.js`
 
@@ -1575,6 +2437,7 @@ function summary(entries, minSample = DEFAULT_MIN_SAMPLE) {
 
 module.exports = { analyze, evaluate, summary, DEFAULT_MIN_SAMPLE };
 ```
+
 
 ## `lib/journal.js`
 
@@ -1724,6 +2587,7 @@ function reset() {
 module.exports = { record, resolvePending, stats, recent, recentByInterval, reset, all: () => entries };
 ```
 
+
 ## `lib/gemini.js`
 
 ```javascript
@@ -1818,6 +2682,7 @@ async function testKey(cfg) {
 module.exports = { narrate, testKey, buildPrompt };
 ```
 
+
 ## `lib/backtest.js`
 
 ```javascript
@@ -1825,236 +2690,498 @@ module.exports = { narrate, testKey, buildPrompt };
 
 // ============================================================================
 // backtest.js — honest, walk-forward evaluation of the engine.
-// Replays real MEXC history candle-by-candle. At each 5m step it rebuilds the
-// exact multi-timeframe view the live engine would have seen, gets the verdict,
-// then checks the outcome after the contract window (10 or 30 min).
-// Reports win-rate broken down by confidence level. No look-ahead.
+//
+// Three defects in the previous version made its numbers unusable:
+//
+// 1. NO PARITY WITH LIVE. It called engine.decide({'5m','15m'}) while the server
+//    calls engine.decide({'5m','15m','60m'}). The 1h trend-alignment signal
+//    (weight 1.5) therefore existed live but not in validation, so the two could
+//    return different verdicts from the same data — verified: one returned
+//    NEUTRU where the other returned UP. Whatever win-rate it printed described
+//    a strategy nobody was running. It now feeds the exact same timeframes.
+//
+// 2. NO TRAIN/TEST SEPARATION. Win-rate was reported over the whole sample, then
+//    the best-looking subset ("sweep + volume + active hours") was picked from
+//    those same numbers. That is selecting a hypothesis on the data you then
+//    quote as evidence for it. Calibration is now fitted on an EARLIER slice and
+//    scored only on a LATER, untouched slice.
+//
+// 3. NO NULL BASELINE AND NO ERROR BARS. "54.8%" means nothing without knowing
+//    what a coin flip scored on the same bars and how wide the interval is. Both
+//    are now reported, plus a binomial test against 50%.
+//
+// Overlap: signals are spaced by at least the longest horizon so samples do not
+// share outcome bars. Overlapping samples are correlated and would make the
+// significance test look far stronger than it is.
 // ============================================================================
 
 const binance = require('./binance');
 const engine = require('./engine');
+const cal = require('./calibration');
+const candles = require('./candles');
 
 const WINDOW = 200;         // candles fed to the engine
 const HORIZON_10 = 2;       // 2 x 5m = 10 min
 const HORIZON_30 = 6;       // 6 x 5m = 30 min
-
-// Map a raw signal label to a setup category (for per-setup win-rate).
-function categorize(label) {
-  const l = label.toLowerCase();
-  if (l.includes('sweep')) return 'Liquidity Sweep';
-  if (l.includes('squeeze')) return 'Bollinger Squeeze breakout';
-  if (l.includes('structure shift')) return 'Market Structure Shift';
-  if (l.includes('ifvg')) return 'Inversion FVG retest';
-  if (l.includes('fvg')) return 'FVG retest';
-  if (l.includes('divergen')) return 'RSI divergence';
-  if (l.includes('crossover')) return 'MACD crossover';
-  if (l.includes('absorb') || l.includes('distribu')) return 'Volume absorption';
-  if (l.includes('reversie') || l.includes('band')) return 'Bollinger bounce';
-  return 'other';
-}
-
-const TRIGGER_RE = /sweep|squeeze|structure shift|fvg|divergen|crossover|absorb|distribu|reversie|band/i;
+const COOLDOWN = HORIZON_30; // non-overlapping samples
 
 async function run(symbol, opts = {}) {
   const days = Math.min(60, Math.max(3, opts.days || 15));
   const endDaysAgo = Math.max(0, opts.endDaysAgo || 0);
+  const trainFraction = Math.min(0.9, Math.max(0.3, opts.trainFraction || 0.6));
+  const payout10 = opts.payout10 != null ? Number(opts.payout10) : 65;
+  const payout30 = opts.payout30 != null ? Number(opts.payout30) : 82;
   const endTimeMs = endDaysAgo > 0 ? Date.now() - endDaysAgo * 86400 * 1000 : null;
+
+  // PARITY: fetch every timeframe the live server uses, including 1h.
   const tf5 = await binance.fetchHistory(symbol, '5m', days, 1000, endTimeMs);
   const tf15 = await binance.fetchHistory(symbol, '15m', days, 1000, endTimeMs);
+  const tf60 = await binance.fetchHistory(symbol, '1h', days, 1000, endTimeMs);
 
-  const stats = {
-    symbol,
-    source: 'binance.vision (proxy pentru istoric adânc)',
-    days,
-    totalCandles: tf5.length,
-    evaluated: 0,
-    byConfidence: {
-      Ridicat: { n: 0, wins: 0 },
-      Mediu: { n: 0, wins: 0 },
-      Scăzut: { n: 0, wins: 0 },
-    },
-    byDirection: { UP: { n: 0, wins: 0 }, DOWN: { n: 0, wins: 0 } },
-    bySetup: {},        // primary trigger category -> {n, wins}
-    strong: { n: 0, wins: 0 },   // only |net| >= 5 (rare, high-conviction)
-    veryStrong: { n: 0, wins: 0 }, // only |net| >= 7
-    byHour: {},         // UTC hour -> {n, wins}  (all signals)
-    sweepAll: { n: 0, wins: 0 },
-    sweepActiveHours: { n: 0, wins: 0 }, // sweep during EU/US session windows
-    sniper: { n: 0, wins: 0 },  // sweep + active hours + volume-confirmed
-    trades: [],
-  };
+  if (tf5.length < WINDOW + HORIZON_30 + 10) {
+    throw new Error(`istoric insuficient pentru ${symbol}: ${tf5.length} lumânări de 5m`);
+  }
 
-  // High-liquidity windows (UTC): EU open + US open, matching a morning/evening
-  // routine for an EET (UTC+2/+3) trader.
-  const ACTIVE_HOURS = new Set([6, 7, 8, 9, 13, 14, 15, 16, 17]);
+  const samples = [];
+  let lastIdx = -Infinity;
+  let neutralCount = 0;
 
-  const maxHorizon = HORIZON_30;
-  let lastCountedIdx = -999;
+  for (let i = WINDOW; i < tf5.length - HORIZON_30; i++) {
+    const asOf = tf5[i].closeTime;
+    const w5 = tf5.slice(i - WINDOW, i + 1);
+    const w15 = candles.upTo(tf15, asOf).slice(-WINDOW);
+    const w60 = candles.upTo(tf60, asOf).slice(-WINDOW);
+    if (w15.length < 60) continue;
 
-  for (let i = WINDOW; i < tf5.length - maxHorizon; i++) {
-    const window5 = tf5.slice(i - WINDOW, i + 1);
-    const currentCloseTime = tf5[i].closeTime;
-    const window15 = tf15.filter((c) => c.closeTime <= currentCloseTime).slice(-WINDOW);
-    if (window15.length < 60) continue;
+    const mtf = { '5m': w5, '15m': w15 };
+    if (w60.length >= 60) mtf['60m'] = w60;
 
     let verdict;
     try {
-      verdict = engine.decide({ '5m': window5, '15m': window15 });
+      verdict = engine.decide(mtf);
     } catch {
       continue;
     }
-    if (verdict.directie === 'NEUTRU') continue;
-
-    // Avoid heavily overlapping duplicate signals: enforce a small cooldown.
-    if (i - lastCountedIdx < 2) continue;
-    lastCountedIdx = i;
-
-    const horizon = verdict.interval === '10 minute' ? HORIZON_10 : HORIZON_30;
-    const outIdx = i + horizon;
-    if (outIdx >= tf5.length) continue;
+    if (verdict.directie === 'NEUTRU') { neutralCount++; continue; }
+    if (i - lastIdx < COOLDOWN) continue;
+    lastIdx = i;
 
     const entry = tf5[i].close;
-    const exit = tf5[outIdx].close;
-    const win = verdict.directie === 'UP' ? exit > entry : exit < entry;
+    const exit10 = tf5[i + HORIZON_10].close;
+    const exit30 = tf5[i + HORIZON_30].close;
+    const up = verdict.directie === 'UP';
+    const win10 = up ? exit10 > entry : exit10 < entry;
+    const win30 = up ? exit30 > entry : exit30 < entry;
+    const natural = verdict.interval;
 
-    stats.evaluated++;
-    const conf = verdict.incredere;
-    if (stats.byConfidence[conf]) {
-      stats.byConfidence[conf].n++;
-      if (win) stats.byConfidence[conf].wins++;
-    }
-    stats.byDirection[verdict.directie].n++;
-    if (win) stats.byDirection[verdict.directie].wins++;
-
-    // Per-setup: use the highest-weight TRIGGER signal on the winning side.
-    const primaryTrigger = (verdict.signals || []).find((s) => TRIGGER_RE.test(s.label));
-    let isSweep = false;
-    let sweepVolConfirmed = false;
-    if (primaryTrigger) {
-      const cat = categorize(primaryTrigger.label);
-      if (!stats.bySetup[cat]) stats.bySetup[cat] = { n: 0, wins: 0 };
-      stats.bySetup[cat].n++;
-      if (win) stats.bySetup[cat].wins++;
-      isSweep = cat === 'Liquidity Sweep';
-      sweepVolConfirmed = isSweep && /volum ridicat/i.test(primaryTrigger.label);
-    }
-
-    // Hour-of-day (UTC) breakdown.
-    const hour = new Date(tf5[i].openTime).getUTCHours();
-    if (!stats.byHour[hour]) stats.byHour[hour] = { n: 0, wins: 0 };
-    stats.byHour[hour].n++;
-    if (win) stats.byHour[hour].wins++;
-
-    const inActive = ACTIVE_HOURS.has(hour);
-    if (isSweep) {
-      stats.sweepAll.n++; if (win) stats.sweepAll.wins++;
-      if (inActive) { stats.sweepActiveHours.n++; if (win) stats.sweepActiveHours.wins++; }
-      // "Sniper": the full A+ recipe — sweep + volume + active session window.
-      if (inActive && sweepVolConfirmed) { stats.sniper.n++; if (win) stats.sniper.wins++; }
-    }
-
-    // Strong-conviction filters (selectivity test).
-    const absNet = Math.abs(verdict.scores.net);
-    if (absNet >= 5) { stats.strong.n++; if (win) stats.strong.wins++; }
-    if (absNet >= 7) { stats.veryStrong.n++; if (win) stats.veryStrong.wins++; }
-
-    if (stats.trades.length < 200) {
-      stats.trades.push({
-        time: new Date(tf5[i].openTime).toISOString(),
-        directie: verdict.directie,
-        interval: verdict.interval,
-        incredere: conf,
-        entry: +entry.toFixed(2),
-        exit: +exit.toFixed(2),
-        win,
-      });
-    }
+    samples.push({
+      ts: tf5[i].openTime,
+      time: new Date(tf5[i].openTime).toISOString(),
+      hour: new Date(tf5[i].openTime).getUTCHours(),
+      setup: verdict.setup,
+      interval: natural,
+      direction: verdict.directie,
+      score: verdict.score,
+      confidence: verdict.incredere,
+      entry: +entry.toFixed(2),
+      exit10: +exit10.toFixed(2),
+      exit30: +exit30.toFixed(2),
+      win10,
+      win30,
+      // Outcome at the window the engine actually chose.
+      win: natural === '10 minute' ? win10 : win30,
+      // Null baselines measured on the SAME bars.
+      baselineUp10: exit10 > entry,
+      baselineUp30: exit30 > entry,
+    });
   }
 
-  // Win-rate percentages.
-  const pct = (o) => (o.n ? +((o.wins / o.n) * 100).toFixed(1) : null);
-  stats.winRate = {
-    overall: pct({
-      n: stats.evaluated,
-      wins: Object.values(stats.byConfidence).reduce((s, o) => s + o.wins, 0),
-    }),
-    Ridicat: pct(stats.byConfidence.Ridicat),
-    Mediu: pct(stats.byConfidence.Mediu),
-    Scăzut: pct(stats.byConfidence.Scăzut),
-    UP: pct(stats.byDirection.UP),
-    DOWN: pct(stats.byDirection.DOWN),
-    strong: pct(stats.strong),
-    veryStrong: pct(stats.veryStrong),
-    sweepAll: pct(stats.sweepAll),
-    sweepActiveHours: pct(stats.sweepActiveHours),
-    sniper: pct(stats.sniper),
+  if (samples.length < 20) {
+    return {
+      symbol,
+      days,
+      source: 'binance.vision (proxy pentru istoric adânc)',
+      totalCandles: tf5.length,
+      neutralCount,
+      evaluated: samples.length,
+      error: `prea puține semnale (${samples.length}) pentru o concluzie. Mărește perioada.`,
+    };
+  }
+
+  // ---- Time-ordered train/test split ---------------------------------------
+  samples.sort((a, b) => a.ts - b.ts);
+  const cut = Math.floor(samples.length * trainFraction);
+  const train = samples.slice(0, cut);
+  const test = samples.slice(cut);
+
+  // Fit calibration on TRAIN ONLY.
+  const model = cal.fit(train, { minSample: opts.minSample || 30 });
+
+  // Score the untouched TEST slice.
+  const scored = test.map((s) => {
+    const pred = cal.predict(model, { setup: s.setup, interval: s.interval, score: s.score });
+    const payout = s.interval === '10 minute' ? payout10 : payout30;
+    const gate = cal.decide(pred, payout, { marginPct: opts.marginPct });
+    return { ...s, probability: pred.probability, predReady: pred.ready, gate };
+  });
+
+  const rate = (rows, field = 'win') => {
+    const n = rows.length;
+    const wins = rows.filter((r) => r[field]).length;
+    const ci = cal.wilson(wins, n);
+    const sig = cal.vsCoinFlip(wins, n);
+    return {
+      n,
+      wins,
+      winRate: n ? +((wins / n) * 100).toFixed(2) : null,
+      ci95: n ? [ci.low, ci.high] : null,
+      vsCoinFlip: sig,
+    };
   };
-  stats.hourWinRate = Object.fromEntries(
-    Object.entries(stats.byHour)
-      .map(([h, v]) => [h, { winRate: pct(v), n: v.n }])
-      .sort((a, b) => Number(a[0]) - Number(b[0]))
+
+  const byGroup = (rows, keyFn, field = 'win') => {
+    const map = new Map();
+    for (const r of rows) {
+      const k = keyFn(r);
+      if (!map.has(k)) map.set(k, []);
+      map.get(k).push(r);
+    }
+    const out = {};
+    for (const [k, v] of [...map.entries()].sort()) out[k] = rate(v, field);
+    return out;
+  };
+
+  // Only the signals the EV gate would actually have approved.
+  const approved = scored.filter((s) => s.gate.trade);
+
+  // Baseline: what did "always bet UP" score on the very same test bars?
+  const baseUp = rate(
+    test.map((s) => ({ win: s.interval === '10 minute' ? s.baselineUp10 : s.baselineUp30 }))
   );
-  stats.setupWinRate = Object.fromEntries(
-    Object.entries(stats.bySetup)
-      .map(([k, v]) => [k, { winRate: pct(v), n: v.n }])
-      .sort((a, b) => (b[1].winRate || 0) - (a[1].winRate || 0))
+  const baseDown = rate(
+    test.map((s) => ({ win: !(s.interval === '10 minute' ? s.baselineUp10 : s.baselineUp30) }))
   );
 
-  return stats;
+  return {
+    symbol,
+    source: 'binance.vision (proxy pentru istoric adânc)',
+    parity: 'engine primește 5m+15m+60m, identic cu serverul live',
+    days,
+    totalCandles: tf5.length,
+    neutralCount,
+    evaluated: samples.length,
+    cooldownBars: COOLDOWN,
+    split: { trainFraction, trainN: train.length, testN: test.length },
+
+    // ---- headline: out-of-sample only ----
+    outOfSample: {
+      all: rate(test),
+      byInterval: byGroup(test, (s) => s.interval),
+      bySetup: byGroup(test, (s) => s.setup),
+      byDirection: byGroup(test, (s) => s.direction),
+      byHour: byGroup(test, (s) => `h${String(s.hour).padStart(2, '0')}`),
+    },
+
+    // ---- does the horizon choice matter? both windows, same signals ----
+    horizonComparison: {
+      note: 'aceleași semnale evaluate la 10 vs 30 min, ca să se vadă care fereastră e mai bună per setup',
+      at10: rate(test, 'win10'),
+      at30: rate(test, 'win30'),
+      bySetupAt10: byGroup(test, (s) => s.setup, 'win10'),
+      bySetupAt30: byGroup(test, (s) => s.setup, 'win30'),
+    },
+
+    // ---- null baselines on the identical bars ----
+    baselines: {
+      note: 'dacă motorul nu bate clar aceste linii, nu are edge',
+      alwaysUp: baseUp,
+      alwaysDown: baseDown,
+      coinFlip: 50,
+    },
+
+    // ---- probability quality ----
+    calibration: {
+      fittedOn: train.length,
+      minSample: model.minSample,
+      brierScore: cal.brierScore(scored),
+      brierBaseline: 0.25,
+      brierNote: '0.25 = ce obții spunând mereu 50%. Mai mic e mai bun.',
+      reliability: cal.reliability(scored),
+      coverage: {
+        withProbability: scored.filter((s) => s.predReady).length,
+        withoutProbability: scored.filter((s) => !s.predReady).length,
+      },
+    },
+
+    // ---- the only number that matters for real money ----
+    evGate: {
+      note: 'doar semnalele pe care poarta EV le-ar fi aprobat (limita inferioară a intervalului de încredere peste pragul impus de payout)',
+      payout10,
+      payout30,
+      breakEven10: cal.breakEvenWinRate(payout10),
+      breakEven30: cal.breakEvenWinRate(payout30),
+      approvedCount: approved.length,
+      rejectedCount: scored.length - approved.length,
+      approved: rate(approved),
+      approvedByInterval: byGroup(approved, (s) => s.interval),
+      realizedEv10: approved.filter((s) => s.interval === '10 minute').length
+        ? cal.expectedValue(rate(approved.filter((s) => s.interval === '10 minute')).winRate, payout10)
+        : null,
+      realizedEv30: approved.filter((s) => s.interval === '30 minute').length
+        ? cal.expectedValue(rate(approved.filter((s) => s.interval === '30 minute')).winRate, payout30)
+        : null,
+    },
+
+    model,
+    trades: scored.slice(0, 200).map((s) => ({
+      time: s.time,
+      directie: s.direction,
+      interval: s.interval,
+      setup: s.setup,
+      score: s.score,
+      probability: s.probability,
+      approved: s.gate.trade,
+      entry: s.entry,
+      exit: s.interval === '10 minute' ? s.exit10 : s.exit30,
+      win: s.win,
+    })),
+  };
 }
 
-module.exports = { run };
+module.exports = { run, WINDOW, HORIZON_10, HORIZON_30, COOLDOWN };
 ```
 
-## `lib/binance.js`
+
+## `tools/selftest.js`
 
 ```javascript
 'use strict';
 
 // ============================================================================
-// binance.js — DEEP HISTORY source used ONLY for backtesting.
-// MEXC's public klines endpoint ignores startTime/endTime and serves only the
-// most recent ~500 bars, so it cannot support a meaningful backtest. The public
-// Binance data mirror (data-api.binance.vision) honors startTime and provides
-// deep history. BTC/ETH prices on MEXC vs Binance track within a few bps, so it
-// is a valid proxy for evaluating strategy edge. Live signals still use MEXC.
+// selftest.js — offline verification. Requires no network and no API keys.
+//
+//   node tools/selftest.js
+//
+// These are not unit tests of arithmetic; they are guards against the specific
+// failure modes that made this app's output untrustworthy:
+//
+//   1. Repainting      — does a verdict change while a candle is still forming?
+//   2. Horizon balance — do 10-minute signals actually occur?
+//   3. Determinism     — same closed bars in, same verdict out?
+//   4. Null edge       — on pure noise, does the EV gate correctly refuse?
+//   5. Event maths     — break-even, EV and interval arithmetic.
+//
+// Test 4 is the important one. Any signal engine can be made to fire; the thing
+// that protects money is refusing to fire when there is nothing there.
 // ============================================================================
 
-const BASE = 'https://data-api.binance.vision';
+const engine = require('../lib/engine');
+const candlesLib = require('../lib/candles');
+const cal = require('../lib/calibration');
 
-async function fetchHistory(symbol, interval = '5m', days = 15, maxPerReq = 1000, endTimeMs = null) {
-  const end = endTimeMs || Date.now();
-  let start = end - days * 86400 * 1000;
-  const all = [];
-  let guard = 0;
-  while (start < end && guard < 120) {
-    guard++;
-    const url = `${BASE}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${interval}&limit=${maxPerReq}&startTime=${start}`;
-    const res = await fetch(url, { headers: { Accept: 'application/json' } });
-    if (!res.ok) break;
-    const raw = await res.json();
-    if (!Array.isArray(raw) || raw.length === 0) break;
-    for (const r of raw) {
-      all.push({
-        openTime: Number(r[0]), open: Number(r[1]), high: Number(r[2]),
-        low: Number(r[3]), close: Number(r[4]), volume: Number(r[5]),
-        closeTime: Number(r[6]), quoteVolume: Number(r[7]),
-      });
-    }
-    const lastOpen = Number(raw[raw.length - 1][0]);
-    if (lastOpen <= start) break;
-    start = lastOpen + 1;
-    if (raw.length < maxPerReq) break;
+let passed = 0;
+let failed = 0;
+
+function check(name, condition, detail) {
+  if (condition) {
+    passed++;
+    console.log(`  PASS  ${name}${detail ? '  — ' + detail : ''}`);
+  } else {
+    failed++;
+    console.log(`  FAIL  ${name}${detail ? '  — ' + detail : ''}`);
   }
-  // Trim anything past the requested end window (when backtesting older ranges).
-  const filtered = all.filter((c) => c.openTime <= end);
-  const seenF = new Map();
-  for (const c of filtered) seenF.set(c.openTime, c);
-  return [...seenF.values()].sort((a, b) => a.openTime - b.openTime);
 }
 
-module.exports = { fetchHistory, BASE };
+function section(title) {
+  console.log(`\n${title}`);
+  console.log('-'.repeat(title.length));
+}
+
+// ---- Deterministic synthetic market ---------------------------------------
+let seed = 20260729;
+function rnd() { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; }
+function gauss() { return Math.sqrt(-2 * Math.log(rnd() + 1e-12)) * Math.cos(2 * Math.PI * rnd()); }
+
+const STEP_5M = 5 * 60000;
+const T0 = 1700000000000;
+
+function make5m(n, startPrice = 3000) {
+  const out = [];
+  let p = startPrice;
+  let t = T0;
+  for (let i = 0; i < n; i++) {
+    const open = p;
+    const close = p * (1 + gauss() * 0.0012);
+    const high = Math.max(open, close) * (1 + Math.abs(gauss()) * 0.0004);
+    const low = Math.min(open, close) * (1 - Math.abs(gauss()) * 0.0004);
+    out.push({ openTime: t, open, high, low, close, volume: 100 * Math.exp(gauss() * 0.4), closeTime: t + STEP_5M - 1 });
+    p = close;
+    t += STEP_5M;
+  }
+  return out;
+}
+
+const SERIES = make5m(4200);
+// Timeframes derived by aggregation so all views are mutually consistent.
+const view = (upTo) => {
+  const s5 = SERIES.slice(0, upTo);
+  return {
+    '5m': s5.slice(-200),
+    '15m': candlesLib.aggregate(s5, 3).slice(-200),
+    '60m': candlesLib.aggregate(s5, 12).slice(-200),
+  };
+};
+
+// ===========================================================================
+section('1. Repainting: verdicts must not move while a candle forms');
+
+{
+  // A closed history plus a candle that is still forming. We mutate the forming
+  // candle through a full range of shapes — including one that manufactures a
+  // textbook liquidity sweep — and assert the verdict never budges.
+  const closed = SERIES.slice(0, 300);
+  const lastClose = closed[closed.length - 1].close;
+  const openTime = closed[closed.length - 1].closeTime + 1;
+  const closeTime = openTime + STEP_5M - 1;
+  const nowMidBar = openTime + Math.floor(STEP_5M / 2); // wall clock inside the bar
+
+  const shapes = [
+    { close: lastClose * 0.995, high: lastClose * 1.0005, low: lastClose * 0.9930, volume: 40 },
+    { close: lastClose * 1.004, high: lastClose * 1.0060, low: lastClose * 0.9990, volume: 900 },
+    { close: lastClose * 0.999, high: lastClose * 1.0010, low: lastClose * 0.9900, volume: 500 },
+    { close: lastClose * 1.001, high: lastClose * 1.0020, low: lastClose * 0.9995, volume: 120 },
+  ];
+
+  const verdicts = shapes.map((s) => {
+    const forming = { openTime, open: lastClose, high: s.high, low: s.low, close: s.close, volume: s.volume, closeTime };
+    const raw = closed.concat([forming]);
+    // This is the pipeline the live server now uses.
+    const confirmed = candlesLib.closedOnly(raw, nowMidBar);
+    const s5 = confirmed.slice(-200);
+    return engine.decide({
+      '5m': s5,
+      '15m': candlesLib.aggregate(confirmed, 3).slice(-200),
+      '60m': candlesLib.aggregate(confirmed, 12).slice(-200),
+    });
+  });
+
+  const dirs = [...new Set(verdicts.map((v) => v.directie))];
+  const nets = [...new Set(verdicts.map((v) => v.scores.net))];
+  const bars = [...new Set(verdicts.map((v) => v.barCloseTime))];
+
+  check('direction is stable across all forming-candle shapes', dirs.length === 1, `directions seen: ${dirs.join(', ')}`);
+  check('score is stable across all forming-candle shapes', nets.length === 1, `nets seen: ${nets.join(', ')}`);
+  check('verdict is attributed to the last CLOSED bar', bars.length === 1 && bars[0] < openTime,
+    `barCloseTime=${bars[0]}, forming bar opened at ${openTime}`);
+
+  // And the forming candle must genuinely be excluded.
+  const withForming = closed.concat([{ openTime, open: lastClose, high: lastClose * 1.01, low: lastClose * 0.99, close: lastClose, volume: 999, closeTime }]);
+  check('closedOnly() strips the unclosed candle',
+    candlesLib.closedOnly(withForming, nowMidBar).length === closed.length,
+    `${withForming.length} in -> ${candlesLib.closedOnly(withForming, nowMidBar).length} out`);
+  check('closedOnly() keeps it once the bar has closed',
+    candlesLib.closedOnly(withForming, closeTime + 1).length === closed.length + 1);
+}
+
+// ===========================================================================
+section('2. Horizon balance: 10-minute signals must actually occur');
+
+const signals = [];
+for (let i = 260; i < SERIES.length - 6; i += 3) {
+  const v = engine.decide(view(i));
+  if (v.directie === 'NEUTRU') continue;
+  const entry = SERIES[i - 1].close;
+  const h = v.interval === '10 minute' ? 2 : 6;
+  const exit = SERIES[i - 1 + h].close;
+  signals.push({
+    setup: v.setup,
+    interval: v.interval,
+    direction: v.directie,
+    score: v.score,
+    win: v.directie === 'UP' ? exit > entry : exit < entry,
+  });
+}
+
+{
+  const n10 = signals.filter((s) => s.interval === '10 minute').length;
+  const n30 = signals.filter((s) => s.interval === '30 minute').length;
+  const share10 = signals.length ? (n10 / signals.length) * 100 : 0;
+  console.log(`  ${signals.length} signals: ${n10} x 10min (${share10.toFixed(1)}%), ${n30} x 30min`);
+  check('both contract windows are produced', n10 > 0 && n30 > 0, `10min=${n10}, 30min=${n30}`);
+  check('10-minute share is not vanishing (>5%)', share10 > 5, `${share10.toFixed(1)}%`);
+  const setups = [...new Set(signals.map((s) => s.setup))];
+  check('no signal is emitted without a real trigger', !setups.includes('context'), `setups: ${setups.join(', ')}`);
+}
+
+// ===========================================================================
+section('3. Determinism: identical closed input yields identical output');
+
+{
+  const a = engine.decide(view(1500));
+  const b = engine.decide(view(1500));
+  const strip = (v) => JSON.stringify({ ...v, ts: 0 });
+  check('decide() is a pure function of the candles', strip(a) === strip(b));
+}
+
+// ===========================================================================
+section('4. Null edge: on pure noise the EV gate must refuse');
+
+{
+  const wins = signals.filter((s) => s.win).length;
+  const wr = signals.length ? (wins / signals.length) * 100 : 0;
+  const sig = cal.vsCoinFlip(wins, signals.length);
+  console.log(`  raw win-rate on random walk: ${wr.toFixed(1)}% (${wins}/${signals.length}), z=${sig.z}, p=${sig.pValue}`);
+  check('random-walk win-rate is near 50% (no look-ahead leak)', Math.abs(wr - 50) < 5, `${wr.toFixed(1)}%`);
+  check('random-walk edge is NOT statistically significant', !sig.significant, `p=${sig.pValue}`);
+
+  // Fit on the first half, gate the second half, at realistic payouts.
+  const cut = Math.floor(signals.length / 2);
+  const model = cal.fit(signals.slice(0, cut), { minSample: 30 });
+  const held = signals.slice(cut);
+  let approved = 0;
+  for (const s of held) {
+    const pred = cal.predict(model, s);
+    const payout = s.interval === '10 minute' ? 65 : 82;
+    if (cal.decide(pred, payout, { marginPct: 1.5 }).trade) approved++;
+  }
+  const approvedPct = held.length ? (approved / held.length) * 100 : 0;
+  console.log(`  EV gate approved ${approved}/${held.length} (${approvedPct.toFixed(1)}%) of noise signals`);
+  check('EV gate approves (almost) nothing on data with no edge', approvedPct < 5, `${approvedPct.toFixed(1)}% approved`);
+}
+
+// ===========================================================================
+section('5. Event-futures arithmetic');
+
+{
+  // Break-even = 1/(1+payout).
+  check('payout 65% needs 60.6%', Math.abs(cal.breakEvenWinRate(65) - 60.61) < 0.05, `${cal.breakEvenWinRate(65)}%`);
+  check('payout 82% needs 54.9%', Math.abs(cal.breakEvenWinRate(82) - 54.95) < 0.05, `${cal.breakEvenWinRate(82)}%`);
+  check('payout 100% needs 50%', Math.abs(cal.breakEvenWinRate(100) - 50) < 0.01);
+  check('EV is zero exactly at break-even',
+    Math.abs(cal.expectedValue(cal.breakEvenWinRate(65), 65)) < 0.05,
+    `EV=${cal.expectedValue(cal.breakEvenWinRate(65), 65)}%`);
+  check('EV is negative below break-even', cal.expectedValue(55, 65) < 0, `EV=${cal.expectedValue(55, 65)}%`);
+  check('EV is positive above break-even', cal.expectedValue(65, 65) > 0, `EV=${cal.expectedValue(65, 65)}%`);
+
+  // A small sample must never be treated as an edge, however good it looks.
+  const tiny = cal.wilson(14, 25); // 56% off 25 samples
+  check('56% off 25 samples has a lower bound below break-even', tiny.low < cal.breakEvenWinRate(82),
+    `CI low ${tiny.low}% vs break-even ${cal.breakEvenWinRate(82)}%`);
+  const gateTiny = cal.decide({ ready: true, probability: 56, ciLow: tiny.low, ciHigh: tiny.high, n: 25 }, 82);
+  check('EV gate refuses that sample', !gateTiny.trade, gateTiny.reason);
+
+  // Unknown probability must never be silently treated as tradeable.
+  const gateBlind = cal.decide({ ready: false, source: 'no data' }, 82);
+  check('EV gate refuses when probability is unknown', !gateBlind.trade && gateBlind.needsData === true);
+}
+
+// ===========================================================================
+console.log(`\n${'='.repeat(60)}`);
+console.log(`  ${passed} passed, ${failed} failed`);
+console.log('='.repeat(60));
+process.exit(failed ? 1 : 0);
 ```
+
 
 ## `public/index.html`
 
@@ -2182,6 +3309,19 @@ ETHUSDT</textarea>
               <small class="muted">Are nevoie de minim ~10 semnale per tipar înainte să acționeze.</small>
             </div>
         </div>
+        <div class="grid" style="margin-top:12px">
+            <div class="field">
+              <label class="switch-inline"><input type="checkbox" id="requireEvGate" checked /> <b>🚦 Poarta EV</b> — nu alerta decât dacă probabilitatea calibrată bate pragul impus de payout</label>
+              <small class="muted">Pentru un contract binar, direcția nu e suficientă. Cu payout de 65% ai nevoie de 60.6% ca să fii pe zero; cu 82%, de 54.9%. Poarta compară <b>limita inferioară</b> a intervalului de încredere cu acest prag, nu estimarea optimistă — de asta refuză un 56% obținut din 25 de mostre.</small>
+            </div>
+            <div class="field">
+              <label>Marjă cerută peste pragul de rentabilitate (%)</label>
+              <input type="number" id="evMarginPct" min="0" max="15" step="0.5" value="1.5" />
+              <label>Rezultate minime per tipar înainte să am încredere</label>
+              <input type="number" id="calibrationMinSample" min="10" max="500" value="30" />
+              <small class="muted">Mai mic = alertează mai repede, dar pe statistici mai fragile.</small>
+            </div>
+        </div>
         <hr />
         <div class="grid">
           <div class="field">
@@ -2208,9 +3348,24 @@ ETHUSDT</textarea>
       </div>
     </section>
 
+    <!-- CALIBRATION -->
+    <section class="panel">
+      <div class="panel-head"><h2>🎚️ Calibrare (obligatorie înainte de primul semnal)</h2></div>
+      <p class="muted" style="margin-top:-6px">
+        Aplicația nu îți dă o probabilitate până nu o măsoară. Calibrarea rulează motorul pe istoric și învață, pentru fiecare setup și fereastră, în ce procent din cazuri a ieșit bine. Fără asta, banner-ul va spune <b>„FĂRĂ DATE — nu intra”</b>, ceea ce e comportamentul corect: un scor de confluență (ex. „net 6.19”) nu este o probabilitate.
+      </p>
+      <div class="backtest-controls">
+        <button id="runCalibration" class="btn-primary">Calibrează pe ultimele 30 de zile</button>
+        <span id="calStatus" class="muted"></span>
+      </div>
+    </section>
+
     <!-- BACKTEST -->
     <section class="panel">
-      <div class="panel-head"><h2>Backtest (win-rate real pe istoric)</h2></div>
+      <div class="panel-head"><h2>Backtest (out-of-sample, cu baseline și marjă de eroare)</h2></div>
+      <p class="muted" style="margin-top:-6px">
+        Calibrarea se face pe o felie mai veche, iar scorul se dă pe una mai nouă, neatinsă. Se raportează și ce a obținut „mereu UP” pe exact aceleași bare, plus un test statistic față de o monedă aruncată. Dacă motorul nu bate clar aceste repere, nu are edge — indiferent cât de bine arată win-rate-ul general.
+      </p>
       <div class="backtest-controls">
         <select id="btSymbol"></select>
         <select id="btDays">
@@ -2230,6 +3385,7 @@ ETHUSDT</textarea>
 </body>
 </html>
 ```
+
 
 ## `public/app.js`
 
@@ -2322,21 +3478,38 @@ function renderCard(v) {
     ? `<div class="ai-note">🤖 <b>AI (${v.ai.acord || '—'})</b>: ${v.ai.risc ? '⚠️ ' + v.ai.risc : ''} ${v.ai.comentariu || ''}</div>`
     : (v.aiError ? `<div class="ai-note">🤖 AI indisponibil: ${v.aiError}</div>` : '');
 
-  // The BIG banner: the only thing you act on. Sniper Mode = trade only on 🎯.
+  // The BIG banner. For a binary contract, direction alone is not a reason to
+  // trade — the calibrated probability has to beat the break-even the payout
+  // imposes. So the banner is driven by the EV gate, and when there is no
+  // calibration data it says exactly that instead of showing a green light.
   const ev = v.ev;
+  const gate = v.gate;
   const payoutNow = ev ? (v.interval === '10 minute' ? ev.payout10 : ev.payout30) : null;
-  const beNow = ev ? (v.interval === '10 minute' ? ev.breakEven10 : ev.breakEven30) : null;
-  const evWarn = ev && !ev.positive;
-  const evNote = ev ? ` · payout ${payoutNow}% (break-even ${beNow}%)` : '';
-  const warnLine = evWarn ? `<div class="ev-warn">⚠️ payout prea mic pentru edge-ul tău — EV negativ, mai bine sari peste</div>` : '';
+  const beNow = gate ? gate.breakEven : null;
+  const probTxt = gate && gate.probability != null
+    ? `${gate.probability}% (prudent ${gate.conservative}%)`
+    : 'necalibrat';
+  const evNote = ev
+    ? ` · payout ${payoutNow}% → nevoie ${beNow}% · probabilitate ${probTxt}`
+    : '';
+
+  const gateOk = !!(gate && gate.trade);
+  const needsData = !!(gate && gate.needsData);
+  const tradeable = gateOk && (!SNIPER_MODE || eligible);
+
   let banner;
-  if (SNIPER_MODE) {
-    banner = eligible
-      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${warnLine}`
-      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
+  if (v.directie === 'NEUTRU') {
+    banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">fără declanșator valid — nicio poziție</div></div>`;
+  } else if (tradeable) {
+    banner = `<div class="cta go ${dir}">${SNIPER_MODE ? '🎯 ' : ''}INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>`;
+  } else if (needsData) {
+    banner = `<div class="cta wait">📊 FĂRĂ DATE — nu intra<div class="cta-sub">motorul vede ${v.directie} ${v.interval} (${v.setup}), dar nu are încă o probabilitate verificată. Rulează calibrarea sau lasă jurnalul să adune rezultate.</div></div>`;
+  } else if (!gateOk) {
+    banner = `<div class="cta wait">🚫 EV NEGATIV — sari peste<div class="cta-sub">${gate ? gate.reason : 'EV nefavorabil'}</div></div>`;
   } else {
-    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`;
+    banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
   }
+  const warnLine = '';
 
   return `
     <div class="card-top">
@@ -2349,10 +3522,20 @@ function renderCard(v) {
       <summary>Analiza motorului în timp real (context, nu semnal de intrare)</summary>
       <div class="row5">
         <b>Direcție motor</b><span class="dir-inline ${dir}">${v.directie} · ${v.interval}</span>
-        <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
+        <b>Declanșator</b><span>${v.setup || '—'}${v.primaryTrigger ? ` <span class="muted">(${v.primaryTrigger.label} [${v.primaryTrigger.tf}])</span>` : ''}</span>
+        <b>Scor confluență</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net} — scor brut, NU o probabilitate)</span></span>
         <b>Justificare</b><span>${v.justificare}</span>
         <b>Invalidare</b><span>${v.invalidare}</span>
-        ${ev ? `<b>EV / fereastră</b><span>10 min: <span class="${ev.ev10 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev10 > 0 ? '+' : ''}${ev.ev10}%</span> (payout ${ev.payout10}%, nevoie ${ev.breakEven10}%) · 30 min: <span class="${ev.ev30 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev30 > 0 ? '+' : ''}${ev.ev30}%</span> (payout ${ev.payout30}%, nevoie ${ev.breakEven30}%)</span>` : ''}
+        ${ev ? `
+        <b>Probabilitate</b><span>${gate && gate.probability != null
+          ? `<b>${gate.probability}%</b> · limita inferioară de încredere <b>${gate.conservative}%</b> <span class="muted">(din ${gate.n} rezultate — ${ev.probabilitySource || gate.source})</span>`
+          : `<span class="bad">indisponibilă</span> <span class="muted">${gate ? gate.reason : ''}</span>`}</span>
+        <b>Prag de rentabilitate</b><span>payout ${payoutNow}% ⇒ ai nevoie de <b>${beNow}%</b> doar ca să fii pe zero${gate && gate.required != null ? ` · prag cerut cu marjă: <b>${gate.required}%</b>` : ''}</span>
+        <b>EV</b><span>${gate && gate.ev != null
+          ? `<span class="${gate.ev > 0 ? 'dir-inline up' : 'dir-inline down'}">${gate.ev > 0 ? '+' : ''}${gate.ev}%</span> per miză${gate.evConservative != null ? ` <span class="muted">(prudent ${gate.evConservative}%)</span>` : ''}`
+          : '<span class="muted">necalculabil fără probabilitate</span>'}</span>
+        <b>Cealaltă fereastră</b><span>${ev.alternative ? `${ev.alternative.interval}: ${ev.alternative.probability != null ? ev.alternative.probability + '%' : 'necalibrat'}${ev.alternative.ev != null ? ` · EV ${ev.alternative.ev > 0 ? '+' : ''}${ev.alternative.ev}%` : ''} ${ev.alternative.trade ? '<span class="ok">(ar trece)</span>' : '<span class="muted">(nu trece)</span>'}` : '—'}</span>
+        <b>Bara analizată</b><span class="muted">${v.barCloseTime ? 'închisă la ' + new Date(v.barCloseTime).toLocaleTimeString('ro-RO') : '—'} · doar lumânări confirmate</span>` : ''}
       </div>
       ${sigs ? `<ul class="sig-list">${sigs}</ul>` : ''}
       ${ai}
@@ -2550,6 +3733,9 @@ async function loadState() {
   $('useOrderFlow').checked = c.useOrderFlow !== false;
   $('requireOfAgree').checked = !!c.requireOfAgree;
   $('useLearning').checked = c.useLearning !== false;
+  $('requireEvGate').checked = c.requireEvGate !== false;
+  if (c.evMarginPct != null) $('evMarginPct').value = c.evMarginPct;
+  if (c.calibrationMinSample != null) $('calibrationMinSample').value = c.calibrationMinSample;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -2580,6 +3766,9 @@ async function saveSettings() {
     useOrderFlow: $('useOrderFlow').checked,
     requireOfAgree: $('requireOfAgree').checked,
     useLearning: $('useLearning').checked,
+    requireEvGate: $('requireEvGate').checked,
+    evMarginPct: Number($('evMarginPct').value),
+    calibrationMinSample: Number($('calibrationMinSample').value),
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,
@@ -2605,27 +3794,106 @@ async function testAi() {
 }
 
 // ---------- backtest ----------
+// The backtest report is deliberately built around three questions, in order:
+//   1. Did it beat a coin flip out-of-sample, with error bars?
+//   2. Did it beat "always bet UP" on the very same bars?
+//   3. Of the trades the EV gate approved, was EV actually positive?
+// A single headline win-rate hides all three, which is how a losing strategy
+// ends up looking profitable.
 async function runBacktest() {
   const symbol = $('btSymbol').value;
   const days = $('btDays').value;
-  $('btStatus').textContent = 'rulez pe istoric... (câteva secunde)';
+  $('btStatus').textContent = 'rulez pe istoric (train/test separat)... poate dura zeci de secunde';
   $('btResult').innerHTML = '';
   try {
     const r = await fetch(`/api/backtest?symbol=${symbol}&days=${days}`);
     const d = await r.json();
     if (d.error) { $('btStatus').textContent = 'eroare: ' + d.error; return; }
-    $('btStatus').textContent = `${d.evaluated} semnale evaluate pe ${d.totalCandles} lumânări (${d.days} zile, sursă: ${d.source})`;
-    const w = d.winRate;
-    const box = (big, lbl) => `<div class="bt-box"><div class="big">${big ?? '—'}${big != null ? '%' : ''}</div><div class="lbl">${lbl}</div></div>`;
-    $('btResult').innerHTML =
-      box(w.overall, 'win-rate general') +
-      box(w.Ridicat, `încredere Ridicat (${d.byConfidence.Ridicat.n})`) +
-      box(w.Mediu, `încredere Mediu (${d.byConfidence.Mediu.n})`) +
-      box(w.Scăzut, `încredere Scăzut (${d.byConfidence.Scăzut.n})`) +
-      box(w.UP, `semnale UP (${d.byDirection.UP.n})`) +
-      box(w.DOWN, `semnale DOWN (${d.byDirection.DOWN.n})`);
+
+    $('btStatus').innerHTML = `${d.evaluated} semnale (${d.neutralCount} bare fără semnal) pe ${d.totalCandles} lumânări · ` +
+      `calibrat pe ${d.split.trainN}, testat pe ${d.split.testN} <b>neatinse</b> · ${d.parity}`;
+
+    const box = (big, lbl, cls) => `<div class="bt-box"><div class="big ${cls || ''}">${big ?? '—'}</div><div class="lbl">${lbl}</div></div>`;
+    const pct = (o) => (o && o.winRate != null ? o.winRate + '%' : '—');
+    const ciTxt = (o) => (o && o.ci95 ? `95% CI ${o.ci95[0]}–${o.ci95[1]}%` : '');
+
+    const oos = d.outOfSample.all;
+    const sig = oos.vsCoinFlip || {};
+    const verdictCls = sig.significant && oos.winRate > 50 ? 'ok' : 'bad';
+
+    let html = '';
+    html += box(pct(oos), `out-of-sample (${oos.n} semnale) · ${ciTxt(oos)}`, verdictCls);
+    html += box(sig.pValue != null ? 'p=' + sig.pValue : '—',
+      sig.significant ? 'DIFERIT de o monedă aruncată' : 'NU se distinge de noroc', verdictCls);
+    html += box(pct(d.baselines.alwaysUp), 'baseline: mereu UP');
+    html += box(pct(d.baselines.alwaysDown), 'baseline: mereu DOWN');
+
+    for (const [iv, o] of Object.entries(d.outOfSample.byInterval || {})) {
+      html += box(pct(o), `fereastră ${iv} (${o.n})`);
+    }
+
+    const g = d.evGate;
+    html += box(`${g.approvedCount}/${g.approvedCount + g.rejectedCount}`, 'aprobate de poarta EV');
+    if (g.approved && g.approved.n) {
+      html += box(pct(g.approved), `win-rate pe cele aprobate (${g.approved.n}) · ${ciTxt(g.approved)}`);
+      if (g.realizedEv10 != null) html += box(`${g.realizedEv10 > 0 ? '+' : ''}${g.realizedEv10}%`, `EV realizat 10 min (payout ${g.payout10}%)`, g.realizedEv10 > 0 ? 'ok' : 'bad');
+      if (g.realizedEv30 != null) html += box(`${g.realizedEv30 > 0 ? '+' : ''}${g.realizedEv30}%`, `EV realizat 30 min (payout ${g.payout30}%)`, g.realizedEv30 > 0 ? 'ok' : 'bad');
+    }
+    html += box(g.breakEven10 + '%', `prag rentabilitate 10 min (payout ${g.payout10}%)`);
+    html += box(g.breakEven30 + '%', `prag rentabilitate 30 min (payout ${g.payout30}%)`);
+
+    const c = d.calibration;
+    html += box(c.brierScore != null ? c.brierScore : '—',
+      `Brier (${c.brierBaseline} = a spune mereu 50%)`,
+      c.brierScore != null && c.brierScore < c.brierBaseline ? 'ok' : 'bad');
+
+    $('btResult').innerHTML = html;
+
+    // Per-setup and per-horizon detail, plus the reliability table.
+    const rows = (obj) => Object.entries(obj || {})
+      .map(([k, o]) => `<div class="lrow"><span>${k}</span><span>${pct(o)} <span class="muted">(${o.n})</span></span></div>`)
+      .join('') || '<p class="muted">—</p>';
+
+    const rel = (c.reliability || [])
+      .filter((b) => b.n > 0)
+      .map((b) => `<div class="lrow"><span>prezis ${b.range}</span><span>real <b>${b.actual}%</b> <span class="muted">(${b.n})</span></span></div>`)
+      .join('') || '<p class="muted">încă nu sunt destule predicții pe intervale</p>';
+
+    const detail = document.createElement('details');
+    detail.className = 'analysis';
+    detail.innerHTML = `<summary>Detaliu: per setup, per fereastră, calibrare</summary>
+      <div class="learn-cols">
+        <div><div class="learn-h">Per setup (out-of-sample)</div>${rows(d.outOfSample.bySetup)}</div>
+        <div><div class="learn-h">Per oră UTC</div>${rows(d.outOfSample.byHour)}</div>
+      </div>
+      <div class="learn-cols" style="margin-top:12px">
+        <div><div class="learn-h">Aceleași semnale la 10 min</div>${rows(d.horizonComparison.bySetupAt10)}</div>
+        <div><div class="learn-h">Aceleași semnale la 30 min</div>${rows(d.horizonComparison.bySetupAt30)}</div>
+      </div>
+      <div style="margin-top:12px"><div class="learn-h">Calibrare: "X%" se întâmplă chiar în X% din cazuri?</div>${rel}</div>`;
+    $('btResult').appendChild(detail);
   } catch (e) {
     $('btStatus').textContent = 'eroare: ' + e.message;
+  }
+}
+
+// Fit the probability model from historical data and persist it, so the app has
+// calibrated probabilities before the user's own journal is large enough.
+async function runCalibration() {
+  const days = 30;
+  $('calStatus').textContent = 'calibrez pe istoric... poate dura un minut';
+  try {
+    const r = await fetch('/api/calibrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ days }),
+    });
+    const d = await r.json();
+    if (d.error) { $('calStatus').textContent = 'eroare: ' + d.error; return; }
+    $('calStatus').innerHTML = `✓ calibrat pe ${d.model.total} rezultate (${days} zile). ` +
+      `Buckets cu minim ${d.model.minSample} mostre sunt folosite live.`;
+  } catch (e) {
+    $('calStatus').textContent = 'eroare: ' + e.message;
   }
 }
 
@@ -2634,6 +3902,7 @@ $('toggleSettings').addEventListener('click', () => $('settingsBody').classList.
 $('saveSettings').addEventListener('click', saveSettings);
 $('testAi').addEventListener('click', testAi);
 $('runBacktest').addEventListener('click', runBacktest);
+$('runCalibration').addEventListener('click', runCalibration);
 $('clearAlerts').addEventListener('click', () => { alertsEl.innerHTML = '<p class="muted">golit.</p>'; });
 $('soundToggle').addEventListener('change', (e) => { soundOn = e.target.checked; });
 $('geminiModel').addEventListener('change', updateCostHint);
@@ -2651,6 +3920,7 @@ connect();
 updateSessionBadge();
 setInterval(updateSessionBadge, 60000);
 ```
+
 
 ## `public/style.css`
 
@@ -2812,4 +4082,150 @@ button:hover { filter: brightness(1.1); }
 .lrow { display: flex; justify-content: space-between; align-items: center; padding: 7px 10px; border-radius: 8px; background: var(--panel2); border: 1px solid var(--border); font-size: 12.5px; margin-bottom: 4px; }
 .lrow .ok { color: var(--up); }
 .lrow .bad { color: var(--down); }
+```
+
+
+## `README.md`
+
+```markdown
+# SignalPilot
+
+Aplicație locală care citește date live de pe MEXC, calculează indicatori tehnici + concepte Smart Money **determinist**, și produce decizii **UP/DOWN** pentru contracte event-futures pe **10 / 30 minute**.
+
+Ce o deosebește de un indicator obișnuit: nu îți dă doar o direcție, ci o **probabilitate măsurată** și o compară cu pragul de rentabilitate impus de payout. Dacă probabilitatea nu bate pragul, îți spune să nu intri.
+
+---
+
+## ⚠️ Citește asta întâi: ce s-a schimbat și de ce nu mai există cifre promise
+
+O versiune anterioară a acestui README raporta rezultate de backtest de tipul „ETH Sniper 54.8% in-sample / 55.6% out-of-sample”. **Aceste cifre au fost retrase.** Nu erau reale, din trei motive măsurate în cod:
+
+1. **Backtest-ul testa altă strategie decât cea care rula live.** Serverul trimitea motorului trei timeframe-uri (`5m`, `15m`, `60m`), iar backtest-ul doar două (`5m`, `15m`). Semnalul de aliniere cu trendul de 1h (pondere 1.5) exista live, dar nu în validare. Pe date identice, cele două puteau returna verdicte diferite — verificat: unul dădea `NEUTRU`, celălalt `UP`.
+
+2. **Motorul citea lumânarea în formare** (*repainting*). Ultimul rând returnat de MEXC este lumânarea curentă, incompletă. Detectorii de sweep, spike de volum și raport de wick o citeau, deci verdictul se schimba în timpul barei. Măsurat pe aceeași bară de 5 minute: la 25% formată → `DOWN`, la 50% → `DOWN`, la 75% → `UP` **și alertă Sniper declanșată**, la închidere → `UP`. Alerta pleca pe date neconfirmate, care se puteau încă anula. Backtest-ul, care rula doar pe bare închise, nu vedea niciodată aceste oscilații.
+
+3. **Nu exista separare train/test.** Win-rate-ul se raporta pe tot eșantionul, apoi se alegea cel mai bun subset („sweep + volum + ore active”) din exact aceleași numere care erau apoi citate ca dovadă. Asta e selectarea ipotezei pe datele folosite ca argument pentru ea.
+
+Pe lângă acestea, două defecte de logică distorsionau puternic semnalele:
+
+4. **Semnalele de 10 minute practic nu apăreau.** Fereastra se alegea comparând greutatea *însumată* a semnalelor „rapide” cu cea a semnalelor „structurale”. Contextul (trend, EMA, VWAP, aliniere 1h) e prezent aproape pe fiecare bară, iar declanșatorii rapizi sunt evenimente rare — deci structura câștiga aproape mereu. Măsurat pe 4000 de bare: **97.6% dintre semnale ieșeau pe 30 de minute, 2.4% pe 10.** README-ul promitea că „apar ambele”.
+
+5. **FVG-urile se comportau ca zgomot, nu ca declanșatori.** Detectorul prindea orice imbalance mecanic de 3 lumânări, fără cerința de *displacement*, nu marca niciodată un gap ca mitigat, iar orice gap străpuns rămânea „Inversion FVG” tradeable pe termen nelimitat. Rezultat: prețul se afla în interiorul unui gap „valid” în 76% din bare, iar FVG + IFVG produceau **93% din toți declanșatorii**, acoperind complet celelalte setup-uri.
+
+Toate cinci sunt reparate. Verificarea rulează offline, fără rețea:
+
+```bash
+node tools/selftest.js
+```
+
+### Ce au schimbat reparațiile (măsurat pe același random walk de 4200 de bare)
+
+| | înainte | după |
+|---|---|---|
+| Semnale pe fereastra de 10 min | 2.4% | **20.1%** |
+| Bare fără semnal (`NEUTRU`) | 14.4% | **59.8%** |
+| Cel mai dominant setup | FVG+IFVG 93% | **max 22%** (RSI divergence) |
+| Verdict stabil în timpul barei | nu | **da** |
+| Semnale aprobate pe zgomot pur | — | **0 din 264** |
+
+Ultimul rând e cel mai important. Pe date generate aleatoriu, unde prin construcție **nu există** niciun edge, poarta EV nu aprobă nimic. Orice motor poate fi făcut să dea semnale; ce protejează banii e să refuze când nu e nimic acolo.
+
+---
+
+## 🚦 Cum decide dacă merită intrat (partea specifică event futures)
+
+Un contract binar nu te plătește pentru că ai ghicit direcția, ci pentru că ai ghicit **mai des decât cere payout-ul**. Cu payout `p`, o miză de 1 aduce `+p` la câștig și `-1` la pierdere:
+
+```
+EV = w·p − (1−w)          w = probabilitatea reală de câștig
+```
+
+EV devine pozitiv doar când `w > 1/(1+p)`. Pragul e brutal:
+
+| Payout | Win-rate necesar doar ca să fii pe zero |
+|---|---|
+| 40% | 71.4% |
+| 65% | 60.6% |
+| 80% | 55.6% |
+| 85% | 54.1% |
+
+De aici decurg două reguli pe care aplicația le respectă strict:
+
+**1. Un scor de confluență nu este o probabilitate.** „net 6.19” nu înseamnă nimic în termeni de șanse. Aplicația nu convertește scorul în procent printr-o formulă inventată; îl folosește doar ca etichetă de bucket și **măsoară** empiric în ce procent din cazuri fiecare bucket a ieșit bine (`lib/calibration.js`).
+
+**2. Se compară limita inferioară, nu estimarea optimistă.** Poarta EV folosește capătul de jos al intervalului de încredere Wilson. Un 56% obținut din 25 de mostre are limita inferioară la ~37% — nu e edge, e zgomot, și poarta îl refuză. E lent la „da” în mod deliberat: alternativa e să pierzi bani.
+
+Dacă nu există calibrare cu suficiente date, banner-ul spune **„FĂRĂ DATE — nu intra”**. Nu inventează un număr. (Versiunea anterioară presupunea un win-rate de 55% prin `fallbackWinRate` și afișa un EV calculat din această presupunere — a fost eliminat.)
+
+---
+
+## Cum pornești
+
+```bash
+npm install
+npm start
+```
+
+Apoi deschide **http://localhost:3005** (schimbi portul cu variabila `PORT`). Pe Windows, dublu-click pe `start.bat`.
+
+### Pasul obligatoriu: calibrarea
+
+Înainte de primul semnal, apasă **„Calibrează pe ultimele 30 de zile”**. Fără asta aplicația nu are cum să știe cât valorează un setup și va refuza corect orice intrare.
+
+```
+POST /api/calibrate    { "days": 30 }
+```
+
+Rezultatul se salvează în `calibration.json` și e folosit live până când jurnalul tău propriu are destule rezultate rezolvate, moment în care are prioritate (datele tale reale bat istoricul).
+
+---
+
+## Cum e gândit
+
+- **Doar lumânări închise.** `lib/candles.js` taie lumânarea în formare înainte ca vreun detector să o vadă. Un verdict e o funcție pură a barelor confirmate, identificat prin `(simbol, barCloseTime)` — deci serverul emite exact o alertă per bară, nu una la fiecare scanare.
+- **Paritate absolută între live și backtest.** Ambele apelează `engine.decide()` cu aceleași timeframe-uri. Dacă divergează, backtest-ul nu măsoară nimic util.
+- **O singură taxonomie a declanșatorilor.** `TRIGGERS` în `lib/engine.js` este sursa unică de adevăr pentru „ce setup e acesta” și „ce fereastră i se potrivește”. Înainte, aceeași clasificare exista ca trei copii de regex în `engine.js`, `server.js` și `backtest.js`, care ajunseseră să nu mai coincidă.
+- **Fereastra vine din declanșatorul principal**: evenimente impulsive de o singură lumânare (sweep, absorbție, breakout din squeeze, crossover) → **10 min**; setup-uri structurale (FVG, IFVG, shift de structură, divergență) → **30 min**.
+- **Gemini nu decide nimic.** Primește numerele deja calculate și scrie justificarea în română. Opțional.
+
+## Ce raportează backtest-ul
+
+Nu un singur win-rate, ci ce e nevoie ca să judeci dacă cifra înseamnă ceva:
+
+- **out-of-sample** pe o felie neatinsă, cu interval de încredere 95%
+- **test binomial** față de o monedă aruncată (dacă `p > 0.05`, nu se distinge de noroc)
+- **baseline „mereu UP” și „mereu DOWN”** pe exact aceleași bare
+- **aceleași semnale evaluate la 10 ȘI la 30 de minute**, ca să vezi per setup care fereastră e mai bună
+- **scor Brier + tabel de fiabilitate** — „70%” se întâmplă chiar în 70% din cazuri?
+- **doar tranzacțiile aprobate de poarta EV**, cu EV realizat la payout-urile tale
+
+Semnalele sunt distanțate cu cel puțin cea mai lungă fereastră, ca să nu împartă bare de rezultat între ele. Mostrele suprapuse sunt corelate și ar face testul de semnificație să pară mult mai puternic decât e.
+
+## Endpoint-uri API
+
+| Metodă | Rută | Descriere |
+|---|---|---|
+| GET | `/api/state` | config + ultimele verdicte + alerte |
+| GET | `/api/signal?symbol=ETHUSDT` | analiză la cerere |
+| POST | `/api/config` | salvează setările, repornește scanner-ul |
+| POST | `/api/calibrate` | învață probabilitățile din istoric, salvează modelul |
+| GET | `/api/calibration` | modelul de calibrare curent |
+| GET | `/api/backtest?symbol=BTCUSDT&days=30` | evaluare out-of-sample completă |
+| GET | `/api/stream` | flux live (SSE) |
+
+## Order flow live
+
+Pe lângă lumânări, aplicația citește dezechilibrul din order book (`/api/v3/depth`) și agresiunea tranzacțiilor (`/api/v3/aggTrades`). Nu se poate backtesta (MEXC nu dă istoric), deci e strict o confirmare live, validată prin jurnal.
+
+Notă de corectitudine: clasificarea agresiunii cere acum explicit un boolean pe câmpul `m`. Înainte, orice tranzacție fără acel câmp era numărată tacit ca vânzare agresivă, ceea ce ar fi fabricat un bias permanent de scădere dacă bursa ar fi schimbat formatul.
+
+---
+
+## ⚠️ Avertisment
+
+Această aplicație este un **instrument de măsurare**, nu un generator de profit și nu sfat financiar.
+
+Reparațiile din această versiune elimină defecte care făceau rezultatele nemăsurabile. **Nu creează un edge.** Rămâne perfect posibil ca, după calibrare corectă pe datele tale, concluzia să fie că niciun setup nu bate pragul impus de payout-urile MEXC — iar dacă asta e realitatea, aplicația îți va spune să nu intri, și acela va fi răspunsul corect.
+
+Predicția direcției pe 10–30 de minute este dominată de zgomot. Pragurile de 55–61% win-rate cerute de payout-urile tipice sunt foarte greu de atins consistent cu analiză tehnică. Validează pe demo, strânge minim 30–50 de semnale rezolvate înainte de orice concluzie, și nu risca sume pe care nu ți le permiți să le pierzi.
 ```

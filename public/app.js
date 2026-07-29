@@ -86,21 +86,38 @@ function renderCard(v) {
     ? `<div class="ai-note">🤖 <b>AI (${v.ai.acord || '—'})</b>: ${v.ai.risc ? '⚠️ ' + v.ai.risc : ''} ${v.ai.comentariu || ''}</div>`
     : (v.aiError ? `<div class="ai-note">🤖 AI indisponibil: ${v.aiError}</div>` : '');
 
-  // The BIG banner: the only thing you act on. Sniper Mode = trade only on 🎯.
+  // The BIG banner. For a binary contract, direction alone is not a reason to
+  // trade — the calibrated probability has to beat the break-even the payout
+  // imposes. So the banner is driven by the EV gate, and when there is no
+  // calibration data it says exactly that instead of showing a green light.
   const ev = v.ev;
+  const gate = v.gate;
   const payoutNow = ev ? (v.interval === '10 minute' ? ev.payout10 : ev.payout30) : null;
-  const beNow = ev ? (v.interval === '10 minute' ? ev.breakEven10 : ev.breakEven30) : null;
-  const evWarn = ev && !ev.positive;
-  const evNote = ev ? ` · payout ${payoutNow}% (break-even ${beNow}%)` : '';
-  const warnLine = evWarn ? `<div class="ev-warn">⚠️ payout prea mic pentru edge-ul tău — EV negativ, mai bine sari peste</div>` : '';
+  const beNow = gate ? gate.breakEven : null;
+  const probTxt = gate && gate.probability != null
+    ? `${gate.probability}% (prudent ${gate.conservative}%)`
+    : 'necalibrat';
+  const evNote = ev
+    ? ` · payout ${payoutNow}% → nevoie ${beNow}% · probabilitate ${probTxt}`
+    : '';
+
+  const gateOk = !!(gate && gate.trade);
+  const needsData = !!(gate && gate.needsData);
+  const tradeable = gateOk && (!SNIPER_MODE || eligible);
+
   let banner;
-  if (SNIPER_MODE) {
-    banner = eligible
-      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${warnLine}`
-      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
+  if (v.directie === 'NEUTRU') {
+    banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">fără declanșator valid — nicio poziție</div></div>`;
+  } else if (tradeable) {
+    banner = `<div class="cta go ${dir}">${SNIPER_MODE ? '🎯 ' : ''}INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>`;
+  } else if (needsData) {
+    banner = `<div class="cta wait">📊 FĂRĂ DATE — nu intra<div class="cta-sub">motorul vede ${v.directie} ${v.interval} (${v.setup}), dar nu are încă o probabilitate verificată. Rulează calibrarea sau lasă jurnalul să adune rezultate.</div></div>`;
+  } else if (!gateOk) {
+    banner = `<div class="cta wait">🚫 EV NEGATIV — sari peste<div class="cta-sub">${gate ? gate.reason : 'EV nefavorabil'}</div></div>`;
   } else {
-    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`;
+    banner = `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
   }
+  const warnLine = '';
 
   return `
     <div class="card-top">
@@ -113,10 +130,20 @@ function renderCard(v) {
       <summary>Analiza motorului în timp real (context, nu semnal de intrare)</summary>
       <div class="row5">
         <b>Direcție motor</b><span class="dir-inline ${dir}">${v.directie} · ${v.interval}</span>
-        <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
+        <b>Declanșator</b><span>${v.setup || '—'}${v.primaryTrigger ? ` <span class="muted">(${v.primaryTrigger.label} [${v.primaryTrigger.tf}])</span>` : ''}</span>
+        <b>Scor confluență</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net} — scor brut, NU o probabilitate)</span></span>
         <b>Justificare</b><span>${v.justificare}</span>
         <b>Invalidare</b><span>${v.invalidare}</span>
-        ${ev ? `<b>EV / fereastră</b><span>10 min: <span class="${ev.ev10 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev10 > 0 ? '+' : ''}${ev.ev10}%</span> (payout ${ev.payout10}%, nevoie ${ev.breakEven10}%) · 30 min: <span class="${ev.ev30 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev30 > 0 ? '+' : ''}${ev.ev30}%</span> (payout ${ev.payout30}%, nevoie ${ev.breakEven30}%)</span>` : ''}
+        ${ev ? `
+        <b>Probabilitate</b><span>${gate && gate.probability != null
+          ? `<b>${gate.probability}%</b> · limita inferioară de încredere <b>${gate.conservative}%</b> <span class="muted">(din ${gate.n} rezultate — ${ev.probabilitySource || gate.source})</span>`
+          : `<span class="bad">indisponibilă</span> <span class="muted">${gate ? gate.reason : ''}</span>`}</span>
+        <b>Prag de rentabilitate</b><span>payout ${payoutNow}% ⇒ ai nevoie de <b>${beNow}%</b> doar ca să fii pe zero${gate && gate.required != null ? ` · prag cerut cu marjă: <b>${gate.required}%</b>` : ''}</span>
+        <b>EV</b><span>${gate && gate.ev != null
+          ? `<span class="${gate.ev > 0 ? 'dir-inline up' : 'dir-inline down'}">${gate.ev > 0 ? '+' : ''}${gate.ev}%</span> per miză${gate.evConservative != null ? ` <span class="muted">(prudent ${gate.evConservative}%)</span>` : ''}`
+          : '<span class="muted">necalculabil fără probabilitate</span>'}</span>
+        <b>Cealaltă fereastră</b><span>${ev.alternative ? `${ev.alternative.interval}: ${ev.alternative.probability != null ? ev.alternative.probability + '%' : 'necalibrat'}${ev.alternative.ev != null ? ` · EV ${ev.alternative.ev > 0 ? '+' : ''}${ev.alternative.ev}%` : ''} ${ev.alternative.trade ? '<span class="ok">(ar trece)</span>' : '<span class="muted">(nu trece)</span>'}` : '—'}</span>
+        <b>Bara analizată</b><span class="muted">${v.barCloseTime ? 'închisă la ' + new Date(v.barCloseTime).toLocaleTimeString('ro-RO') : '—'} · doar lumânări confirmate</span>` : ''}
       </div>
       ${sigs ? `<ul class="sig-list">${sigs}</ul>` : ''}
       ${ai}
@@ -314,6 +341,9 @@ async function loadState() {
   $('useOrderFlow').checked = c.useOrderFlow !== false;
   $('requireOfAgree').checked = !!c.requireOfAgree;
   $('useLearning').checked = c.useLearning !== false;
+  $('requireEvGate').checked = c.requireEvGate !== false;
+  if (c.evMarginPct != null) $('evMarginPct').value = c.evMarginPct;
+  if (c.calibrationMinSample != null) $('calibrationMinSample').value = c.calibrationMinSample;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -344,6 +374,9 @@ async function saveSettings() {
     useOrderFlow: $('useOrderFlow').checked,
     requireOfAgree: $('requireOfAgree').checked,
     useLearning: $('useLearning').checked,
+    requireEvGate: $('requireEvGate').checked,
+    evMarginPct: Number($('evMarginPct').value),
+    calibrationMinSample: Number($('calibrationMinSample').value),
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,
@@ -369,27 +402,106 @@ async function testAi() {
 }
 
 // ---------- backtest ----------
+// The backtest report is deliberately built around three questions, in order:
+//   1. Did it beat a coin flip out-of-sample, with error bars?
+//   2. Did it beat "always bet UP" on the very same bars?
+//   3. Of the trades the EV gate approved, was EV actually positive?
+// A single headline win-rate hides all three, which is how a losing strategy
+// ends up looking profitable.
 async function runBacktest() {
   const symbol = $('btSymbol').value;
   const days = $('btDays').value;
-  $('btStatus').textContent = 'rulez pe istoric... (câteva secunde)';
+  $('btStatus').textContent = 'rulez pe istoric (train/test separat)... poate dura zeci de secunde';
   $('btResult').innerHTML = '';
   try {
     const r = await fetch(`/api/backtest?symbol=${symbol}&days=${days}`);
     const d = await r.json();
     if (d.error) { $('btStatus').textContent = 'eroare: ' + d.error; return; }
-    $('btStatus').textContent = `${d.evaluated} semnale evaluate pe ${d.totalCandles} lumânări (${d.days} zile, sursă: ${d.source})`;
-    const w = d.winRate;
-    const box = (big, lbl) => `<div class="bt-box"><div class="big">${big ?? '—'}${big != null ? '%' : ''}</div><div class="lbl">${lbl}</div></div>`;
-    $('btResult').innerHTML =
-      box(w.overall, 'win-rate general') +
-      box(w.Ridicat, `încredere Ridicat (${d.byConfidence.Ridicat.n})`) +
-      box(w.Mediu, `încredere Mediu (${d.byConfidence.Mediu.n})`) +
-      box(w.Scăzut, `încredere Scăzut (${d.byConfidence.Scăzut.n})`) +
-      box(w.UP, `semnale UP (${d.byDirection.UP.n})`) +
-      box(w.DOWN, `semnale DOWN (${d.byDirection.DOWN.n})`);
+
+    $('btStatus').innerHTML = `${d.evaluated} semnale (${d.neutralCount} bare fără semnal) pe ${d.totalCandles} lumânări · ` +
+      `calibrat pe ${d.split.trainN}, testat pe ${d.split.testN} <b>neatinse</b> · ${d.parity}`;
+
+    const box = (big, lbl, cls) => `<div class="bt-box"><div class="big ${cls || ''}">${big ?? '—'}</div><div class="lbl">${lbl}</div></div>`;
+    const pct = (o) => (o && o.winRate != null ? o.winRate + '%' : '—');
+    const ciTxt = (o) => (o && o.ci95 ? `95% CI ${o.ci95[0]}–${o.ci95[1]}%` : '');
+
+    const oos = d.outOfSample.all;
+    const sig = oos.vsCoinFlip || {};
+    const verdictCls = sig.significant && oos.winRate > 50 ? 'ok' : 'bad';
+
+    let html = '';
+    html += box(pct(oos), `out-of-sample (${oos.n} semnale) · ${ciTxt(oos)}`, verdictCls);
+    html += box(sig.pValue != null ? 'p=' + sig.pValue : '—',
+      sig.significant ? 'DIFERIT de o monedă aruncată' : 'NU se distinge de noroc', verdictCls);
+    html += box(pct(d.baselines.alwaysUp), 'baseline: mereu UP');
+    html += box(pct(d.baselines.alwaysDown), 'baseline: mereu DOWN');
+
+    for (const [iv, o] of Object.entries(d.outOfSample.byInterval || {})) {
+      html += box(pct(o), `fereastră ${iv} (${o.n})`);
+    }
+
+    const g = d.evGate;
+    html += box(`${g.approvedCount}/${g.approvedCount + g.rejectedCount}`, 'aprobate de poarta EV');
+    if (g.approved && g.approved.n) {
+      html += box(pct(g.approved), `win-rate pe cele aprobate (${g.approved.n}) · ${ciTxt(g.approved)}`);
+      if (g.realizedEv10 != null) html += box(`${g.realizedEv10 > 0 ? '+' : ''}${g.realizedEv10}%`, `EV realizat 10 min (payout ${g.payout10}%)`, g.realizedEv10 > 0 ? 'ok' : 'bad');
+      if (g.realizedEv30 != null) html += box(`${g.realizedEv30 > 0 ? '+' : ''}${g.realizedEv30}%`, `EV realizat 30 min (payout ${g.payout30}%)`, g.realizedEv30 > 0 ? 'ok' : 'bad');
+    }
+    html += box(g.breakEven10 + '%', `prag rentabilitate 10 min (payout ${g.payout10}%)`);
+    html += box(g.breakEven30 + '%', `prag rentabilitate 30 min (payout ${g.payout30}%)`);
+
+    const c = d.calibration;
+    html += box(c.brierScore != null ? c.brierScore : '—',
+      `Brier (${c.brierBaseline} = a spune mereu 50%)`,
+      c.brierScore != null && c.brierScore < c.brierBaseline ? 'ok' : 'bad');
+
+    $('btResult').innerHTML = html;
+
+    // Per-setup and per-horizon detail, plus the reliability table.
+    const rows = (obj) => Object.entries(obj || {})
+      .map(([k, o]) => `<div class="lrow"><span>${k}</span><span>${pct(o)} <span class="muted">(${o.n})</span></span></div>`)
+      .join('') || '<p class="muted">—</p>';
+
+    const rel = (c.reliability || [])
+      .filter((b) => b.n > 0)
+      .map((b) => `<div class="lrow"><span>prezis ${b.range}</span><span>real <b>${b.actual}%</b> <span class="muted">(${b.n})</span></span></div>`)
+      .join('') || '<p class="muted">încă nu sunt destule predicții pe intervale</p>';
+
+    const detail = document.createElement('details');
+    detail.className = 'analysis';
+    detail.innerHTML = `<summary>Detaliu: per setup, per fereastră, calibrare</summary>
+      <div class="learn-cols">
+        <div><div class="learn-h">Per setup (out-of-sample)</div>${rows(d.outOfSample.bySetup)}</div>
+        <div><div class="learn-h">Per oră UTC</div>${rows(d.outOfSample.byHour)}</div>
+      </div>
+      <div class="learn-cols" style="margin-top:12px">
+        <div><div class="learn-h">Aceleași semnale la 10 min</div>${rows(d.horizonComparison.bySetupAt10)}</div>
+        <div><div class="learn-h">Aceleași semnale la 30 min</div>${rows(d.horizonComparison.bySetupAt30)}</div>
+      </div>
+      <div style="margin-top:12px"><div class="learn-h">Calibrare: "X%" se întâmplă chiar în X% din cazuri?</div>${rel}</div>`;
+    $('btResult').appendChild(detail);
   } catch (e) {
     $('btStatus').textContent = 'eroare: ' + e.message;
+  }
+}
+
+// Fit the probability model from historical data and persist it, so the app has
+// calibrated probabilities before the user's own journal is large enough.
+async function runCalibration() {
+  const days = 30;
+  $('calStatus').textContent = 'calibrez pe istoric... poate dura un minut';
+  try {
+    const r = await fetch('/api/calibrate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ days }),
+    });
+    const d = await r.json();
+    if (d.error) { $('calStatus').textContent = 'eroare: ' + d.error; return; }
+    $('calStatus').innerHTML = `✓ calibrat pe ${d.model.total} rezultate (${days} zile). ` +
+      `Buckets cu minim ${d.model.minSample} mostre sunt folosite live.`;
+  } catch (e) {
+    $('calStatus').textContent = 'eroare: ' + e.message;
   }
 }
 
@@ -398,6 +510,7 @@ $('toggleSettings').addEventListener('click', () => $('settingsBody').classList.
 $('saveSettings').addEventListener('click', saveSettings);
 $('testAi').addEventListener('click', testAi);
 $('runBacktest').addEventListener('click', runBacktest);
+$('runCalibration').addEventListener('click', runCalibration);
 $('clearAlerts').addEventListener('click', () => { alertsEl.innerHTML = '<p class="muted">golit.</p>'; });
 $('soundToggle').addEventListener('change', (e) => { soundOn = e.target.checked; });
 $('geminiModel').addEventListener('change', updateCostHint);
