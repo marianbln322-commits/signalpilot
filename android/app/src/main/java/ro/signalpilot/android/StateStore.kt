@@ -45,7 +45,9 @@ object StateStore {
 
     fun symbols(context: Context): List<String> {
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("symbols", "BTCUSDT,ETHUSDT") ?: "BTCUSDT,ETHUSDT"
-        return raw.split(',').map { it.trim().uppercase().replace(Regex("[^A-Z0-9]"), "") }.filter { it.isNotBlank() }.distinct().take(8)
+        val parsed = raw.split(',').map { it.trim().uppercase().replace(Regex("[^A-Z0-9]"), "") }
+            .filter { it.isNotBlank() }.distinct().take(8)
+        return parsed.ifEmpty { listOf("BTCUSDT", "ETHUSDT") }
     }
 
     fun setSymbols(context: Context, symbols: String) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("symbols", symbols).apply()
@@ -54,11 +56,17 @@ object StateStore {
     fun requireOrderFlow(context: Context): Boolean = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getBoolean("require_order_flow", false)
     fun setRequireOrderFlow(context: Context, enabled: Boolean) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putBoolean("require_order_flow", enabled).apply()
 
-    fun signalFingerprint(context: Context, symbol: String): String? =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("fingerprint_$symbol", null)
+    fun lastAlertKey(context: Context, symbol: String): String? =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("alert_key_$symbol", null)
 
-    fun setSignalFingerprint(context: Context, symbol: String, value: String) =
-        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("fingerprint_$symbol", value).apply()
+    fun lastAlertTime(context: Context, symbol: String): Long =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong("alert_time_$symbol", 0L)
+
+    fun recordAlert(context: Context, symbol: String, key: String, timestamp: Long) =
+        context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit()
+            .putString("alert_key_$symbol", key)
+            .putLong("alert_time_$symbol", timestamp)
+            .apply()
 
     private fun Verdict.toJson(): JSONObject = JSONObject()
         .put("symbol", symbol).put("direction", direction).put("interval", interval)

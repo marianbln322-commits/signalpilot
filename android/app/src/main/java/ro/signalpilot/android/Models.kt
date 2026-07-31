@@ -49,5 +49,6 @@ data class Verdict(
     val sniperReason: String,
     val orderFlow: OrderFlow?,
     val orderFlowAgreement: String,
+    val sourceTimes: Map<String, Long>,
     val timestamp: Long = System.currentTimeMillis(),
 )

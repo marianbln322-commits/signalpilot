@@ -18,7 +18,7 @@ Alternativ, deschide directorul `android/` în Android Studio (JDK 17, Android S
 1. Deschide SignalPilot Android și permite notificările.
 2. Apasă **Permite rularea fără restricții de baterie** și aprobă excluderea.
 3. Pe telefoane Xiaomi/Redmi/POCO, Huawei/Honor, Oppo/Realme, Vivo sau Samsung, activează și **Auto-start** / **Unrestricted battery** din setările producătorului.
-4. Apasă **TESTEAZĂ SUNETUL ȘI VIBRAȚIA**.
+4. Oprește modul **Nu deranja**, setează telefonul pe profil sonor și mărește volumul notificărilor, apoi apasă **TESTEAZĂ SUNETUL ȘI VIBRAȚIA**.
 5. Apasă **PORNEȘTE 24/7**. Păstrează notificarea permanentă „SignalPilot monitorizează 24/7”.
 
 Android nu permite unei aplicații să promită execuție absolut neîntreruptă: repornirile, economisirea agresivă a bateriei și restricțiile producătorului pot opri procese. Aplicația folosește un foreground service vizibil, `START_STICKY`, wake-lock limitat pe durata scanării, repornire după boot și alarmă de recuperare după eliminarea din lista Recent Apps.
@@ -26,7 +26,7 @@ Android nu permite unei aplicații să promită execuție absolut neîntreruptă
 ## Comportament
 
 - Citește direct endpointurile publice MEXC; nu cere cheie API.
-- Scanează implicit la 8 secunde, la fel ca versiunea originală.
+- Rulează ciclurile continuu, cu o pauză de 8 secunde între cicluri, la fel ca versiunea originală; notificarea permanentă afișează durata reală a ultimului ciclu.
 - Analizează 5m, 15m și contextul 60m cu RSI, MACD, Bollinger, EMA20/50, VWAP, volum, structură, FVG/IFVG, liquidity sweep și divergență RSI.
 - Modul **Sniper original** este activ implicit și alertează rar, doar la liquidity sweep în orele active originale.
 - Debifează Sniper dacă vrei alerte de la încrederea `Mediu` în sus.

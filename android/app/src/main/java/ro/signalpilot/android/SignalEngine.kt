@@ -214,6 +214,11 @@ object SignalEngine {
             sniperReason = sniper.second,
             orderFlow = orderFlow,
             orderFlowAgreement = orderFlowAgreement(direction, orderFlow),
+            sourceTimes = mapOf(
+                "5m" to (market["5m"]?.lastOrNull()?.openTime ?: 0L),
+                "15m" to (market["15m"]?.lastOrNull()?.openTime ?: 0L),
+                "1h" to (market["60m"]?.lastOrNull()?.openTime ?: 0L),
+            ),
         )
     }
 

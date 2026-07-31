@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.Color
 import android.media.AudioAttributes
+import android.media.AudioManager
 import android.media.RingtoneManager
 import android.os.Build
 import android.os.VibrationEffect
@@ -43,8 +44,15 @@ object AlertNotifier {
         if (Build.VERSION.SDK_INT >= 33 && context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
         val manager = context.getSystemService(NotificationManager::class.java)
         val channel = manager.getNotificationChannel(SIGNAL_CHANNEL)
-        return manager.areNotificationsEnabled() && channel != null &&
-            channel.importance != NotificationManager.IMPORTANCE_NONE && channel.sound != null
+        if (!manager.areNotificationsEnabled() || channel == null) return false
+        if (channel.importance < NotificationManager.IMPORTANCE_DEFAULT || channel.sound == null) return false
+
+        val audio = context.getSystemService(AudioManager::class.java)
+        val audibleVolume = audio.ringerMode == AudioManager.RINGER_MODE_NORMAL &&
+            audio.getStreamVolume(AudioManager.STREAM_NOTIFICATION) > 0
+        val dndAllowsSound = manager.currentInterruptionFilter == NotificationManager.INTERRUPTION_FILTER_ALL ||
+            channel.canBypassDnd()
+        return audibleVolume && dndAllowsSound
     }
 
     fun send(context: Context, verdict: Verdict): Boolean {

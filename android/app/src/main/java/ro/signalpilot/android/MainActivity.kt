@@ -142,7 +142,7 @@ class MainActivity : Activity() {
         val soundReady = hasSoundAlerts()
         status.text = when {
             enabled && !soundReady -> "⚠ PORNIT, DAR ALERTELE SONORE SUNT DEZACTIVATE"
-            enabled && age in 0..30 -> "● LIVE 24/7 • ultima scanare acum ${age}s • interval 8s"
+            enabled && age in 0..30 -> "● LIVE 24/7 • ultima scanare acum ${age}s • pauză 8s între cicluri"
             enabled -> "● PORNIT • aștept date MEXC${if (error != null) " • $error" else ""}"
             else -> "○ MONITORIZARE OPRITĂ"
         }
@@ -198,7 +198,7 @@ class MainActivity : Activity() {
             invalidation = "Aceasta nu este o tranzacție.", price = 1.0,
             signals = emptyList(), snapshots = emptyMap(), chart = emptyList(),
             sniperEligible = false, sniperReason = "test", orderFlow = null,
-            orderFlowAgreement = "neutru",
+            orderFlowAgreement = "neutru", sourceTimes = emptyMap(),
         )
         AlertNotifier.send(this, demo)
     }
@@ -214,7 +214,7 @@ class MainActivity : Activity() {
         }
         val ready = hasSoundAlerts()
         if (!ready) {
-            android.widget.Toast.makeText(this, "Activează sunetul pentru canalul de semnale SignalPilot.", android.widget.Toast.LENGTH_LONG).show()
+            android.widget.Toast.makeText(this, "Activează notificările și sunetul, mărește volumul și oprește Nu deranja pentru alerte audibile.", android.widget.Toast.LENGTH_LONG).show()
             val settings = Intent(Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
                 .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
                 .putExtra(Settings.EXTRA_CHANNEL_ID, AlertNotifier.SIGNAL_CHANNEL)

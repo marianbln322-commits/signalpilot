@@ -24,7 +24,9 @@ class SignalService : Service() {
         const val ACTION_UPDATE = "ro.signalpilot.android.UPDATE"
         const val ACTION_STOP = "ro.signalpilot.android.STOP"
         private const val FOREGROUND_ID = 3010
-        private const val SCAN_SECONDS = 8L // original SignalPilot cadence
+        private const val SCAN_SECONDS = 8L // original SignalPilot pause between cycles
+        private const val MAX_CYCLE_MS = 120_000L
+        private const val MIN_ALERT_GAP_MS = 5 * 60_000L
     }
 
     private val scheduler = Executors.newSingleThreadScheduledExecutor()
@@ -56,8 +58,13 @@ class SignalService : Service() {
         val power = getSystemService(PowerManager::class.java)
         try {
             val symbols = StateStore.symbols(this)
+            val cycleStarted = SystemClock.elapsedRealtime()
             var completed = 0
             for (symbol in symbols) {
+                if (SystemClock.elapsedRealtime() - cycleStarted >= MAX_CYCLE_MS) {
+                    StateStore.setError(this, "Ciclul a depășit 120s; simbolurile rămase vor fi reluate.")
+                    break
+                }
                 // Protect only the active network/analysis operation. This scales
                 // with the configured symbol count instead of expiring mid-cycle.
                 val lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "SignalPilot:MarketScan:$symbol")
@@ -68,15 +75,15 @@ class SignalService : Service() {
                     val verdict = SignalEngine.decide(symbol, market, orderFlow)
                     StateStore.saveVerdict(this, verdict)
                     StateStore.setError(this, null)
-                    val oldFingerprint = StateStore.signalFingerprint(this, symbol)
-                    val newFingerprint = signalFingerprint(verdict)
-                    val alertDue = shouldAlert(verdict, oldFingerprint, newFingerprint)
+                    val oldAlertKey = StateStore.lastAlertKey(this, symbol)
+                    val newAlertKey = alertKey(verdict)
+                    val lastAlertTime = StateStore.lastAlertTime(this, symbol)
+                    val alertDue = shouldAlert(verdict, oldAlertKey, newAlertKey, lastAlertTime)
                     val delivered = if (alertDue) AlertNotifier.send(this, verdict) else false
-                    if (delivered) StateStore.addAlert(this, verdict)
-                    // Persist every normal state transition, including NEUTRU.
-                    // If an audible alert was due but could not be delivered, keep
-                    // the old fingerprint so it is retried after sound is restored.
-                    if (!alertDue || delivered) StateStore.setSignalFingerprint(this, symbol, newFingerprint)
+                    if (delivered) {
+                        StateStore.addAlert(this, verdict)
+                        StateStore.recordAlert(this, symbol, newAlertKey, verdict.timestamp)
+                    }
                     completed++
                     sendBroadcast(Intent(ACTION_UPDATE).setPackage(packageName))
                 } catch (error: Exception) {
@@ -85,7 +92,12 @@ class SignalService : Service() {
                     if (lock.isHeld) lock.release()
                 }
             }
-            val label = if (completed == symbols.size) "Live • $completed simboluri • scan 8s" else "Feed parțial • $completed/${symbols.size}"
+            val cycleSeconds = (SystemClock.elapsedRealtime() - cycleStarted) / 1000
+            val label = if (completed == symbols.size) {
+                "Live • $completed simboluri • ciclu ${cycleSeconds}s • pauză 8s"
+            } else {
+                "Feed parțial • $completed/${symbols.size} • ciclu ${cycleSeconds}s"
+            }
             getSystemService(android.app.NotificationManager::class.java).notify(FOREGROUND_ID, statusNotification(label))
             sendBroadcast(Intent(ACTION_UPDATE).setPackage(packageName))
         } finally {
@@ -93,21 +105,34 @@ class SignalService : Service() {
         }
     }
 
-    private fun signalFingerprint(verdict: Verdict): String {
-        val base = if (StateStore.sniper(this)) {
-            "sniper:${verdict.sniperEligible}:${verdict.direction}"
-        } else {
-            "normal:${verdict.direction}:${verdict.confidence}"
-        }
-        return if (StateStore.requireOrderFlow(this)) "$base:${verdict.orderFlowAgreement}" else base
+    private fun alertKey(verdict: Verdict): String {
+        val trigger = Regex("sweep|squeeze|structure shift|fvg|divergen|crossover|absorb|distribu|reversie|band", RegexOption.IGNORE_CASE)
+        val events = verdict.signals
+            .filter { trigger.containsMatchIn(it.label) }
+            .take(3)
+            .joinToString("|") { signal ->
+                val candleTime = verdict.sourceTimes[signal.timeframe] ?: 0L
+                "${signal.timeframe}:$candleTime:${signal.label.lowercase(Locale.ROOT)}"
+            }
+        val mode = if (StateStore.sniper(this)) "sniper" else "normal:${verdict.confidence}"
+        return "$mode:${verdict.direction}:$events"
     }
 
-    private fun shouldAlert(now: Verdict, oldFingerprint: String?, newFingerprint: String): Boolean {
+    private fun shouldAlert(
+        now: Verdict,
+        oldAlertKey: String?,
+        newAlertKey: String,
+        lastAlertTime: Long,
+    ): Boolean {
         if (StateStore.requireOrderFlow(this) && now.orderFlowAgreement == "conflict") return false
-        if (StateStore.sniper(this)) return now.sniperEligible && oldFingerprint != newFingerprint
-        val rank = mapOf("Scăzut" to 1, "Mediu" to 2, "Ridicat" to 3)
-        val valid = now.direction != "NEUTRU" && (rank[now.confidence] ?: 0) >= 2
-        return valid && oldFingerprint != newFingerprint
+        val valid = if (StateStore.sniper(this)) {
+            now.sniperEligible
+        } else {
+            val rank = mapOf("Scăzut" to 1, "Mediu" to 2, "Ridicat" to 3)
+            now.direction != "NEUTRU" && (rank[now.confidence] ?: 0) >= 2
+        }
+        val cooldownElapsed = now.timestamp - lastAlertTime >= MIN_ALERT_GAP_MS
+        return valid && oldAlertKey != newAlertKey && cooldownElapsed
     }
 
     private fun statusNotification(text: String): Notification {
