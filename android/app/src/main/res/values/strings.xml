@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">SignalPilot Android</string>
+    <string name="service_channel">Monitorizare SignalPilot</string>
+    <string name="signal_channel">Semnale UP/DOWN SignalPilot</string>
+</resources>
