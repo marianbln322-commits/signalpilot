@@ -16,7 +16,11 @@ data class Signal(
     val label: String,
     val kind: String,
     val timeframe: String,
-)
+    val featureId: String,
+    val baseWeight: Double = weight,
+) {
+    fun learningKey(): String = "$featureId|$timeframe|$side"
+}
 
 data class Snapshot(
     val price: Double,

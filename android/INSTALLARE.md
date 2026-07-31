@@ -32,4 +32,6 @@ Android nu permite unei aplicații să promită execuție absolut neîntreruptă
 - Debifează Sniper dacă vrei alerte de la încrederea `Mediu` în sus.
 - Opțional, activează veto-ul order flow pentru a bloca alertele când order book-ul și agresiunea tranzacțiilor contrazic direcția.
 - Alertele folosesc notificări Android de prioritate mare, sunet și vibrație.
-- Nu plasează ordine și nu garantează rezultate viitoare.
+- Calibrarea online locală reține semnalele `Mediu`/`Ridicat`, le verifică după 10 sau 30 minute numai pe lumânări MEXC închise și adaptează conservator ponderile fiecărui indicator după minimum 5 rezultate decisive.
+- Datele de învățare rămân pe telefon; multiplicatorii sunt limitați la `0,75×–1,25×`, iar codul aplicației nu se rescrie singur. Secțiunea **ÎNVĂȚARE ADAPTIVĂ LOCALĂ** arată exemplele, rata istorică și ponderile folosite.
+- Nu plasează ordine și nu garantează rezultate viitoare. O rată istorică bună nu garantează un WIN pentru următorul semnal.

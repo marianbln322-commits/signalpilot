@@ -67,68 +67,68 @@ object SignalEngine {
         val bandwidthWindow = bb?.bandwidth?.takeLast(40)?.filterNotNull().orEmpty()
         val squeeze = bandwidth != null && bandwidthWindow.isNotEmpty() && bandwidth <= bandwidthWindow.min() * 1.25
         val signals = mutableListOf<Signal>()
-        fun add(side: String, weight: Double, label: String, kind: String) {
-            signals += Signal(side, weight, label, kind, timeframe)
+        fun add(featureId: String, side: String, weight: Double, label: String, kind: String) {
+            signals += Signal(side, weight, label, kind, timeframe, featureId)
         }
 
         if (sweep != null) {
             val weight = 3 + sweep.strength.coerceAtMost(1.5)
-            add(if (sweep.type == "bullish") "up" else "down", weight,
+            add("liquidity_sweep", if (sweep.type == "bullish") "up" else "down", weight,
                 "Liquidity sweep ${sweep.type} (respingere${if (sweep.volumeSpike) " + volum ridicat" else ""})", "fast")
         }
         gaps.retest?.let {
-            add(if (it.effectiveType == "bullish") "up" else "down", 2.5 + if (it.inverted) .5 else 0.0,
+            add("fvg_retest", if (it.effectiveType == "bullish") "up" else "down", 2.5 + if (it.inverted) .5 else 0.0,
                 "Retestare ${if (it.inverted) "IFVG" else "FVG"} ${it.effectiveType}", "structural")
         }
-        if (structure.shift == "bullish") add("up", 2.2, "Market Structure Shift bullish (CHoCH)", "fast")
-        if (structure.shift == "bearish") add("down", 2.2, "Market Structure Shift bearish (CHoCH)", "fast")
-        if (structure.trend == "up") add("up", 1.5, "Structură de trend ascendent (HH/HL)", "structural")
-        if (structure.trend == "down") add("down", 1.5, "Structură de trend descendent (LH/LL)", "structural")
+        if (structure.shift == "bullish") add("structure_shift", "up", 2.2, "Market Structure Shift bullish (CHoCH)", "fast")
+        if (structure.shift == "bearish") add("structure_shift", "down", 2.2, "Market Structure Shift bearish (CHoCH)", "fast")
+        if (structure.trend == "up") add("trend_structure", "up", 1.5, "Structură de trend ascendent (HH/HL)", "structural")
+        if (structure.trend == "down") add("trend_structure", "down", 1.5, "Structură de trend descendent (LH/LL)", "structural")
 
         if (ema20Now != null && ema50Now != null) {
             if (ema20Now > ema50Now && ema20Prev != null && ema20Now > ema20Prev) {
                 val near = abs(price - ema20Now) / price < .0035
-                add("up", if (near) 1.8 else 1.0, "EMA20 > EMA50 în urcare${if (near) " + suport EMA20" else ""}", "structural")
+                add("ema_alignment", "up", if (near) 1.8 else 1.0, "EMA20 > EMA50 în urcare${if (near) " + suport EMA20" else ""}", "structural")
             }
             if (ema20Now < ema50Now && ema20Prev != null && ema20Now < ema20Prev) {
                 val near = abs(price - ema20Now) / price < .0035
-                add("down", if (near) 1.8 else 1.0, "EMA20 < EMA50 în coborâre${if (near) " + rezistență EMA20" else ""}", "structural")
+                add("ema_alignment", "down", if (near) 1.8 else 1.0, "EMA20 < EMA50 în coborâre${if (near) " + rezistență EMA20" else ""}", "structural")
             }
         }
-        if (divergence.first) add("up", 2.0, "Divergență bullish pe RSI", "structural")
-        if (divergence.second) add("down", 2.0, "Divergență bearish pe RSI", "structural")
+        if (divergence.first) add("rsi_divergence", "up", 2.0, "Divergență bullish pe RSI", "structural")
+        if (divergence.second) add("rsi_divergence", "down", 2.0, "Divergență bearish pe RSI", "structural")
 
         if (macdNow != null && macdSignal != null && macd != null) {
             val previousLine = macd.line.getOrNull(i - 1)
             val previousSignal = macd.signal.getOrNull(i - 1)
             if (previousLine != null && previousSignal != null && previousLine <= previousSignal && macdNow > macdSignal)
-                add("up", if (macdNow < 0) 1.6 else 1.1, "Crossover MACD bullish", "fast")
+                add("macd_crossover", "up", if (macdNow < 0) 1.6 else 1.1, "Crossover MACD bullish", "fast")
             if (previousLine != null && previousSignal != null && previousLine >= previousSignal && macdNow < macdSignal)
-                add("down", if (macdNow > 0) 1.6 else 1.1, "Crossover MACD bearish", "fast")
+                add("macd_crossover", "down", if (macdNow > 0) 1.6 else 1.1, "Crossover MACD bearish", "fast")
         }
         if (histNow != null && histPrev != null) {
-            if (histNow < 0 && histNow > histPrev) add("up", .8, "Histogramă MACD se contractă", "fast")
-            if (histNow > 0 && histNow < histPrev) add("down", .8, "Histogramă MACD se contractă", "fast")
+            if (histNow < 0 && histNow > histPrev) add("macd_histogram_contraction", "up", .8, "Histogramă MACD se contractă", "fast")
+            if (histNow > 0 && histNow < histPrev) add("macd_histogram_contraction", "down", .8, "Histogramă MACD se contractă", "fast")
         }
         if (squeeze && bbUpper != null && price > bbUpper && averageVolume != null && volumes[i] > averageVolume * 1.5)
-            add("up", 2.5, "Breakout din Bollinger Squeeze cu volum", "fast")
+            add("bollinger_squeeze_breakout", "up", 2.5, "Breakout din Bollinger Squeeze cu volum", "fast")
         if (squeeze && bbLower != null && price < bbLower && averageVolume != null && volumes[i] > averageVolume * 1.5)
-            add("down", 2.5, "Breakdown din Bollinger Squeeze cu volum", "fast")
+            add("bollinger_squeeze_breakout", "down", 2.5, "Breakdown din Bollinger Squeeze cu volum", "fast")
         if (bbLower != null && price <= bbLower && rsiNow != null && rsiNow < 32 && structure.trend != "down")
-            add("up", 1.4, "Bandă Bollinger inferioară + RSI supravândut (reversie)", "fast")
+            add("bollinger_reversal", "up", 1.4, "Bandă Bollinger inferioară + RSI supravândut (reversie)", "fast")
         if (bbUpper != null && price >= bbUpper && rsiNow != null && rsiNow > 68 && structure.trend != "up" && divergence.second)
-            add("down", 1.4, "Bandă Bollinger superioară + RSI + divergență", "fast")
+            add("bollinger_reversal", "down", 1.4, "Bandă Bollinger superioară + RSI + divergență", "fast")
         if (vwapNow != null) {
-            if (price > vwapNow && vwapPrev != null && vwapNow > vwapPrev) add("up", 1.0, "Preț peste VWAP în urcare", "structural")
-            if (price < vwapNow && vwapPrev != null && vwapNow < vwapPrev) add("down", 1.0, "Preț sub VWAP în coborâre", "structural")
+            if (price > vwapNow && vwapPrev != null && vwapNow > vwapPrev) add("vwap_trend", "up", 1.0, "Preț peste VWAP în urcare", "structural")
+            if (price < vwapNow && vwapPrev != null && vwapNow < vwapPrev) add("vwap_trend", "down", 1.0, "Preț sub VWAP în coborâre", "structural")
         }
         if (averageVolume != null && volumes[i] > averageVolume * 1.8) {
             val candle = candles[i]
             val lowerWick = minOf(candle.close, candle.open) - candle.low
             val upperWick = candle.high - maxOf(candle.close, candle.open)
             val body = abs(candle.close - candle.open)
-            if (lowerWick > body && lowerWick > upperWick) add("up", 1.6, "Volum de oprire / absorbție la minim", "fast")
-            if (upperWick > body && upperWick > lowerWick) add("down", 1.6, "Volum de distribuție la maxim", "fast")
+            if (lowerWick > body && lowerWick > upperWick) add("stopping_volume", "up", 1.6, "Volum de oprire / absorbție la minim", "fast")
+            if (upperWick > body && upperWick > lowerWick) add("stopping_volume", "down", 1.6, "Volum de distribuție la maxim", "fast")
         }
 
         return Analysis(timeframe, signals, Snapshot(
@@ -143,11 +143,16 @@ object SignalEngine {
         ), structure, sweep, gaps)
     }
 
-    fun decide(symbol: String, market: Map<String, List<Candle>>, orderFlow: OrderFlow?): Verdict {
+    fun decide(
+        symbol: String,
+        market: Map<String, List<Candle>>,
+        orderFlow: OrderFlow?,
+        learnedMultipliers: Map<String, Double> = emptyMap(),
+    ): Verdict {
         val analyses = mutableListOf<Analysis>()
         market["5m"]?.takeIf { it.size >= 60 }?.let { analyses += analyze(it, "5m") }
         market["15m"]?.takeIf { it.size >= 60 }?.let { analyses += analyze(it, "15m") }
-        val all = analyses.flatMap { it.signals }.toMutableList()
+        val rawSignals = analyses.flatMap { it.signals }.toMutableList()
         var higherTrend: String? = null
         market["60m"]?.takeIf { it.size >= 60 }?.let { candles ->
             val closes = candles.map { it.close }
@@ -155,8 +160,12 @@ object SignalEngine {
             val e50 = Indicators.last(Indicators.ema(closes, 50))
             if (e20 != null && e50 != null) {
                 higherTrend = if (e20 > e50) "up" else "down"
-                all += Signal(higherTrend!!, 1.5, "Aliniere cu trendul 1h (${if (higherTrend == "up") "ascendent" else "descendent"})", "structural", "1h")
+                rawSignals += Signal(higherTrend!!, 1.5, "Aliniere cu trendul 1h (${if (higherTrend == "up") "ascendent" else "descendent"})", "structural", "1h", "higher_timeframe_trend")
             }
+        }
+        val all = rawSignals.map { signal ->
+            val multiplier = (learnedMultipliers[signal.learningKey()] ?: 1.0).coerceIn(0.75, 1.25)
+            signal.copy(weight = signal.baseWeight * multiplier)
         }
         val up = all.filter { it.side == "up" }.sumOf { it.weight }
         val down = all.filter { it.side == "down" }.sumOf { it.weight }

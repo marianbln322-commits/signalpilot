@@ -42,6 +42,8 @@ object StateStore {
     fun lastScan(context: Context): Long = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getLong("last_scan", 0)
     fun setError(context: Context, message: String?) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("error", message).apply()
     fun error(context: Context): String? = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("error", null)
+    fun setLearningError(context: Context, message: String?) = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("learning_error", message).apply()
+    fun learningError(context: Context): String? = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("learning_error", null)
 
     fun symbols(context: Context): List<String> {
         val raw = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("symbols", "BTCUSDT,ETHUSDT") ?: "BTCUSDT,ETHUSDT"

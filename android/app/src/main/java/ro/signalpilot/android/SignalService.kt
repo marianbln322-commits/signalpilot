@@ -60,6 +60,7 @@ class SignalService : Service() {
             val symbols = StateStore.symbols(this)
             val cycleStarted = SystemClock.elapsedRealtime()
             var completed = 0
+            var cycleLearningError: String? = null
             for (symbol in symbols) {
                 if (SystemClock.elapsedRealtime() - cycleStarted >= MAX_CYCLE_MS) {
                     StateStore.setError(this, "Ciclul a depășit 120s; simbolurile rămase vor fi reluate.")
@@ -71,9 +72,16 @@ class SignalService : Service() {
                 try {
                     lock.acquire(45_000)
                     val market = MexcClient.fetchMarket(symbol)
+                    runCatching { OnlineLearner.resolve(this, symbol, market["5m"].orEmpty()) }
+                        .onFailure { cycleLearningError = "$symbol • evaluare: ${it.message ?: it.javaClass.simpleName}" }
                     val orderFlow = MexcClient.fetchOrderFlow(symbol)
-                    val verdict = SignalEngine.decide(symbol, market, orderFlow)
+                    val learnedMultipliers = runCatching { OnlineLearner.multipliers(this) }
+                        .onFailure { cycleLearningError = "$symbol • ponderi: ${it.message ?: it.javaClass.simpleName}" }
+                        .getOrDefault(emptyMap())
+                    val verdict = SignalEngine.decide(symbol, market, orderFlow, learnedMultipliers)
                     StateStore.saveVerdict(this, verdict)
+                    runCatching { OnlineLearner.observe(this, verdict) }
+                        .onFailure { cycleLearningError = "$symbol • salvare: ${it.message ?: it.javaClass.simpleName}" }
                     StateStore.setError(this, null)
                     val oldAlertKey = StateStore.lastAlertKey(this, symbol)
                     val newAlertKey = alertKey(verdict)
@@ -92,6 +100,7 @@ class SignalService : Service() {
                     if (lock.isHeld) lock.release()
                 }
             }
+            StateStore.setLearningError(this, cycleLearningError)
             val cycleSeconds = (SystemClock.elapsedRealtime() - cycleStarted) / 1000
             val label = if (completed == symbols.size) {
                 "Live • $completed simboluri • ciclu ${cycleSeconds}s • pauză 8s"

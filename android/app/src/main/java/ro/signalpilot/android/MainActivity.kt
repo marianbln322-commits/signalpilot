@@ -35,6 +35,7 @@ class MainActivity : Activity() {
     private lateinit var status: TextView
     private lateinit var cards: LinearLayout
     private lateinit var alerts: LinearLayout
+    private lateinit var learning: LinearLayout
     private lateinit var symbolsInput: EditText
     private lateinit var sniper: CheckBox
     private lateinit var requireOrderFlow: CheckBox
@@ -103,6 +104,10 @@ class MainActivity : Activity() {
         root.addView(text("Debifează Sniper pentru alerte UP/DOWN de la încredere Mediu. Setarea originală Sniper este activată implicit; veto-ul order flow este opțional.", 11, Color.GRAY, false))
         root.addView(button("SALVEAZĂ SETĂRILE", Color.rgb(42, 74, 110)) { saveSettings(); render() }, full())
 
+        root.addView(section("ÎNVĂȚARE ADAPTIVĂ LOCALĂ"))
+        learning = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(learning)
+
         root.addView(section("PIAȚĂ LIVE"))
         cards = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         root.addView(cards)
@@ -148,6 +153,7 @@ class MainActivity : Activity() {
         }
         status.setTextColor(if (enabled && age in 0..30) Color.rgb(22, 199, 132) else if (enabled) Color.rgb(240, 180, 41) else Color.GRAY)
 
+        renderLearning()
         cards.removeAllViews()
         val latest = StateStore.latest(this)
         if (latest.isEmpty()) cards.addView(text("Pornește monitorizarea; primele rezultate apar după descărcarea lumânărilor MEXC.", 13, Color.GRAY, false))
@@ -157,6 +163,45 @@ class MainActivity : Activity() {
         val recent = StateStore.alerts(this).take(12)
         if (recent.isEmpty()) alerts.addView(text("Nicio alertă încă. În Sniper original, alertele sunt intenționat rare.", 13, Color.GRAY, false))
         recent.forEach { alerts.addView(alertRow(it)) }
+    }
+
+    private fun renderLearning() {
+        learning.removeAllViews()
+        val summary = OnlineLearner.summary(this)
+        val box = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(12), dp(12), dp(12), dp(12))
+            background = rounded(Color.rgb(17, 22, 31), Color.rgb(82, 63, 125))
+            layoutParams = full(dp(10))
+        }
+        box.addView(text("● CALIBRARE ONLINE ACTIVĂ", 14, Color.rgb(167, 139, 250), true))
+        if (summary.resolved == 0) {
+            box.addView(text("Colectează primele semnale Mediu/Ridicat. Fiecare va fi verificat după 10 sau 30 minute pe lumânări MEXC închise.", 12, Color.LTGRAY, false).apply { setPadding(0, dp(6), 0, 0) })
+        } else {
+            val rate = if (summary.decisive > 0) String.format(Locale.US, "%.1f%%", summary.hitRate * 100) else "—"
+            box.addView(text("Rezolvate ${summary.resolved} • WIN ${summary.wins} • LOSS ${summary.losses} • neutre ${summary.neutral}", 13, Color.WHITE, true).apply { setPadding(0, dp(6), 0, 0) })
+            box.addView(text("Rată istorică pe rezultate decisive: $rate (${summary.decisive} exemple)", 12, Color.rgb(170, 180, 194), false))
+        }
+        val learningError = StateStore.learningError(this)
+        box.addView(text("În așteptare: ${summary.pending} • expirate fără date: ${summary.expired} • ultima evaluare: ${OnlineLearner.formatTime(summary.lastEvaluation)}", 11, Color.GRAY, false).apply { setPadding(0, dp(4), 0, 0) })
+        if (learningError != null) {
+            box.addView(text("⚠ Calibrare degradată: $learningError. Analiza live continuă cu ponderile disponibile.", 11, Color.rgb(240, 180, 41), true).apply { setPadding(0, dp(5), 0, 0) })
+        }
+
+        if (summary.features.isNotEmpty()) {
+            box.addView(text("Ponderi învățate", 12, Color.rgb(125, 150, 180), true).apply { setPadding(0, dp(9), 0, dp(3)) })
+            summary.features.forEach { feature ->
+                val evidence = if (feature.decisive < 5) "colectare ${feature.decisive}/5" else "${feature.decisive} rezultate"
+                val color = when {
+                    feature.multiplier > 1.001 -> Color.rgb(22, 199, 132)
+                    feature.multiplier < .999 -> Color.rgb(234, 100, 105)
+                    else -> Color.LTGRAY
+                }
+                box.addView(text("${OnlineLearner.readableFeature(feature.key)} • x${String.format(Locale.US, "%.3f", feature.multiplier)} • $evidence", 11, color, false))
+            }
+        }
+        box.addView(text("Ponderile se adaptează conservator între 0,75× și 1,25× după minimum 5 rezultate. Sistemul nu își rescrie codul și nu poate garanta un WIN; istoricul este calibrare statistică, nu certitudine.", 10, Color.GRAY, false).apply { setPadding(0, dp(9), 0, 0) })
+        learning.addView(box)
     }
 
     private fun marketCard(data: JSONObject): View {
