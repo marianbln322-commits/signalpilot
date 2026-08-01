@@ -27,7 +27,27 @@ Ca să oprești: închide fereastra / `Ctrl+C`.
 
 Pe Windows poți da dublu-click pe **`start.bat`**.
 
-## Setări (în UI, se salvează în `config.json`)
+## Android standalone (fără PC/server după instalare)
+
+Aplicația Android împachetează interfața și motorul SignalPilot în APK. Datele MEXC/Binance/Gemini sunt accesate direct de telefon prin HTTPS, iar configurația, jurnalul și learning-ul sunt păstrate local pe telefon. Serverul Node.js nu este necesar după instalare.
+
+Cerințe pentru build: **Android Studio**, Android SDK 35 și JDK 17. Deschide directorul `android/` în Android Studio, lasă Gradle Sync să termine, apoi rulează configurația `app` pe telefon sau emulator. Din terminal poți construi APK-ul astfel:
+
+```bash
+npm run android:build
+```
+
+APK-ul debug rezultat este:
+
+```text
+android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+Pentru instalare manuală, activează temporar permisiunea Android de instalare din surse necunoscute pentru aplicația din care deschizi APK-ul. SignalPilot cere doar acces la internet și, pe Android 13+, permisiunea pentru notificări.
+
+**Limitare Android:** scannerul rulează la intervalul configurat numai cât aplicația este deschisă în foreground. Dacă o trimiți în fundal sau închizi ecranul/aplicația, Android poate suspenda timer-ele; la revenire, jurnalul restant este rezolvat folosind prețul istoric de la momentul corect. Un serviciu Android permanent nu este inclus în această versiune.
+
+## Setări (în UI, se salvează local)
 
 - **Simboluri**: format MEXC fără underscore, ex. `BTCUSDT`, `ETHUSDT`.
 - **Interval scanare** (secunde, minim 3).
