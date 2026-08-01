@@ -1,0 +1,43 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.signalpilot.localhost3001'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.signalpilot.localhost3001'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '1.0.0-3001'
+    }
+
+    sourceSets {
+        // The same UI is used by desktop Express and Android WebView.
+        main.assets.srcDirs = ['../../public']
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// Keep the browser bundle synchronized with classic/lib/*.js before every APK build.
+tasks.register('buildMobileCore', Exec) {
+    workingDir rootProject.projectDir.parentFile
+    commandLine 'node', 'scripts/build-mobile-core.js'
+}
+
+tasks.named('preBuild').configure {
+    dependsOn tasks.named('buildMobileCore')
+}

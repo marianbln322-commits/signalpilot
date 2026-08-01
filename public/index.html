@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'" />
   <title>SignalPilot — MEXC live UP/DOWN</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -16,7 +17,6 @@
       </div>
     </div>
     <div class="badges">
-      <span id="sessionBadge" class="badge badge-off">Sesiune: ...</span>
       <span id="aiBadge" class="badge badge-off">AI: verific...</span>
       <span id="connBadge" class="badge badge-off">Conectare...</span>
     </div>
@@ -30,10 +30,6 @@
         <label class="switch-inline">
           <input type="checkbox" id="soundToggle" checked /> sunet la alertă
         </label>
-      </div>
-      <div class="howto">
-        <b>Cum se folosește:</b> aplicația citește prețul MEXC live și îl analizează singură (nu desenează grafic — îți dă direct concluzia).
-        În <b>Sniper Mode</b>, aștepți banner-ul verde/roșu <b>🎯 INTRĂ</b>: atunci deschizi MEXC → event futures pe moneda respectivă și pui <b>UP</b> sau <b>DOWN</b> pe fereastra afișată (10 sau 30 min). Cât timp vezi <b>⏳ AȘTEAPTĂ</b>, nu faci nimic. Fereastra (10 vs 30 min) o alege singură în funcție de tipul setup-ului.
       </div>
       <div id="cards" class="cards"></div>
     </section>
@@ -53,15 +49,6 @@
       <p class="muted" style="margin-top:-6px">Fiecare alertă e înregistrată automat, iar rezultatul (WIN/LOSS) se verifică singur după 10/30 min. Acesta e win-rate-ul TĂU real, live.</p>
       <div id="journalStats" class="bt-result" style="margin-top:12px"></div>
       <div id="journalList" class="journal-list"></div>
-    </section>
-
-    <!-- LEARNING -->
-    <section class="panel">
-      <div class="panel-head"><h2>🧠 Ce a învățat (din rezultatele tale)</h2></div>
-      <p class="muted" style="margin-top:-6px">Pe măsură ce jurnalul se umple, aplicația învață ce tipare îți merg și ce evită. Are nevoie de minim ~10 semnale per tipar ca să aibă încredere.</p>
-      <div id="learningBody" class="learning-body">
-        <p class="muted">Încă strâng date — nimic învățat sigur deocamdată. Lasă aplicația să ruleze câteva sesiuni.</p>
-      </div>
     </section>
 
     <!-- SETTINGS -->
@@ -99,27 +86,6 @@ ETHUSDT</textarea>
               <small class="muted">În afara Sniper Mode, aplicația alertează pe orice setup peste pragul de încredere (mai multe semnale, mai mult zgomot).</small>
             </div>
           </div>
-          <div class="grid" style="margin-top:12px">
-            <div class="field">
-              <label class="switch-inline"><input type="checkbox" id="adaptiveInterval" /> <b>Comută 10→30 min când payout-ul pe 10 min e slab</b> (opțional)</label>
-              <small class="muted">Intervalul e ales natural de tipul setup-ului (sweep rapid → 10 min, structură → 30 min), deci apar AMBELE. Payout-ul de mai jos e afișat mereu ca informație. Bifează asta doar dacă vrei ca aplicația să treacă singură pe 30 min când 10 min are payout prost.</small>
-            </div>
-            <div class="field">
-              <label>Payout MEXC pe 10 min (%)</label>
-              <input type="number" id="payout10" min="1" max="500" value="65" />
-              <label>Payout MEXC pe 30 min (%)</label>
-              <input type="number" id="payout30" min="1" max="500" value="82" />
-          </div>
-        </div>
-        <div class="grid" style="margin-top:12px">
-            <div class="field">
-              <label class="switch-inline"><input type="checkbox" id="useOrderFlow" checked /> <b>Order flow live</b> — confirmă direcția cu order book + agresiunea tranzacțiilor</label>
-              <label class="switch-inline"><input type="checkbox" id="requireOfAgree" /> nu alerta când order flow e în conflict cu direcția</label>
-            </div>
-            <div class="field">
-              <label class="switch-inline"><input type="checkbox" id="useLearning" checked /> <b>🧠 Învățare din jurnal</b> — se calibrează din rezultatele tale și blochează tiparele pierzătoare</label>
-              <small class="muted">Are nevoie de minim ~10 semnale per tipar înainte să acționeze.</small>
-            </div>
         </div>
         <hr />
         <div class="grid">
@@ -165,6 +131,8 @@ ETHUSDT</textarea>
     </section>
   </main>
 
+  <script src="mobile-core.js"></script>
+  <script src="mobile-runtime.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
