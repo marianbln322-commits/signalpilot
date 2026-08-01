@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'" />
   <title>SignalPilot — MEXC live UP/DOWN</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -165,6 +166,8 @@ ETHUSDT</textarea>
     </section>
   </main>
 
+  <script src="mobile-core.js"></script>
+  <script src="mobile-runtime.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
