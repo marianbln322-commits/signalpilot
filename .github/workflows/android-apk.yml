@@ -1,0 +1,97 @@
+name: Build Android APK
+
+on:
+  push:
+    branches:
+      - main
+      - feat/android-standalone-old
+  workflow_dispatch:
+
+concurrency:
+  group: android-apk-${{ github.sha }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build installable APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build debug APK
+        run: |
+          chmod +x android/gradlew
+          ./android/gradlew -p android :app:assembleDebug --no-daemon
+
+      - name: Prepare APK
+        run: |
+          test -s android/app/build/outputs/apk/debug/app-debug.apk
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/SignalPilot-Android-debug.apk
+
+      - name: Store workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SignalPilot-Android-${{ github.sha }}
+          path: dist/SignalPilot-Android-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  publish:
+    name: Publish downloadable APK
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+
+    steps:
+      - name: Download built APK
+        uses: actions/download-artifact@v4
+        with:
+          name: SignalPilot-Android-${{ github.sha }}
+          path: dist
+
+      - name: Publish downloadable prerelease
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="android-${GITHUB_SHA}"
+          APK_PATH="dist/SignalPilot-Android-debug.apk"
+          if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG_NAME" "$APK_PATH" --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG_NAME" "$APK_PATH" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "SignalPilot Android ${GITHUB_SHA:0:7}" \
+              --notes "APK Android standalone generat automat. Descarcă SignalPilot-Android-debug.apk și instalează-l pe telefon. Este un build debug, semnat automat pentru instalare." \
+              --prerelease
+          fi
+          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/SignalPilot-Android-debug.apk"
+          echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
+          {
+            echo "## APK Android"
+            echo "[Descarcă SignalPilot-Android-debug.apk]($DOWNLOAD_URL)"
+          } >> "$GITHUB_STEP_SUMMARY"
