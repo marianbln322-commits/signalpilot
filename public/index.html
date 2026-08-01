@@ -3,6 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-src 'none'; form-action 'none'" />
   <title>SignalPilot — MEXC live UP/DOWN</title>
   <link rel="stylesheet" href="style.css" />
 </head>
@@ -23,6 +24,9 @@
   </header>
 
   <main>
+    <div id="mobileNotice" class="howto mobile-only">
+      <b>Android standalone:</b> motorul rulează direct pe telefon. Pentru scanare la 8 secunde, ține aplicația deschisă; Android suspendă aplicațiile închise sau trimise în fundal.
+    </div>
     <!-- LIVE SIGNAL CARDS -->
     <section class="panel">
       <div class="panel-head">
@@ -165,6 +169,8 @@ ETHUSDT</textarea>
     </section>
   </main>
 
+  <script src="mobile-core.js"></script>
+  <script src="mobile-runtime.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

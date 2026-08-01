@@ -4,6 +4,28 @@
 // handles settings save, AI key test, and backtest.
 
 const $ = (id) => document.getElementById(id);
+const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+})[char]);
+const browserFetch = window.fetch.bind(window);
+const mobileRuntime = window.SignalPilotMobile || null;
+if (mobileRuntime) document.body.classList.add('android-standalone');
+
+async function apiFetch(url, options = {}) {
+  if (!mobileRuntime) return browserFetch(url, options);
+  try {
+    const payload = await mobileRuntime.request(url, options);
+    return { ok: true, status: 200, json: async () => payload, text: async () => JSON.stringify(payload) };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 500,
+      json: async () => ({ error: error.message }),
+      text: async () => error.message,
+    };
+  }
+}
+
 const cardsEl = $('cards');
 const alertsEl = $('alerts');
 let cards = {}; // symbol -> element
@@ -73,7 +95,7 @@ function ofRow(v) {
     const up = v.htfTrend === 'up';
     parts.push(`<span title="trendul pe 1 oră">Trend 1h: <b class="${up ? 'ok' : 'bad'}">${up ? '↗ ascendent' : '↘ descendent'}</b></span>`);
   }
-  if (v.suppressed) parts.push(`<span class="bad">⛔ blocat: ${v.suppressed}</span>`);
+  if (v.suppressed) parts.push(`<span class="bad">⛔ blocat: ${escapeHtml(v.suppressed)}</span>`);
   if (!parts.length) return '';
   return `<div class="of-row">${parts.join(' &nbsp;·&nbsp; ')}</div>`;
 }
@@ -81,10 +103,10 @@ function ofRow(v) {
 function renderCard(v) {
   const dir = v.directie.toLowerCase();
   const eligible = v.sniper && v.sniper.eligible;
-  const sigs = (v.signals || []).slice(0, 5).map((s) => `<li>${s.label} <span class="muted">[${s.tf}]</span></li>`).join('');
+  const sigs = (v.signals || []).slice(0, 5).map((s) => `<li>${escapeHtml(s.label)} <span class="muted">[${escapeHtml(s.tf)}]</span></li>`).join('');
   const ai = v.ai
-    ? `<div class="ai-note">🤖 <b>AI (${v.ai.acord || '—'})</b>: ${v.ai.risc ? '⚠️ ' + v.ai.risc : ''} ${v.ai.comentariu || ''}</div>`
-    : (v.aiError ? `<div class="ai-note">🤖 AI indisponibil: ${v.aiError}</div>` : '');
+    ? `<div class="ai-note">🤖 <b>AI (${escapeHtml(v.ai.acord || '—')})</b>: ${v.ai.risc ? '⚠️ ' + escapeHtml(v.ai.risc) : ''} ${escapeHtml(v.ai.comentariu || '')}</div>`
+    : (v.aiError ? `<div class="ai-note">🤖 AI indisponibil: ${escapeHtml(v.aiError)}</div>` : '');
 
   // The BIG banner: the only thing you act on. Sniper Mode = trade only on 🎯.
   const ev = v.ev;
@@ -97,7 +119,7 @@ function renderCard(v) {
   if (SNIPER_MODE) {
     banner = eligible
       ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${warnLine}`
-      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${v.sniper ? v.sniper.reason : '—'}</div></div>`;
+      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${escapeHtml(v.sniper ? v.sniper.reason : '—')}</div></div>`;
   } else {
     banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`;
   }
@@ -114,8 +136,8 @@ function renderCard(v) {
       <div class="row5">
         <b>Direcție motor</b><span class="dir-inline ${dir}">${v.directie} · ${v.interval}</span>
         <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
-        <b>Justificare</b><span>${v.justificare}</span>
-        <b>Invalidare</b><span>${v.invalidare}</span>
+        <b>Justificare</b><span>${escapeHtml(v.justificare)}</span>
+        <b>Invalidare</b><span>${escapeHtml(v.invalidare)}</span>
         ${ev ? `<b>EV / fereastră</b><span>10 min: <span class="${ev.ev10 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev10 > 0 ? '+' : ''}${ev.ev10}%</span> (payout ${ev.payout10}%, nevoie ${ev.breakEven10}%) · 30 min: <span class="${ev.ev30 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev30 > 0 ? '+' : ''}${ev.ev30}%</span> (payout ${ev.payout30}%, nevoie ${ev.breakEven30}%)</span>` : ''}
       </div>
       ${sigs ? `<ul class="sig-list">${sigs}</ul>` : ''}
@@ -176,6 +198,13 @@ function beep() {
 
 function notify(a) {
   beep();
+  if (mobileRuntime) {
+    mobileRuntime.notify(
+      `SignalPilot: ${a.symbol} ${a.directie}`,
+      `${a.interval} · încredere ${a.incredere} @ ${fmt(a.price)}`
+    );
+    return;
+  }
   if ('Notification' in window && Notification.permission === 'granted') {
     new Notification(`SignalPilot: ${a.symbol} ${a.directie}`, {
       body: `${a.interval} · încredere ${a.incredere} @ ${fmt(a.price)}`,
@@ -183,28 +212,45 @@ function notify(a) {
   }
 }
 
-// ---------- SSE ----------
+function renderSnapshot(d) {
+  Object.values(d.latest || {}).forEach(upsertCard);
+  if (d.journal) renderJournal(d.journal);
+  if (d.learning) renderLearning(d.learning);
+  (d.alerts || []).slice().reverse().forEach((a) => {
+    if (alertsEl.querySelector('.muted')) alertsEl.innerHTML = '';
+    const el = document.createElement('div');
+    el.className = 'alert-item';
+    const dir = a.directie.toLowerCase();
+    el.innerHTML = `<span class="adir ${dir}">${a.directie} ${a.directie === 'UP' ? '▲' : '▼'}</span>
+      <span><b>${a.symbol}</b> · ${a.interval} · <span class="pill ${a.incredere}">${a.incredere}</span> @ ${fmt(a.price)}</span>
+      <span class="alert-time">${new Date(a.ts).toLocaleTimeString('ro-RO')}</span>`;
+    alertsEl.prepend(el);
+  });
+}
+
+// ---------- live stream: SSE on desktop, in-process event bus on Android ----
 function connect() {
+  if (mobileRuntime) {
+    mobileRuntime.on('connection', (state) => setBadge('connBadge', state.online ? 'Android live' : 'Offline', !!state.online));
+    mobileRuntime.on('snapshot', renderSnapshot);
+    mobileRuntime.on('signal', upsertCard);
+    mobileRuntime.on('alert', addAlert);
+    mobileRuntime.on('journal', (data) => {
+      renderJournal(data);
+      if (data.learning) renderLearning(data.learning);
+    });
+    mobileRuntime.on('error', (error) => {
+      setBadge('connBadge', `Eroare ${error.symbol || ''}`, false);
+      console.error('Mobile scan error:', error.message);
+    });
+    mobileRuntime.connect();
+    return;
+  }
+
   const es = new EventSource('/api/stream');
   es.addEventListener('open', () => setBadge('connBadge', 'Live', true));
   es.addEventListener('error', () => setBadge('connBadge', 'Reconectare...', false));
-  es.addEventListener('snapshot', (e) => {
-    const d = JSON.parse(e.data);
-    Object.values(d.latest || {}).forEach(upsertCard);
-    if (d.journal) renderJournal(d.journal);
-    if (d.learning) renderLearning(d.learning);
-    (d.alerts || []).slice().reverse().forEach((a) => {
-      // render without sound on initial load
-      if (alertsEl.querySelector('.muted')) alertsEl.innerHTML = '';
-      const el = document.createElement('div');
-      el.className = 'alert-item';
-      const dir = a.directie.toLowerCase();
-      el.innerHTML = `<span class="adir ${dir}">${a.directie} ${a.directie === 'UP' ? '▲' : '▼'}</span>
-        <span><b>${a.symbol}</b> · ${a.interval} · <span class="pill ${a.incredere}">${a.incredere}</span> @ ${fmt(a.price)}</span>
-        <span class="alert-time">${new Date(a.ts).toLocaleTimeString('ro-RO')}</span>`;
-      alertsEl.prepend(el);
-    });
-  });
+  es.addEventListener('snapshot', (e) => renderSnapshot(JSON.parse(e.data)));
   es.addEventListener('signal', (e) => upsertCard(JSON.parse(e.data)));
   es.addEventListener('alert', (e) => addAlert(JSON.parse(e.data)));
   es.addEventListener('journal', (e) => {
@@ -297,7 +343,7 @@ function updateCostHint() {
 
 // ---------- settings ----------
 async function loadState() {
-  const r = await fetch('/api/state');
+  const r = await apiFetch('/api/state');
   const s = await r.json();
   const c = s.config;
   $('symbols').value = (c.symbols || []).join('\n');
@@ -352,7 +398,7 @@ async function saveSettings() {
     },
   };
   $('saveResult').textContent = 'se salvează...';
-  const r = await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await apiFetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const d = await r.json();
   $('saveResult').textContent = d.ok ? '✓ salvat' : 'eroare';
   $('geminiKey').value = '';
@@ -363,7 +409,7 @@ async function saveSettings() {
 async function testAi() {
   $('testAiResult').textContent = 'testez...';
   const body = { apiKey: $('geminiKey').value, model: $('geminiModel').value };
-  const r = await fetch('/api/test-ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const r = await apiFetch('/api/test-ai', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
   const d = await r.json();
   $('testAiResult').textContent = d.ok ? `✓ cheie validă (${d.model})` : `✗ ${d.error}`;
 }
@@ -375,7 +421,7 @@ async function runBacktest() {
   $('btStatus').textContent = 'rulez pe istoric... (câteva secunde)';
   $('btResult').innerHTML = '';
   try {
-    const r = await fetch(`/api/backtest?symbol=${symbol}&days=${days}`);
+    const r = await apiFetch(`/api/backtest?symbol=${symbol}&days=${days}`);
     const d = await r.json();
     if (d.error) { $('btStatus').textContent = 'eroare: ' + d.error; return; }
     $('btStatus').textContent = `${d.evaluated} semnale evaluate pe ${d.totalCandles} lumânări (${d.days} zile, sursă: ${d.source})`;
@@ -403,10 +449,10 @@ $('soundToggle').addEventListener('change', (e) => { soundOn = e.target.checked;
 $('geminiModel').addEventListener('change', updateCostHint);
 $('resetJournal').addEventListener('click', async () => {
   if (!confirm('Sigur resetezi jurnalul? Se pierde istoricul de semnale.')) return;
-  await fetch('/api/journal/reset', { method: 'POST' });
+  await apiFetch('/api/journal/reset', { method: 'POST' });
 });
 
-if ('Notification' in window && Notification.permission === 'default') {
+if (!mobileRuntime && 'Notification' in window && Notification.permission === 'default') {
   Notification.requestPermission();
 }
 
