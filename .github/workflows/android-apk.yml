@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - feat/android-standalone-old
+      - feat/android-classic-localhost-ui
   workflow_dispatch:
 
 concurrency:
@@ -46,13 +47,13 @@ jobs:
         run: |
           test -s android/app/build/outputs/apk/debug/app-debug.apk
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/SignalPilot-Android-debug.apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/SignalPilot-Classic-Android-debug.apk
 
       - name: Store workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SignalPilot-Android-${{ github.sha }}
-          path: dist/SignalPilot-Android-debug.apk
+          name: SignalPilot-Classic-Android-${{ github.sha }}
+          path: dist/SignalPilot-Classic-Android-debug.apk
           if-no-files-found: error
           retention-days: 30
 
@@ -69,7 +70,7 @@ jobs:
       - name: Download built APK
         uses: actions/download-artifact@v4
         with:
-          name: SignalPilot-Android-${{ github.sha }}
+          name: SignalPilot-Classic-Android-${{ github.sha }}
           path: dist
 
       - name: Publish downloadable prerelease
@@ -77,21 +78,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG_NAME="android-${GITHUB_SHA}"
-          APK_PATH="dist/SignalPilot-Android-debug.apk"
+          TAG_NAME="android-classic-${GITHUB_SHA}"
+          APK_PATH="dist/SignalPilot-Classic-Android-debug.apk"
           if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" "$APK_PATH" --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG_NAME" "$APK_PATH" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
-              --title "SignalPilot Android ${GITHUB_SHA:0:7}" \
-              --notes "APK Android standalone generat automat. Descarcă SignalPilot-Android-debug.apk și instalează-l pe telefon. Este un build debug, semnat automat pentru instalare." \
+              --title "SignalPilot Classic Android ${GITHUB_SHA:0:7}" \
+              --notes "APK Android standalone cu interfața clasică din versiunea localhost 3000/3001. Descarcă SignalPilot-Classic-Android-debug.apk și instalează-l pe telefon. Rulează fără PC și se poate instala alături de versiunea nouă." \
               --prerelease
           fi
-          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/SignalPilot-Android-debug.apk"
+          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/SignalPilot-Classic-Android-debug.apk"
           echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
           {
             echo "## APK Android"
-            echo "[Descarcă SignalPilot-Android-debug.apk]($DOWNLOAD_URL)"
+            echo "[Descarcă SignalPilot-Classic-Android-debug.apk]($DOWNLOAD_URL)"
           } >> "$GITHUB_STEP_SUMMARY"

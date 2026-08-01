@@ -13,21 +13,6 @@
 }
 
 * { box-sizing: border-box; }
-.mobile-only { display: none; }
-body.android-standalone .mobile-only { display: block; }
-body.android-standalone main { padding-bottom: calc(60px + env(safe-area-inset-bottom)); }
-body.android-standalone header { padding-top: calc(16px + env(safe-area-inset-top)); }
-
-@media (max-width: 640px) {
-  header { align-items: flex-start; padding: 14px; gap: 10px; }
-  header p { display: none; }
-  .badges { flex-direction: column; align-items: flex-end; }
-  main { margin-top: 12px; padding-left: 10px; padding-right: 10px; }
-  .panel { padding: 14px 12px; }
-  .cards { grid-template-columns: 1fr; }
-  .grid { grid-template-columns: 1fr; }
-}
-
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
