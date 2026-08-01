@@ -1,4 +1,4 @@
-package com.signalpilot.app;
+package com.signalpilot.localhost3001;
 
 import android.Manifest;
 import android.annotation.SuppressLint;
@@ -117,7 +117,15 @@ public class MainActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (bridge != null) bridge.setForeground(true);
         if (webView != null) webView.evaluateJavascript("window.SignalPilotMobile && window.SignalPilotMobile.resume()", null);
+    }
+
+    @Override
+    protected void onPause() {
+        if (bridge != null) bridge.setForeground(false);
+        if (webView != null) webView.evaluateJavascript("window.SignalPilotMobile && window.SignalPilotMobile.pause()", null);
+        super.onPause();
     }
 
     @Override
@@ -149,6 +157,7 @@ public class MainActivity extends Activity {
         private final AtomicInteger notificationIds = new AtomicInteger(100);
         private final File storageDir;
         private final Object storageLock = new Object();
+        private volatile boolean foreground = true;
         private volatile boolean destroyed = false;
 
         SignalPilotBridge(Context context, WebView webView) {
@@ -161,13 +170,28 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void http(String requestId, String method, String rawUrl, String body, String headersJson) {
             if (destroyed) return;
+            if (!foreground) {
+                callback(requestId, 0, "", "Aplicația este în fundal");
+                return;
+            }
             network.execute(() -> executeHttp(requestId, method, rawUrl, body, headersJson));
+        }
+
+        void setForeground(boolean value) {
+            foreground = value;
+            if (!value) {
+                for (HttpURLConnection connection : activeConnections) connection.disconnect();
+            }
         }
 
         private void executeHttp(String requestId, String method, String rawUrl, String body, String headersJson) {
             HttpURLConnection connection = null;
             try {
                 if (destroyed) return;
+                if (!foreground) {
+                    callback(requestId, 0, "", "Aplicația este în fundal");
+                    return;
+                }
                 URL url = new URL(rawUrl);
                 if (!"https".equalsIgnoreCase(url.getProtocol()) || !ALLOWED_HOSTS.contains(url.getHost())) {
                     throw new SecurityException("Host HTTPS nepermis: " + url.getHost());
@@ -233,8 +257,13 @@ public class MainActivity extends Activity {
                 JSONObject.quote(requestId) + "," + status + "," +
                 JSONObject.quote(body == null ? "" : body) + "," +
                 (error == null ? "null" : JSONObject.quote(error)) + ")";
+            String pausedScript = "window.__signalPilotNativeResponse(" +
+                JSONObject.quote(requestId) + ",0,\"\"," +
+                JSONObject.quote("Aplicația este în fundal") + ")";
             webView.post(() -> {
-                if (!destroyed && webView != null) webView.evaluateJavascript(script, null);
+                if (!destroyed && webView != null) {
+                    webView.evaluateJavascript(foreground ? script : pausedScript, null);
+                }
             });
         }
 

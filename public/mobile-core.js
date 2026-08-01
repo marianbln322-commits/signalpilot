@@ -23,7 +23,7 @@
     modules[id](module, module.exports, (request) => load(resolve(id, request)));
     return module.exports;
   }
-  define("lib/indicators.js", function (module, exports, require) {
+  define("classic/lib/indicators.js", function (module, exports, require) {
 'use strict';
 
 // ============================================================================
@@ -154,25 +154,6 @@ function volumeAverage(volumes, period = 20) {
   return sma(volumes, period);
 }
 
-// Rolling VWAP (Volume-Weighted Average Price) over the last `period` bars.
-// The intraday "fair value" anchor scalpers watch: price above a rising VWAP is
-// a bullish bias, below a falling VWAP is bearish.
-function vwap(candles, period = 96) {
-  const out = new Array(candles.length).fill(null);
-  for (let i = 0; i < candles.length; i++) {
-    const start = Math.max(0, i - period + 1);
-    let pv = 0;
-    let vol = 0;
-    for (let j = start; j <= i; j++) {
-      const tp = (candles[j].high + candles[j].low + candles[j].close) / 3;
-      pv += tp * candles[j].volume;
-      vol += candles[j].volume;
-    }
-    out[i] = vol > 0 ? pv / vol : null;
-  }
-  return out;
-}
-
 // Convenience: last non-null value of a series.
 function last(series) {
   if (!series) return null;
@@ -190,12 +171,11 @@ module.exports = {
   bollinger,
   atr,
   volumeAverage,
-  vwap,
   last,
 };
 
   });
-  define("lib/smc.js", function (module, exports, require) {
+  define("classic/lib/smc.js", function (module, exports, require) {
 'use strict';
 
 // ============================================================================
@@ -394,7 +374,7 @@ module.exports = {
 };
 
   });
-  define("lib/engine.js", function (module, exports, require) {
+  define("classic/lib/engine.js", function (module, exports, require) {
 'use strict';
 
 // ============================================================================
@@ -445,7 +425,6 @@ function analyzeTimeframe(candles, tf, kindOfTf) {
   const ema20 = ind.ema(closes, 20) || [];
   const ema50 = ind.ema(closes, 50) || [];
   const volAvg = ind.volumeAverage(volumes, 20) || [];
-  const vwapSeries = ind.vwap(candles, 96) || [];
 
   const iLast = candles.length - 1;
   const price = closes[iLast];
@@ -464,8 +443,6 @@ function analyzeTimeframe(candles, tf, kindOfTf) {
   const ema50Now = ind.last(ema50);
   const vNow = volumes[iLast];
   const vAvgNow = ind.last(volAvg);
-  const vwapNow = ind.last(vwapSeries);
-  const vwapPrev = vwapSeries[iLast - 5] ?? vwapSeries[iLast - 1];
 
   const structure = smc.marketStructure(candles, 2);
   const fvg = smc.fairValueGaps(candles, 60);
@@ -542,14 +519,6 @@ function analyzeTimeframe(candles, tf, kindOfTf) {
     add('down', 1.4, 'Atingere bandă Bollinger superioară + RSI supracumpărat + divergență', 'fast');
   }
 
-  // VWAP bias (intraday fair-value anchor)
-  if (vwapNow != null) {
-    const vwapRising = vwapPrev != null && vwapNow > vwapPrev;
-    const vwapFalling = vwapPrev != null && vwapNow < vwapPrev;
-    if (price > vwapNow && vwapRising) add('up', 1.0, 'Preț peste VWAP în urcare (bias intraday bullish)', 'structural');
-    if (price < vwapNow && vwapFalling) add('down', 1.0, 'Preț sub VWAP în coborâre (bias intraday bearish)', 'structural');
-  }
-
   // Volume absorption (stopping volume) at a low
   if (vAvgNow && vNow > vAvgNow * 1.8) {
     const c = candles[iLast];
@@ -574,8 +543,6 @@ function analyzeTimeframe(candles, tf, kindOfTf) {
     volume: vNow != null ? +vNow.toFixed(2) : null,
     volAvg: vAvgNow != null ? +vAvgNow.toFixed(2) : null,
     squeeze: isSqueeze,
-    vwap: vwapNow != null ? +vwapNow.toFixed(2) : null,
-    aboveVwap: vwapNow != null ? price > vwapNow : null,
     trend: structure.trend,
     mss: structure.mss,
     sweep: sweep ? sweep.type : null,
@@ -596,25 +563,6 @@ function decide(mtf) {
   if (tf15 && tf15.length >= 60) analyses.push({ tf: '15m', ...analyzeTimeframe(tf15, '15m') });
 
   const allSignals = analyses.flatMap((a) => a.signals);
-
-  // Higher-timeframe (1h) trend alignment: trade WITH the bigger trend.
-  let htfTrend = null;
-  const tf60 = mtf['60m'];
-  if (tf60 && tf60.length >= 60) {
-    const c60 = tf60.map((c) => c.close);
-    const e20 = ind.last(ind.ema(c60, 20));
-    const e50 = ind.last(ind.ema(c60, 50));
-    if (e20 != null && e50 != null) {
-      htfTrend = e20 > e50 ? 'up' : 'down';
-      allSignals.push({
-        side: htfTrend,
-        weight: 1.5,
-        label: `Aliniere cu trendul 1h (${htfTrend === 'up' ? 'ascendent' : 'descendent'})`,
-        kind: 'structural',
-        tf: '1h',
-      });
-    }
-  }
 
   let upScore = 0;
   let downScore = 0;
@@ -711,7 +659,6 @@ function decide(mtf) {
     signals: winning.map((s) => ({ label: s.label, tf: s.tf, weight: +s.weight.toFixed(2), kind: s.kind })),
     allSignals: allSignals.map((s) => ({ side: s.side, label: s.label, tf: s.tf, weight: +s.weight.toFixed(2) })),
     snapshots: Object.fromEntries(analyses.map((a) => [a.tf, a.snapshot])),
-    htfTrend,
     price,
     ts: Date.now(),
   };
@@ -741,123 +688,7 @@ function sniperEligibility(verdict, hourUTC, activeHours, requireVolume = true) 
 module.exports = { decide, analyzeTimeframe, rsiDivergence, sniperEligibility };
 
   });
-  define("lib/learning.js", function (module, exports, require) {
-'use strict';
-
-// ============================================================================
-// learning.js — honest, statistical self-calibration from the user's OWN journal.
-// It is NOT a black-box AI. It tracks live win-rate across several context
-// dimensions (setup, hour, symbol+direction, order-flow agreement) and, once a
-// dimension has enough resolved samples, nudges new signals up or down based on
-// how those exact conditions have actually performed for THIS user.
-//
-// Guards: needs a minimum sample per bucket before it trusts anything, so it
-// won't "learn" from noise. It optimizes around the real edge — it does not
-// invent one.
-// ============================================================================
-
-const DEFAULT_MIN_SAMPLE = 10;
-
-function agg(arr) {
-  const n = arr.length;
-  const wins = arr.filter((e) => e.win).length;
-  return { n, wins, winRate: n ? +((wins / n) * 100).toFixed(1) : null };
-}
-
-function bucketize(resolved, keyFn) {
-  const map = {};
-  for (const e of resolved) {
-    const k = keyFn(e);
-    if (k == null) continue;
-    (map[k] = map[k] || []).push(e);
-  }
-  const out = {};
-  for (const [k, arr] of Object.entries(map)) out[k] = agg(arr);
-  return out;
-}
-
-// Build all dimension statistics from resolved journal entries.
-function analyze(entries) {
-  const resolved = entries.filter((e) => e.status === 'resolved');
-  return {
-    total: resolved.length,
-    bySetup: bucketize(resolved, (e) => e.setup || 'necunoscut'),
-    byHour: bucketize(resolved, (e) => (e.hourUTC != null ? `h${e.hourUTC}` : null)),
-    bySymbolDir: bucketize(resolved, (e) => `${e.symbol}-${e.directie}`),
-    byOfAgree: bucketize(resolved, (e) => (e.ofAgree ? `of:${e.ofAgree}` : null)),
-    byInterval: bucketize(resolved, (e) => e.interval),
-  };
-}
-
-// Evaluate a new signal's context against learned stats.
-// Returns { estimate, adjustment, ready, factors } where estimate is a blended
-// win-rate guess (%) and adjustment is (estimate - 50).
-function evaluate(entries, ctx, minSample = DEFAULT_MIN_SAMPLE) {
-  const a = analyze(entries);
-  const factors = [];
-  const pull = (map, key, label) => {
-    const o = map[key];
-    if (o && o.n >= minSample && o.winRate != null) {
-      factors.push({ label, winRate: o.winRate, n: o.n });
-    }
-  };
-  pull(a.bySetup, ctx.setup || 'necunoscut', `setup ${ctx.setup || '—'}`);
-  if (ctx.hourUTC != null) pull(a.byHour, `h${ctx.hourUTC}`, `ora ${ctx.hourUTC} UTC`);
-  pull(a.bySymbolDir, `${ctx.symbol}-${ctx.directie}`, `${ctx.symbol} ${ctx.directie}`);
-  if (ctx.ofAgree) pull(a.byOfAgree, `of:${ctx.ofAgree}`, `order flow ${ctx.ofAgree}`);
-
-  if (!factors.length) {
-    return { ready: false, estimate: null, adjustment: 0, factors: [], note: 'încă strâng date — nimic învățat sigur' };
-  }
-  // Weight each factor by its sample size (more data = more trust).
-  let wsum = 0;
-  let acc = 0;
-  for (const f of factors) {
-    const w = Math.min(f.n, 60); // cap influence of any single bucket
-    acc += f.winRate * w;
-    wsum += w;
-  }
-  const estimate = +(acc / wsum).toFixed(1);
-  const adjustment = +(estimate - 50).toFixed(1);
-  return {
-    ready: true,
-    estimate,
-    adjustment,
-    factors,
-    note: `estimare din istoricul tău: ${estimate}% (din ${factors.length} tipare)`,
-  };
-}
-
-// Human-readable summary for the UI: best/worst learned buckets.
-function summary(entries, minSample = DEFAULT_MIN_SAMPLE) {
-  const a = analyze(entries);
-  const rows = [];
-  const collect = (map, prefix) => {
-    for (const [k, o] of Object.entries(map)) {
-      if (o.n >= minSample && o.winRate != null) {
-        rows.push({ key: `${prefix}: ${k}`, winRate: o.winRate, n: o.n });
-      }
-    }
-  };
-  collect(a.bySetup, 'setup');
-  collect(a.byHour, 'oră');
-  collect(a.bySymbolDir, 'monedă+dir');
-  collect(a.byOfAgree, 'order flow');
-  collect(a.byInterval, 'fereastră');
-  rows.sort((x, y) => y.winRate - x.winRate);
-  return {
-    total: a.total,
-    ready: rows.length > 0,
-    best: rows.slice(0, 5),
-    worst: rows.slice(-5).reverse(),
-    minSample,
-  };
-}
-
-module.exports = { analyze, evaluate, summary, DEFAULT_MIN_SAMPLE };
-
-  });
-  define("lib/gemini.js", function (module, exports, require) {
+  define("classic/lib/gemini.js", function (module, exports, require) {
 'use strict';
 
 // ============================================================================
@@ -950,8 +781,7 @@ module.exports = { narrate, testKey, buildPrompt };
 
   });
   global.SignalPilotCore = Object.freeze({
-    engine: load('lib/engine.js'),
-    learning: load('lib/learning.js'),
-    gemini: load('lib/gemini.js'),
+    engine: load('classic/lib/engine.js'),
+    gemini: load('classic/lib/gemini.js'),
   });
 })(window);

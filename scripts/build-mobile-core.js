@@ -5,11 +5,10 @@ const path = require('path');
 
 const root = path.join(__dirname, '..');
 const modules = [
-  'lib/indicators.js',
-  'lib/smc.js',
-  'lib/engine.js',
-  'lib/learning.js',
-  'lib/gemini.js',
+  'classic/lib/indicators.js',
+  'classic/lib/smc.js',
+  'classic/lib/engine.js',
+  'classic/lib/gemini.js',
 ];
 
 const parts = [
@@ -46,12 +45,11 @@ for (const id of modules) {
 }
 
 parts.push(`  global.SignalPilotCore = Object.freeze({
-    engine: load('lib/engine.js'),
-    learning: load('lib/learning.js'),
-    gemini: load('lib/gemini.js'),
+    engine: load('classic/lib/engine.js'),
+    gemini: load('classic/lib/gemini.js'),
   });`);
 parts.push('})(window);', '');
 
 const output = path.join(root, 'public', 'mobile-core.js');
 fs.writeFileSync(output, parts.join('\n'));
-console.log(`Built ${path.relative(root, output)} from ${modules.length} modules.`);
+console.log(`Built ${path.relative(root, output)} from ${modules.length} classic modules.`);

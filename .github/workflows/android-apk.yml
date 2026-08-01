@@ -1,19 +1,18 @@
-name: Build Android APK
+name: Build SignalPilot Localhost 3001 APK
 
 on:
   push:
     branches:
-      - main
-      - feat/android-standalone-old
+      - feat/android-localhost-3001-exact
   workflow_dispatch:
 
 concurrency:
-  group: android-apk-${{ github.sha }}
+  group: android-localhost-3001-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
   build:
-    name: Build installable APK
+    name: Build installable Localhost 3001 APK
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -37,6 +36,9 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Build canonical mobile core
+        run: env -u NODE_OPTIONS npm run build:mobile-core
+
       - name: Build debug APK
         run: |
           chmod +x android/gradlew
@@ -46,18 +48,18 @@ jobs:
         run: |
           test -s android/app/build/outputs/apk/debug/app-debug.apk
           mkdir -p dist
-          cp android/app/build/outputs/apk/debug/app-debug.apk dist/SignalPilot-Android-debug.apk
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/SignalPilot-Localhost-3001-debug.apk
 
       - name: Store workflow artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SignalPilot-Android-${{ github.sha }}
-          path: dist/SignalPilot-Android-debug.apk
+          name: SignalPilot-Localhost-3001-${{ github.sha }}
+          path: dist/SignalPilot-Localhost-3001-debug.apk
           if-no-files-found: error
           retention-days: 30
 
   publish:
-    name: Publish downloadable APK
+    name: Publish downloadable Localhost 3001 APK
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -69,7 +71,7 @@ jobs:
       - name: Download built APK
         uses: actions/download-artifact@v4
         with:
-          name: SignalPilot-Android-${{ github.sha }}
+          name: SignalPilot-Localhost-3001-${{ github.sha }}
           path: dist
 
       - name: Publish downloadable prerelease
@@ -77,21 +79,21 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG_NAME="android-${GITHUB_SHA}"
-          APK_PATH="dist/SignalPilot-Android-debug.apk"
+          TAG_NAME="android-localhost-3001-${GITHUB_SHA}"
+          APK_PATH="dist/SignalPilot-Localhost-3001-debug.apk"
           if gh release view "$TAG_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG_NAME" "$APK_PATH" --clobber --repo "$GITHUB_REPOSITORY"
           else
             gh release create "$TAG_NAME" "$APK_PATH" \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
-              --title "SignalPilot Android ${GITHUB_SHA:0:7}" \
-              --notes "APK Android standalone generat automat. Descarcă SignalPilot-Android-debug.apk și instalează-l pe telefon. Este un build debug, semnat automat pentru instalare." \
+              --title "SignalPilot Localhost 3001 Android ${GITHUB_SHA:0:7}" \
+              --notes "APK standalone al interfeței canonice localhost:3001, cu applicationId com.signalpilot.localhost3001 pentru instalare în paralel. Motorul rulează local pe telefon și scanează numai cât timp aplicația este în prim-plan. Fișier debug semnat automat: SignalPilot-Localhost-3001-debug.apk." \
               --prerelease
           fi
-          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/SignalPilot-Android-debug.apk"
+          DOWNLOAD_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG_NAME}/SignalPilot-Localhost-3001-debug.apk"
           echo "download_url=$DOWNLOAD_URL" >> "$GITHUB_OUTPUT"
           {
-            echo "## APK Android"
-            echo "[Descarcă SignalPilot-Android-debug.apk]($DOWNLOAD_URL)"
+            echo "## SignalPilot Localhost 3001 APK"
+            echo "[Descarcă SignalPilot-Localhost-3001-debug.apk]($DOWNLOAD_URL)"
           } >> "$GITHUB_STEP_SUMMARY"

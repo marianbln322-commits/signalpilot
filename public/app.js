@@ -7,9 +7,8 @@ const $ = (id) => document.getElementById(id);
 const escapeHtml = (value) => String(value ?? '').replace(/[&<>'"]/g, (char) => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
 })[char]);
-const browserFetch = window.fetch.bind(window);
 const mobileRuntime = window.SignalPilotMobile || null;
-if (mobileRuntime) document.body.classList.add('android-standalone');
+const browserFetch = window.fetch.bind(window);
 
 async function apiFetch(url, options = {}) {
   if (!mobileRuntime) return browserFetch(url, options);
@@ -30,29 +29,6 @@ const cardsEl = $('cards');
 const alertsEl = $('alerts');
 let cards = {}; // symbol -> element
 let soundOn = true;
-let SNIPER_MODE = true; // set from server config on load
-let ACTIVE_HOURS = [6, 7, 8, 9, 13, 14, 15, 16, 17]; // UTC, set from config
-const detailsOpen = {}; // per-symbol: keep the analysis panel open across live re-renders
-
-function updateSessionBadge() {
-  const nowUtc = new Date().getUTCHours();
-  const active = ACTIVE_HOURS.includes(nowUtc);
-  const el = $('sessionBadge');
-  if (!el) return;
-  if (active) {
-    el.textContent = '🟢 Sesiune ACTIVĂ';
-    el.className = 'badge badge-on';
-  } else {
-    // find next active hour
-    let next = null;
-    for (let k = 1; k <= 24; k++) {
-      const h = (nowUtc + k) % 24;
-      if (ACTIVE_HOURS.includes(h)) { next = k; break; }
-    }
-    el.textContent = next != null ? `⚪ Pauză (sesiune în ~${next}h)` : '⚪ Pauză';
-    el.className = 'badge badge-off';
-  }
-}
 
 // Local <-> UTC hour conversion (offset in hours; e.g. UTC+3 => off = -3).
 const OFF = new Date().getTimezoneOffset() / 60;
@@ -74,77 +50,36 @@ function snapChips(snaps) {
     if (s.fvgRetest) parts.push(`<span>${tf} · FVG ${s.fvgRetest}</span>`);
     if (s.divergence) parts.push(`<span>${tf} · div ${s.divergence}</span>`);
     if (s.squeeze) parts.push(`<span>${tf} · squeeze</span>`);
-    if (s.aboveVwap != null) parts.push(`<span>${tf} · ${s.aboveVwap ? 'peste' : 'sub'} VWAP</span>`);
   }
   return parts.join('');
 }
 
-function ofRow(v) {
-  const parts = [];
-  if (v.orderflow) {
-    const of = v.orderflow;
-    const map = { buy: '🟢 cumpărare', sell: '🔴 vânzare', neutru: '⚪ neutru' };
-    const agreeMap = { 'confirmă': '<span class="ok">✓ confirmă</span>', 'conflict': '<span class="bad">✗ conflict</span>', 'neutru': 'neutru' };
-    parts.push(`<span title="dezechilibru order book + agresiune tranzacții">Order flow: <b>${map[of.state] || of.state}</b> (${(of.pressure * 100).toFixed(0)}%) · ${agreeMap[v.ofAgree] || ''}</span>`);
-  }
-  if (v.learned && v.learned.ready) {
-    const cls = v.learned.estimate >= 55 ? 'ok' : (v.learned.estimate < 48 ? 'bad' : '');
-    parts.push(`<span title="estimare din istoricul tău">🧠 istoric: <span class="${cls}">${v.learned.estimate}%</span></span>`);
-  }
-  if (v.htfTrend) {
-    const up = v.htfTrend === 'up';
-    parts.push(`<span title="trendul pe 1 oră">Trend 1h: <b class="${up ? 'ok' : 'bad'}">${up ? '↗ ascendent' : '↘ descendent'}</b></span>`);
-  }
-  if (v.suppressed) parts.push(`<span class="bad">⛔ blocat: ${escapeHtml(v.suppressed)}</span>`);
-  if (!parts.length) return '';
-  return `<div class="of-row">${parts.join(' &nbsp;·&nbsp; ')}</div>`;
-}
-
 function renderCard(v) {
   const dir = v.directie.toLowerCase();
-  const eligible = v.sniper && v.sniper.eligible;
   const sigs = (v.signals || []).slice(0, 5).map((s) => `<li>${escapeHtml(s.label)} <span class="muted">[${escapeHtml(s.tf)}]</span></li>`).join('');
   const ai = v.ai
     ? `<div class="ai-note">🤖 <b>AI (${escapeHtml(v.ai.acord || '—')})</b>: ${v.ai.risc ? '⚠️ ' + escapeHtml(v.ai.risc) : ''} ${escapeHtml(v.ai.comentariu || '')}</div>`
     : (v.aiError ? `<div class="ai-note">🤖 AI indisponibil: ${escapeHtml(v.aiError)}</div>` : '');
-
-  // The BIG banner: the only thing you act on. Sniper Mode = trade only on 🎯.
-  const ev = v.ev;
-  const payoutNow = ev ? (v.interval === '10 minute' ? ev.payout10 : ev.payout30) : null;
-  const beNow = ev ? (v.interval === '10 minute' ? ev.breakEven10 : ev.breakEven30) : null;
-  const evWarn = ev && !ev.positive;
-  const evNote = ev ? ` · payout ${payoutNow}% (break-even ${beNow}%)` : '';
-  const warnLine = evWarn ? `<div class="ev-warn">⚠️ payout prea mic pentru edge-ul tău — EV negativ, mai bine sari peste</div>` : '';
-  let banner;
-  if (SNIPER_MODE) {
-    banner = eligible
-      ? `<div class="cta go ${dir}">🎯 INTRĂ ${v.directie} ${v.directie === 'UP' ? '▲' : '▼'}<div class="cta-sub">MEXC event futures · fereastră ${v.interval}${evNote}</div></div>${warnLine}`
-      : `<div class="cta wait">⏳ AȘTEAPTĂ<div class="cta-sub">nu e încă setup A+: ${escapeHtml(v.sniper ? v.sniper.reason : '—')}</div></div>`;
-  } else {
-    banner = `<div class="cta go ${dir}">${v.directie} ${v.directie === 'UP' ? '▲' : v.directie === 'DOWN' ? '▼' : ''}<div class="cta-sub">fereastră ${v.interval}${evNote} · încredere ${v.incredere}</div></div>${warnLine}`;
-  }
 
   return `
     <div class="card-top">
       <span class="card-sym">${v.symbol}</span>
       <span class="card-price">${fmt(v.price)} USDT</span>
     </div>
-    ${banner}
-    ${ofRow(v)}
-    <details class="analysis" data-sym="${v.symbol}" ${detailsOpen[v.symbol] ? 'open' : ''}>
-      <summary>Analiza motorului în timp real (context, nu semnal de intrare)</summary>
-      <div class="row5">
-        <b>Direcție motor</b><span class="dir-inline ${dir}">${v.directie} · ${v.interval}</span>
-        <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
-        <b>Justificare</b><span>${escapeHtml(v.justificare)}</span>
-        <b>Invalidare</b><span>${escapeHtml(v.invalidare)}</span>
-        ${ev ? `<b>EV / fereastră</b><span>10 min: <span class="${ev.ev10 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev10 > 0 ? '+' : ''}${ev.ev10}%</span> (payout ${ev.payout10}%, nevoie ${ev.breakEven10}%) · 30 min: <span class="${ev.ev30 > 0 ? 'dir-inline up' : 'dir-inline down'}">${ev.ev30 > 0 ? '+' : ''}${ev.ev30}%</span> (payout ${ev.payout30}%, nevoie ${ev.breakEven30}%)</span>` : ''}
-      </div>
-      ${sigs ? `<ul class="sig-list">${sigs}</ul>` : ''}
-      ${ai}
-      <div class="snap">${snapChips(v.snapshots)}</div>
-    </details>
-    <div class="muted" style="margin-top:8px;font-size:11px">preț live · actualizat ${new Date(v.ts).toLocaleTimeString('ro-RO')}</div>
+    <div class="dir ${dir}">${v.directie}${v.directie !== 'NEUTRU' ? (v.directie === 'UP' ? ' ▲' : ' ▼') : ''}</div>
+    <div class="sniper-status ${v.sniper && v.sniper.eligible ? 'ok' : ''}">
+      ${v.sniper && v.sniper.eligible ? '🎯 SNIPER A+ — ' + escapeHtml(v.sniper.reason) : '⏳ ' + escapeHtml(v.sniper ? v.sniper.reason : 'aștept setup')}
+    </div>
+    <div class="row5">
+      <b>Interval</b><span>${v.interval}</span>
+      <b>Încredere</b><span><span class="pill ${v.incredere}">${v.incredere}</span> <span class="muted">(net ${v.scores.net})</span></span>
+      <b>Justificare</b><span>${escapeHtml(v.justificare)}</span>
+      <b>Invalidare</b><span>${escapeHtml(v.invalidare)}</span>
+    </div>
+    ${sigs ? `<ul class="sig-list">${sigs}</ul>` : ''}
+    ${ai}
+    <div class="snap">${snapChips(v.snapshots)}</div>
+    <div class="muted" style="margin-top:8px;font-size:11px">actualizat ${new Date(v.ts).toLocaleTimeString('ro-RO')}</div>
   `;
 }
 
@@ -158,11 +93,6 @@ function upsertCard(v) {
   }
   el.className = 'card ' + v.directie.toLowerCase();
   el.innerHTML = renderCard(v);
-  // Persist the analysis panel's open/closed state across live re-renders.
-  const det = el.querySelector('details.analysis');
-  if (det) {
-    det.addEventListener('toggle', () => { detailsOpen[v.symbol] = det.open; });
-  }
 }
 
 function addAlert(a) {
@@ -215,8 +145,8 @@ function notify(a) {
 function renderSnapshot(d) {
   Object.values(d.latest || {}).forEach(upsertCard);
   if (d.journal) renderJournal(d.journal);
-  if (d.learning) renderLearning(d.learning);
   (d.alerts || []).slice().reverse().forEach((a) => {
+    // render without sound on initial load
     if (alertsEl.querySelector('.muted')) alertsEl.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'alert-item';
@@ -228,21 +158,14 @@ function renderSnapshot(d) {
   });
 }
 
-// ---------- live stream: SSE on desktop, in-process event bus on Android ----
+// ---------- SSE / Android in-process events ----------
 function connect() {
   if (mobileRuntime) {
-    mobileRuntime.on('connection', (state) => setBadge('connBadge', state.online ? 'Android live' : 'Offline', !!state.online));
-    mobileRuntime.on('snapshot', renderSnapshot);
-    mobileRuntime.on('signal', upsertCard);
-    mobileRuntime.on('alert', addAlert);
-    mobileRuntime.on('journal', (data) => {
-      renderJournal(data);
-      if (data.learning) renderLearning(data.learning);
-    });
-    mobileRuntime.on('error', (error) => {
-      setBadge('connBadge', `Eroare ${error.symbol || ''}`, false);
-      console.error('Mobile scan error:', error.message);
-    });
+    mobileRuntime.events.on('connection', (state) => setBadge('connBadge', state.online ? 'Live' : 'Reconectare...', !!state.online));
+    mobileRuntime.events.on('snapshot', renderSnapshot);
+    mobileRuntime.events.on('signal', upsertCard);
+    mobileRuntime.events.on('alert', addAlert);
+    mobileRuntime.events.on('journal', renderJournal);
     mobileRuntime.connect();
     return;
   }
@@ -253,31 +176,7 @@ function connect() {
   es.addEventListener('snapshot', (e) => renderSnapshot(JSON.parse(e.data)));
   es.addEventListener('signal', (e) => upsertCard(JSON.parse(e.data)));
   es.addEventListener('alert', (e) => addAlert(JSON.parse(e.data)));
-  es.addEventListener('journal', (e) => {
-    const d = JSON.parse(e.data);
-    renderJournal(d);
-    if (d.learning) renderLearning(d.learning);
-  });
-}
-
-// ---------- learning panel ----------
-function renderLearning(l) {
-  if (!l) return;
-  const el = $('learningBody');
-  if (!l.ready) {
-    el.innerHTML = `<p class="muted">Încă strâng date (${l.total || 0} semnale rezolvate). Am nevoie de minim ${l.minSample || 10} per tipar ca să învăț ceva sigur.</p>`;
-    return;
-  }
-  const row = (r) => {
-    const cls = r.winRate >= 55 ? 'ok' : (r.winRate < 48 ? 'bad' : '');
-    return `<div class="lrow"><span>${r.key}</span><span class="${cls}"><b>${r.winRate}%</b> <span class="muted">(${r.n})</span></span></div>`;
-  };
-  el.innerHTML = `
-    <div class="learn-cols">
-      <div><div class="learn-h ok">✅ Ce îți merge</div>${(l.best || []).map(row).join('') || '<p class="muted">—</p>'}</div>
-      <div><div class="learn-h bad">⛔ Ce evită</div>${(l.worst || []).map(row).join('') || '<p class="muted">—</p>'}</div>
-    </div>
-    <p class="muted" style="margin-top:10px">Din ${l.total} semnale rezolvate. Aplicația folosește asta ca să confirme sau să blocheze semnale noi automat.</p>`;
+  es.addEventListener('journal', (e) => renderJournal(JSON.parse(e.data)));
 }
 
 // ---------- live journal ----------
@@ -289,12 +188,6 @@ function renderJournal(d) {
   const s = d.stats;
   const box = (val, lbl) => `<div class="bt-box"><div class="big" style="font-size:20px">${val}</div><div class="lbl">${lbl}</div></div>`;
   let html = box(wr(s.overall), 'general (toate)') + box(wr(s.sniper), '🎯 doar Sniper') + `<div class="bt-box"><div class="big" style="font-size:20px">${s.pending}</div><div class="lbl">în așteptare</div></div>`;
-  if (s.byInterval) {
-    html += box(wr(s.byInterval['10 minute']), 'fereastră 10 min') + box(wr(s.byInterval['30 minute']), 'fereastră 30 min');
-  }
-  if (s.recentInterval && s.recentInterval.tenMin && s.recentInterval.tenMin.n) {
-    html += box(wr(s.recentInterval.tenMin), '10 min (recent 20)');
-  }
   for (const [sym, o] of Object.entries(s.sniperBySymbol || {})) {
     if (o.n) html += box(wr(o), `🎯 ${sym}`);
   }
@@ -349,17 +242,8 @@ async function loadState() {
   $('symbols').value = (c.symbols || []).join('\n');
   $('scanInterval').value = c.scanIntervalSec;
   $('alertMinConfidence').value = c.alertMinConfidence;
-  SNIPER_MODE = c.sniperMode !== false;
-  if (Array.isArray(c.activeHoursUTC) && c.activeHoursUTC.length) ACTIVE_HOURS = c.activeHoursUTC;
-  updateSessionBadge();
   $('sniperMode').checked = c.sniperMode !== false;
-  $('sniperRequireVolume').checked = !!c.sniperRequireVolume;
-  $('adaptiveInterval').checked = c.adaptiveInterval !== false;
-  if (c.payout10) $('payout10').value = c.payout10;
-  if (c.payout30) $('payout30').value = c.payout30;
-  $('useOrderFlow').checked = c.useOrderFlow !== false;
-  $('requireOfAgree').checked = !!c.requireOfAgree;
-  $('useLearning').checked = c.useLearning !== false;
+  $('sniperRequireVolume').checked = c.sniperRequireVolume !== false;
   const localHours = (c.activeHoursUTC || []).map(utcToLocal).sort((a, b) => a - b);
   $('activeHoursLocal').value = localHours.join(',');
   const nowUtc = new Date().getUTCHours();
@@ -384,12 +268,6 @@ async function saveSettings() {
     alertMinConfidence: $('alertMinConfidence').value,
     sniperMode: $('sniperMode').checked,
     sniperRequireVolume: $('sniperRequireVolume').checked,
-    adaptiveInterval: $('adaptiveInterval').checked,
-    payout10: Number($('payout10').value),
-    payout30: Number($('payout30').value),
-    useOrderFlow: $('useOrderFlow').checked,
-    requireOfAgree: $('requireOfAgree').checked,
-    useLearning: $('useLearning').checked,
     activeHoursUTC,
     gemini: {
       enabled: $('geminiEnabled').checked,
@@ -458,5 +336,3 @@ if (!mobileRuntime && 'Notification' in window && Notification.permission === 'd
 
 loadState();
 connect();
-updateSessionBadge();
-setInterval(updateSessionBadge, 60000);

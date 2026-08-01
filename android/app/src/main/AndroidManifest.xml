@@ -6,7 +6,7 @@
 
     <application
         android:allowBackup="false"
-        android:label="SignalPilot"
+        android:label="SignalPilot 3001"
         android:networkSecurityConfig="@xml/network_security_config"
         android:supportsRtl="true"
         android:theme="@style/AppTheme"

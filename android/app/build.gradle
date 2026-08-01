@@ -3,15 +3,15 @@ plugins {
 }
 
 android {
-    namespace 'com.signalpilot.app'
+    namespace 'com.signalpilot.localhost3001'
     compileSdk 35
 
     defaultConfig {
-        applicationId 'com.signalpilot.app'
+        applicationId 'com.signalpilot.localhost3001'
         minSdk 26
         targetSdk 35
         versionCode 1
-        versionName '1.0.0'
+        versionName '1.0.0-3001'
     }
 
     sourceSets {
@@ -32,7 +32,7 @@ android {
     }
 }
 
-// Keep the browser bundle synchronized with lib/*.js before every APK build.
+// Keep the browser bundle synchronized with classic/lib/*.js before every APK build.
 tasks.register('buildMobileCore', Exec) {
     workingDir rootProject.projectDir.parentFile
     commandLine 'node', 'scripts/build-mobile-core.js'
