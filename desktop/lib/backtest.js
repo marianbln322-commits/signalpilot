@@ -244,6 +244,7 @@ async function run({ symbol, days = 7, minQuality10 = 65, minQuality30 = 68, pay
       if (entry.openTime <= prediction.generatedAt || exit.closeTime !== timing.expiryCloseTime) throw new Error('backtest timing invariant failed');
       const win = prediction.direction === 'UP' ? exit.close > entry.open : exit.close < entry.open;
       results.push({
+        engineVersion: prediction.engineVersion,
         signalKey: prediction.signalKey, horizonMin: prediction.horizonMin, direction: prediction.direction, quality: prediction.quality,
         generatedAt: prediction.generatedAt, signalCloseTime: prediction.latestClosedCandleTime,
         entryOpenTime: entry.openTime, entryPrice: entry.open,
@@ -260,10 +261,10 @@ async function run({ symbol, days = 7, minQuality10 = 65, minQuality30 = 68, pay
     '30m': summarize(results.filter((item) => item.horizonMin === 30), payout30),
   };
   const result = {
-    symbol, days: safeDays, source: SOURCE,
+    symbol, days: safeDays, source: SOURCE, engineVersion: engine.ENGINE_VERSION,
     proxyDisclosure: 'Datele sunt Binance Vision proxy/in-sample și pot diferi de MEXC; rezultatul istoric nu prezice sigur semnalul curent.',
     methodology: 'Replay event-time cu closeTime<=T; intrare numai la primul 1m open strict după generatedAt; expirare la closeTime exact al minutei finale. Boundary lipsă = invalid, fără substituție.',
-    fixedParameters: { minQuality10, minQuality30, payout10, payout30, adaptiveTuning: false },
+    fixedParameters: { engineVersion: engine.ENGINE_VERSION, minQuality10, minQuality30, payout10, payout30, adaptiveTuning: false },
     totalOneMinuteCandles: oneMinute.length,
     coverage: history.coverage,
     evaluationWindow: {

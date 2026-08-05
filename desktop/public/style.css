@@ -15,7 +15,7 @@ main { max-width:1200px; margin:22px auto; padding:0 20px 60px; display:flex; fl
 @media (max-width:760px) { header { align-items:flex-start; flex-direction:column; }.prediction-grid,.form-grid { grid-template-columns:1fr; }.details { grid-template-columns:75px 1fr; } }
 
 
-.observed-rate { margin:0 0 9px; padding:7px 9px; border-radius:7px; color:#c7bfff; background:rgba(109,94,252,.12); font-size:11.5px; line-height:1.4; }
+.observed-rate { margin:0 0 9px; padding:7px 9px; border-radius:7px; color:#c7bfff; background:rgba(109,94,252,.12); font-size:11.5px; line-height:1.4; }.bias-line { margin:-3px 0 8px; color:var(--muted); font-size:11.5px; }.bias-line .UP { color:var(--up); }.bias-line .DOWN { color:var(--down); }.bias-line .NEUTRAL { color:var(--wait); }
 .charts { margin-top:12px; display:flex; flex-direction:column; gap:8px; }.chart-caption { color:var(--muted); font-size:11px; }.chart { overflow:hidden; border:1px solid var(--border); border-radius:8px; background:#0d1117; }.chart-label { display:flex; justify-content:space-between; gap:8px; padding:6px 8px 0; color:var(--muted); font-size:10.5px; }.chart-label b { color:var(--text); }.chart svg { display:block; width:100%; height:150px; }.chart-empty { padding:10px; border:1px dashed var(--border); border-radius:8px; color:var(--muted); font-size:11px; }
 
 .analysis-badges { display:flex; flex-wrap:wrap; gap:5px; padding:6px 8px 0; }.analysis-badge { padding:3px 6px; border:1px solid var(--border); border-radius:999px; color:var(--muted); background:rgba(255,255,255,.03); font-size:9.5px; }.analysis-badge.UP { color:var(--up); border-color:rgba(22,199,132,.4); }.analysis-badge.DOWN { color:var(--down); border-color:rgba(234,57,67,.4); }.analysis-badge.NEUTRAL { color:var(--wait); }

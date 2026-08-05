@@ -12,6 +12,7 @@ const { chooseEstimate } = require('./lib/calibration');
 
 const HOST = '127.0.0.1';
 const PORT = 3009;
+const APP_BUILD = expertEngine.ENGINE_VERSION;
 const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const JOURNAL_FILE = path.join(DATA_DIR, 'journal.json');
@@ -59,7 +60,7 @@ function loadConfig() {
 }
 
 let config = loadConfig();
-const journal = new Journal(JOURNAL_FILE);
+const journal = new Journal(JOURNAL_FILE, expertEngine.ENGINE_VERSION);
 const state = {
   startedAt: Date.now(), scanning: false, lastScanStartedAt: null, lastScanCompletedAt: null,
   scanClock: null, latest: {}, errors: {}, alerts: [], backtests: {}, backtestProgress: null,
@@ -77,7 +78,8 @@ function probabilityEstimate(symbol, prediction, journalState) {
   const forward = journalState.calibration && journalState.calibration.bySymbol
     ? journalState.calibration.bySymbol[symbol] : null;
   const backtestResult = state.backtests[symbol];
-  const backtest = backtestResult && backtestResult.calibration;
+  const backtest = backtestResult && backtestResult.engineVersion === prediction.engineVersion
+    ? backtestResult.calibration : null;
   const estimate = chooseEstimate({
     verdict: prediction.direction || prediction.verdict,
     horizonMin: prediction.horizonMin,
@@ -114,7 +116,8 @@ function publicState() {
     }])),
   }]));
   return {
-    app: 'SignalPilot Expert', endpoint: `http://${HOST}:${PORT}`, aliases: [...ALLOWED_ORIGINS], config,
+    app: 'SignalPilot Expert', build: APP_BUILD,
+    endpoint: `http://${HOST}:${PORT}`, aliases: [...ALLOWED_ORIGINS], config,
     status: {
       startedAt: state.startedAt, scanning: state.scanning,
       lastScanStartedAt: state.lastScanStartedAt, lastScanCompletedAt: state.lastScanCompletedAt,

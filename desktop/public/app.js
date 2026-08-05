@@ -35,7 +35,16 @@ function metadataTable(metadata) {
   return `<table class="meta-table"><thead><tr><th>TF</th><th>last open</th><th>last close</th><th>age / limită</th><th>status</th><th>gaps</th><th>sursă</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 function triggerText(trigger) {
-  return trigger ? `${trigger.type} [${trigger.timeframe}] · ${trigger.detail} · close ${formatTime(trigger.closeTime)} · age ${formatAge(trigger.ageMs)}` : 'niciun trigger recent eligibil';
+  return trigger ? `${trigger.type} [${trigger.timeframe}] · ${trigger.direction} · ${trigger.detail} · close ${formatTime(trigger.closeTime)} · age ${formatAge(trigger.ageMs)}` : 'niciun trigger unic selectat';
+}
+function triggerCandidatesText(prediction) {
+  return (prediction.triggerCandidates || []).map((trigger) => `${trigger.type} ${trigger.direction} [${trigger.timeframe}] · strength ${trigger.strength} · age ${formatAge(trigger.ageMs)}`);
+}
+function frameBiasText(prediction) {
+  return (prediction.frameBiases || []).map((item) => `${item.timeframe}: ${item.state} (UP ${item.up} / DOWN ${item.down})`);
+}
+function qualityLedgerText(prediction) {
+  return Object.entries(prediction.qualityComponents || {}).map(([name, value]) => `${name} ${value >= 0 ? '+' : ''}${formatNumber(value)}`);
 }
 function analysisSummary(analyses) {
   return Object.entries(analyses || {}).map(([timeframe, item]) => `${timeframe}: trend ${item.trend}, RSI ${formatNumber(item.rsi)}, MACD ${item.momentum}, ATR ${formatNumber(item.atrPct, 3)}%, volum ${formatNumber(item.volumeRatio)}x, range ${formatNumber(item.rangePosition, 3)}, structură ${item.structure}`).join(' | ');
@@ -78,8 +87,8 @@ function candleChart(timeframe, chartState, trigger, analysis) {
   const triggerEvents = Array.isArray(analysis && analysis.triggers) ? analysis.triggers : [];
   const candlesSvg = visible.map((candle, index) => {
     const center = x(index);
-    const bullish = candle.close >= candle.open;
-    const color = bullish ? '#16c784' : '#ea3943';
+    const candleDirection = candle.close > candle.open ? 'UP' : candle.close < candle.open ? 'DOWN' : 'NEUTRAL';
+    const color = candleDirection === 'UP' ? '#16c784' : candleDirection === 'DOWN' ? '#ea3943' : '#8b949e';
     const openY = y(candle.open);
     const closeY = y(candle.close);
     const events = triggerEvents.filter((item) => item.timeframe === timeframe && item.closeTime === candle.closeTime);
@@ -118,21 +127,27 @@ function predictionCard(_symbol, prediction, chartData) {
   const action = prediction.action === 'ENTER' && direction ? 'ENTER' : 'WAIT';
   const visual = direction || 'WAIT';
   const bias = ['UP', 'DOWN', 'NEUTRAL'].includes(prediction.bias) ? prediction.bias : 'NEUTRAL';
-  const decision = action === 'ENTER' ? `ENTER ${direction}` : `WAIT · bias ${bias}`;
+  const decision = action === 'ENTER' ? `ENTER ${direction}` : 'WAIT — NU INTRA';
+  const qualityContext = action === 'ENTER' ? 'confluență eligibilă' : 'confluență descriptivă, intrare blocată';
   const reasons = (prediction.reasonCodes || []).map((code) => `<span class="reason">${safe(code)}</span>`).join('');
   return `<article class="card ${safe(visual)}">
-    <div class="card-top"><span class="horizon">Intrare ${safe(prediction.horizonMin)} minute</span><span class="quality">quality/confluence <b>${safe(prediction.quality)}/100</b> · nu probabilitate</span></div>
-    <div class="verdict ${safe(visual)}">${safe(decision)}</div><div class="observed-rate">${safe(probabilityText(prediction))}</div><div class="reason-codes">${reasons}</div>
+    <div class="card-top"><span class="horizon">Intrare ${safe(prediction.horizonMin)} minute</span><span class="quality">${safe(qualityContext)} <b>${safe(prediction.quality)}/100</b> · nu probabilitate</span></div>
+    <div class="verdict ${safe(visual)}">${safe(decision)}</div><div class="bias-line">Context direcțional curent: <b class="${safe(bias)}">${safe(bias)}</b>. Numai textul ENTER este semnal.</div><div class="observed-rate">${safe(probabilityText(prediction))}</div><div class="reason-codes">${reasons}</div>
     ${horizonCharts(prediction, chartData)}
     <div class="details">
-      <b>Bias observat</b><span>${safe(prediction.bias || 'NEUTRAL')} · nu este instrucțiune de intrare cât timp acțiunea este WAIT</span>
-      <b>Trigger</b><span>${safe(triggerText(prediction.trigger))}</span>
+      <b>Context, nu semnal</b><span>${safe(bias)} · nu este instrucțiune cât timp scrie WAIT</span>
+      <b>Scor UP/DOWN</b><span>UP ${safe(formatNumber(prediction.directionScores && prediction.directionScores.up))} / DOWN ${safe(formatNumber(prediction.directionScores && prediction.directionScores.down))} · agregat ${safe(prediction.directionScores && prediction.directionScores.aggregate || '—')} · marjă ${safe(formatNumber(prediction.directionScores && prediction.directionScores.margin))}</span>
+      <b>Bias pe TF</b><span>${list(frameBiasText(prediction))}</span>
+      <b>Trigger selectat</b><span>${safe(triggerText(prediction.trigger))}</span>
+      <b>Candidați top</b><span>${list(triggerCandidatesText(prediction), 'niciun candidat top')}</span>
+      <b>Selecție trigger</b><span>${safe(prediction.triggerSelection && prediction.triggerSelection.rule || '—')} · tie direcțional ${safe(prediction.triggerSelection && prediction.triggerSelection.directionTie ? 'DA — WAIT' : 'nu')}</span>
       <b>Trigger age</b><span>${safe(formatAge(prediction.triggerAgeMs))} / fereastră ${safe(formatAge(prediction.triggerWindowMs))}</span>
       <b>TF confirmă</b><span>${safe((prediction.confirmingTimeframes || []).join(', ') || '—')}</span>
       <b>TF opun</b><span>${safe((prediction.opposingTimeframes || []).join(', ') || '—')}</span>
       <b>Entry boundary</b><span>${safe(formatTime(prediction.entryBoundaryOpenTime))} · primul 1m open strict după generatedAt</span>
       <b>Expiry</b><span>${safe(formatTime(prediction.expiryEstimateCloseTime))} · closeTime exact al minutei finale</span>
       <b>Gate checks</b><span>${gateTable(prediction.gateChecks)}</span>
+      <b>Ledger confluență</b><span>${list(qualityLedgerText(prediction))}</span>
       <b>Confirmări</b><span>${safe((prediction.confirmations || []).join(', ') || '—')}</span>
       <b>Dovezi</b><span>${list(prediction.evidence)}</span>
       <b>Conflicte</b><span>${list(prediction.conflicts, 'niciun conflict explicit')}</span>
@@ -166,8 +181,9 @@ function renderJournal(journal) {
   currentForwardCalibration = journal.calibration;
   byId('journalStats').innerHTML = aggregateBox('overall', stats.overall)
     + aggregateBox('10m', stats.byHorizon['10m']) + aggregateBox('30m', stats.byHorizon['30m'])
-    + aggregateBox('UP', stats.byDirection.UP) + aggregateBox('DOWN', stats.byDirection.DOWN)
-    + `<div class="stat"><strong>${safe(stats.pending)}</strong><span>pending · invalid excluse ${safe(stats.invalid)}</span></div>`;
+    + aggregateBox('UP rezolvate', stats.byDirection.UP) + aggregateBox('DOWN rezolvate', stats.byDirection.DOWN)
+    + `<div class="stat"><strong>${safe(stats.issuedByDirection ? stats.issuedByDirection.UP : 0)} / ${safe(stats.issuedByDirection ? stats.issuedByDirection.DOWN : 0)}</strong><span>ENTER emise UP / DOWN · fără țintă artificială 50/50</span></div>`
+    + `<div class="stat"><strong>${safe(stats.pending)}</strong><span>pending · invalid excluse ${safe(stats.invalid)} · istoric alt motor exclus ${safe(stats.excludedOtherEngineVersions || 0)}</span></div>`;
   const rows = (journal.recent || []).map((entry) => {
     const result = entry.status === 'resolved' ? (entry.win ? 'WIN' : 'LOSS') : entry.status === 'invalid' ? `INVALID: ${entry.invalidReason}` : 'PENDING';
     return `<div class="jrow"><span><b>${safe(entry.symbol)}</b> · ${safe(entry.horizonMin)}m · <span class="${safe(entry.direction)}">${safe(entry.direction)}</span> · quality ${safe(entry.quality)}<br><span class="muted">entry ${safe(formatTime(entry.entryOpenTime))} ${safe(formatNumber(entry.entryPrice, 8))} → expiry ${safe(formatTime(entry.targetCloseTime))} ${safe(formatNumber(entry.exitPrice, 8))}</span></span><b>${safe(result)}</b></div>`;
@@ -175,11 +191,13 @@ function renderJournal(journal) {
   byId('journalRows').innerHTML = rows || '<p class="muted">Niciun semnal deduplicat încă.</p>';
 }
 function alertRow(alert) {
-  const direction = alert.direction || alert.verdict;
-  return `<div class="alert"><span><b>${safe(alert.symbol)}</b> · ${safe(alert.horizonMin)}m · <span class="${safe(direction)}">ENTER ${safe(direction)}</span> · quality ${safe(alert.quality)} · ${safe(triggerText(alert.trigger))}</span><span class="muted">${safe(formatTime(alert.generatedAt))}</span></div>`;
+  const direction = alert && alert.direction;
+  if (!alert || alert.action !== 'ENTER' || !['UP', 'DOWN'].includes(direction)) return '';
+  return `<div class="alert"><span><b>${safe(alert.symbol)}</b> · ${safe(alert.horizonMin)}m · <span class="${safe(direction)}">ENTER ${safe(direction)}</span> · confluență ${safe(alert.quality)} · ${safe(triggerText(alert.trigger))}</span><span class="muted">${safe(formatTime(alert.generatedAt))}</span></div>`;
 }
 function renderAlerts(alerts) {
-  byId('alerts').innerHTML = alerts && alerts.length ? alerts.map(alertRow).join('') : '<p class="muted">WAIT nu generează alertă. Aștept un semnal care trece toate porțile.</p>';
+  const validAlerts = (alerts || []).filter((alert) => alert && alert.action === 'ENTER' && ['UP', 'DOWN'].includes(alert.direction));
+  byId('alerts').innerHTML = validAlerts.length ? validAlerts.map(alertRow).join('') : '<p class="muted">WAIT nu generează alertă. Aștept un ENTER care trece toate porțile.</p>';
 }
 function renderErrors(errors) {
   byId('scanErrors').innerHTML = Object.entries(errors || {}).map(([symbol, error]) => `<div>${safe(symbol)} · ${safe(formatTime(error.at))}: ${safe(error.message)} · rezultat vechi eliminat</div>`).join('');
@@ -208,7 +226,7 @@ function renderState(state) {
   const clock = state.status && state.status.scanClock;
   byId('clockBadge').textContent = clock ? (clock.failClosed ? 'Clock neverificat · fără ENTER' : `publicat ${formatTime(clock.publishedAtCorrected || clock.asOf)}`) : 'asOf —';
   byId('clockBadge').className = `badge ${clock && clock.failClosed ? 'badge-off' : ''}`;
-  byId('sourceLine').textContent = clock ? `Clock: ${clock.source} · skew ${clock.localSkewMs}ms · RTT ${clock.roundTripMs}ms${clock.warning ? ` · fallback: ${clock.warning}` : ''}` : 'Aștept primul scan…';
+  byId('sourceLine').textContent = clock ? `Build ${state.build || '—'} · Clock: ${clock.source} · skew ${clock.localSkewMs}ms · RTT ${clock.roundTripMs}ms${clock.warning ? ` · fallback: ${clock.warning}` : ''}` : `Build ${state.build || '—'} · aștept primul scan…`;
   const progress = state.status && state.status.backtestProgress;
   if (progress) byId('btStatus').textContent = `${progress.phase}: ${progress.percent}%`;
 }
@@ -286,7 +304,11 @@ stream.addEventListener('scan-complete', (event) => {
   renderState(state);
   if (Array.isArray(state.newAlerts) && state.newAlerts.length > 0) beep();
 });
-stream.addEventListener('alert', (event) => { const alert = JSON.parse(event.data); byId('alerts').insertAdjacentHTML('afterbegin', alertRow(alert)); beep(); });
+stream.addEventListener('alert', (event) => {
+  const alert = JSON.parse(event.data);
+  const row = alertRow(alert);
+  if (row) { byId('alerts').insertAdjacentHTML('afterbegin', row); beep(); }
+});
 stream.addEventListener('config', (event) => fillConfig(JSON.parse(event.data)));
 stream.addEventListener('backtest-progress', (event) => { const progress = JSON.parse(event.data); byId('btStatus').textContent = `${progress.phase}: ${progress.percent}%`; });
 loadState().catch((error) => { byId('scanErrors').textContent = error.message; });

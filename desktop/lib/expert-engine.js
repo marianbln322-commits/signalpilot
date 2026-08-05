@@ -3,6 +3,7 @@
 const { contractBoundaries } = require('./contract-timing');
 
 const ANALYSIS_CANDLE_COUNT = 300;
+const ENGINE_VERSION = 'direction-balanced-v2';
 
 const HORIZONS = Object.freeze({
   10: { minutes: 10, execution: ['1m', '5m'], context: ['15m'], triggerFrames: ['1m', '5m'], triggerMaxAgeMs: 10 * 60_000 },
@@ -24,6 +25,13 @@ function ema(values, period) {
   return output;
 }
 
+function rsiFromAverages(avgGain, avgLoss) {
+  if (avgGain === 0 && avgLoss === 0) return 50;
+  if (avgLoss === 0) return 100;
+  if (avgGain === 0) return 0;
+  return 100 - (100 / (1 + avgGain / avgLoss));
+}
+
 function rsi(values, period = 14) {
   if (values.length < period + 1) return null;
   const output = new Array(values.length).fill(null);
@@ -36,12 +44,12 @@ function rsi(values, period = 14) {
   }
   let avgGain = gains / period;
   let avgLoss = losses / period;
-  output[period] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+  output[period] = rsiFromAverages(avgGain, avgLoss);
   for (let i = period + 1; i < values.length; i += 1) {
     const delta = values[i] - values[i - 1];
     avgGain = (avgGain * (period - 1) + Math.max(0, delta)) / period;
     avgLoss = (avgLoss * (period - 1) + Math.max(0, -delta)) / period;
-    output[i] = avgLoss === 0 ? 100 : 100 - (100 / (1 + avgGain / avgLoss));
+    output[i] = rsiFromAverages(avgGain, avgLoss);
   }
   return output;
 }
@@ -109,7 +117,10 @@ function detectTriggers(candles, atrSeries, timeframe) {
     if (candle.close < priorLow && body >= currentAtr * 0.45) push('BREAKOUT', 'DOWN', 4, `close sub range-ul ultimelor 20 lumânări; volum ${round(volumeRatio)}x`, priorLow);
     if (candle.low < priorLow && candle.close > priorLow && lowerWick / candleRange >= 0.35) push('LIQUIDITY_SWEEP_RECLAIM', 'UP', 5, 'sweep sub minimul recent urmat de reclaim la close', priorLow);
     if (candle.high > priorHigh && candle.close < priorHigh && upperWick / candleRange >= 0.35) push('LIQUIDITY_SWEEP_RECLAIM', 'DOWN', 5, 'sweep peste maximul recent urmat de reclaim la close', priorHigh);
-    if (body >= currentAtr * 1.2 && volumeRatio >= 1.1) push('DISPLACEMENT', candle.close > candle.open ? 'UP' : 'DOWN', 4, `corp ${round(body / currentAtr)} ATR; volum ${round(volumeRatio)}x`);
+    const displacementDirection = candle.close > candle.open ? 'UP' : candle.close < candle.open ? 'DOWN' : 'NEUTRAL';
+    if (currentAtr > 0 && body >= currentAtr * 1.2 && volumeRatio >= 1.1 && displacementDirection !== 'NEUTRAL') {
+      push('DISPLACEMENT', displacementDirection, 4, `corp ${round(body / currentAtr)} ATR; volum ${round(volumeRatio)}x`);
+    }
     const bullishEngulf = candle.close > candle.open && previous.close < previous.open && candle.open <= previous.close && candle.close >= previous.open;
     const bearishEngulf = candle.close < candle.open && previous.close > previous.open && candle.open >= previous.close && candle.close <= previous.open;
     if (bullishEngulf) push('ENGULFING', 'UP', 3, 'bullish engulfing pe lumânări închise');
@@ -164,18 +175,25 @@ function analyzeTimeframe(candles, timeframe) {
   const structure = recentHigh > olderHigh && recentLow > olderLow ? 'UP' : recentHigh < olderHigh && recentLow < olderLow ? 'DOWN' : 'NEUTRAL';
   const trendValue = (last(ema9) - last(ema20)) + (last(ema20) - last(ema50));
   const trend = directionLabel(trendValue, candle.close * 0.00035);
-  const momentum = currentRsi >= 55 && histogram > 0 && histogram >= previousHistogram ? 'UP'
-    : currentRsi <= 45 && histogram < 0 && histogram <= previousHistogram ? 'DOWN' : 'NEUTRAL';
+  const macdDeadZone = Math.max(Number.EPSILON, candle.close * 1e-8);
+  const histogramDelta = histogram - previousHistogram;
+  const momentum = currentRsi >= 55 && histogram > macdDeadZone && histogramDelta >= -macdDeadZone ? 'UP'
+    : currentRsi <= 45 && histogram < -macdDeadZone && histogramDelta <= macdDeadZone ? 'DOWN' : 'NEUTRAL';
   const volatilityPct = currentAtr / candle.close;
   const volatility = volatilityPct >= 0.0005 && volatilityPct <= 0.05 ? 'USABLE' : 'UNUSABLE';
+  const volumeDirection = volumeRatio < 1.15 ? 'NEUTRAL'
+    : candle.close > previous.close ? 'UP' : candle.close < previous.close ? 'DOWN' : 'NEUTRAL';
   return {
     timeframe, closeTime: candle.closeTime, price: candle.close, usedCandleCount: candles.length,
     ema: { fast: round(last(ema9), 8), medium: round(last(ema20), 8), slow: round(last(ema50), 8) },
     overlay: { rangeHigh: round(rangeHigh, 8), rangeLow: round(rangeLow, 8), lastClose: round(candle.close, 8) },
     trend, trendStrengthPct: round(Math.abs(last(ema9) - last(ema50)) / candle.close * 100, 3),
-    rsi: round(currentRsi), macd: { histogram: round(histogram, 8), accelerating: Math.abs(histogram) >= Math.abs(previousHistogram || 0) },
+    rsi: round(currentRsi), macd: {
+      histogram: round(histogram, 8), deadZone: round(macdDeadZone, 8),
+      accelerating: Math.abs(histogramDelta) <= macdDeadZone || Math.abs(histogram) >= Math.abs(previousHistogram || 0),
+    },
     momentum, atr: round(currentAtr, 8), atrPct: round(volatilityPct * 100, 3), volatility,
-    volumeRatio: round(volumeRatio), volume: volumeRatio >= 1.15 ? (candle.close >= previous.close ? 'UP' : 'DOWN') : 'NEUTRAL',
+    volumeRatio: round(volumeRatio), volume: volumeDirection,
     rangePosition: round(rangePosition, 3), structure,
     triggers: detectTriggers(candles, atrSeries, timeframe),
   };
@@ -206,6 +224,24 @@ function directionalComponents(analysis, direction) {
   return score;
 }
 
+function frameDirectionalBias(analysis) {
+  const up = directionalComponents(analysis, 'UP');
+  const down = directionalComponents(analysis, 'DOWN');
+  const dominant = up >= 2 && up > down ? 'UP' : down >= 2 && down > up ? 'DOWN' : 'NEUTRAL';
+  const state = dominant !== 'NEUTRAL' ? dominant : up >= 2 && down >= 2 && up === down ? 'AMBIVALENT' : 'NEUTRAL';
+  return { timeframe: analysis.timeframe, up, down, dominant, state };
+}
+
+function selectTriggerCandidate(recentTriggers) {
+  if (!recentTriggers.length) return { selected: null, top: [], directionTie: false };
+  const newestCloseTime = recentTriggers[0].closeTime;
+  const newest = recentTriggers.filter((trigger) => trigger.closeTime === newestCloseTime);
+  const strongest = Math.max(...newest.map((trigger) => trigger.strength));
+  const top = newest.filter((trigger) => trigger.strength === strongest);
+  const directions = [...new Set(top.map((trigger) => trigger.direction))];
+  return { selected: directions.length === 1 ? top[0] : null, top, directionTie: directions.length > 1 };
+}
+
 function addGate(gates, reasonCodes, code, pass, detail) {
   gates.push({ code, pass, detail });
   if (!pass) reasonCodes.push(code);
@@ -226,17 +262,23 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   const recentTriggers = spec.triggerFrames
     .flatMap((timeframe) => analyses[timeframe].triggers)
     .filter((trigger) => trigger.closeTime <= asOf && asOf - trigger.closeTime <= spec.triggerMaxAgeMs)
-    .sort((a, b) => b.closeTime - a.closeTime || b.strength - a.strength);
-  const bestTrigger = recentTriggers[0] || null;
-  addGate(gateChecks, reasonCodes, 'TRIGGER_MISSING_OR_STALE', Boolean(bestTrigger), bestTrigger
-    ? `${bestTrigger.type} ${bestTrigger.direction} ${bestTrigger.timeframe}, age ${Math.max(0, asOf - bestTrigger.closeTime)}ms`
+    .sort((a, b) => b.closeTime - a.closeTime || b.strength - a.strength
+      || a.timeframe.localeCompare(b.timeframe) || a.type.localeCompare(b.type));
+  const triggerSelection = selectTriggerCandidate(recentTriggers);
+  const bestTrigger = triggerSelection.selected;
+  const representativeTrigger = bestTrigger || triggerSelection.top[0] || null;
+  addGate(gateChecks, reasonCodes, 'TRIGGER_MISSING_OR_STALE', recentTriggers.length > 0, representativeTrigger
+    ? `${recentTriggers.length} trigger(e) eligibile; cel mai nou close ${representativeTrigger.closeTime}`
     : `niciun trigger în ultimele ${spec.triggerMaxAgeMs / 60_000} minute`);
+  addGate(gateChecks, reasonCodes, 'TRIGGER_DIRECTION_TIE', !triggerSelection.directionTie, triggerSelection.directionTie
+    ? `trigger-ele de rang maxim au direcții opuse: ${triggerSelection.top.map((trigger) => `${trigger.type} ${trigger.direction} ${trigger.timeframe}`).join(' | ')}`
+    : bestTrigger ? `${bestTrigger.type} ${bestTrigger.direction} ${bestTrigger.timeframe} selectat fără tie direcțional` : 'fără candidat selectabil');
   const candidate = bestTrigger ? bestTrigger.direction : 'WAIT';
   const opposingTriggers = bestTrigger ? recentTriggers.filter((trigger) => trigger.direction !== candidate) : [];
   const materialOpposing = bestTrigger ? opposingTriggers.find((trigger) => trigger.strength >= bestTrigger.strength - 1) : null;
   addGate(gateChecks, reasonCodes, 'TRIGGER_CONFLICT', !materialOpposing, materialOpposing
     ? `${materialOpposing.type} ${materialOpposing.direction} ${materialOpposing.timeframe}, strength ${materialOpposing.strength}`
-    : 'fără trigger opus material în fereastra relevantă');
+    : triggerSelection.directionTie ? 'conflictul co-egal este tratat separat, fail-closed' : 'fără trigger opus material în fereastra relevantă');
 
   let bullish = 0;
   let bearish = 0;
@@ -253,27 +295,26 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   }
   const margin = round(Math.abs(bullish - bearish));
   const aggregateDirection = bullish > bearish ? 'UP' : bearish > bullish ? 'DOWN' : 'WAIT';
-  const confirmingTimeframes = candidate === 'WAIT' ? [] : execution.filter((analysis) => directionalComponents(analysis, candidate) >= 2).map((analysis) => analysis.timeframe);
-  const opposingTimeframes = candidate === 'WAIT' ? [] : execution.filter((analysis) => directionalComponents(analysis, candidate === 'UP' ? 'DOWN' : 'UP') >= 2).map((analysis) => analysis.timeframe);
+  const frameBiases = execution.map(frameDirectionalBias);
+  const opposite = candidate === 'UP' ? 'DOWN' : 'UP';
+  const confirmingTimeframes = candidate === 'WAIT' ? []
+    : frameBiases.filter((item) => item.dominant === candidate).map((item) => item.timeframe);
+  const opposingTimeframes = candidate === 'WAIT' ? []
+    : frameBiases.filter((item) => item.dominant === opposite).map((item) => item.timeframe);
+  const ambivalentTimeframes = frameBiases.filter((item) => item.state === 'AMBIVALENT').map((item) => item.timeframe);
   addGate(gateChecks, reasonCodes, 'EXECUTION_TF_CONFIRMATIONS_LT_2', confirmingTimeframes.length >= 2,
-    `${confirmingTimeframes.length}/${execution.length} TF distincte confirmă: ${confirmingTimeframes.join(', ') || 'niciunul'}`);
-  const frameBiases = execution.map((analysis) => ({
-    timeframe: analysis.timeframe,
-    up: directionalComponents(analysis, 'UP'),
-    down: directionalComponents(analysis, 'DOWN'),
-  }));
-  const hasUpFrame = frameBiases.some((item) => item.up >= 2 && item.up > item.down);
-  const hasDownFrame = frameBiases.some((item) => item.down >= 2 && item.down > item.up);
+    `${confirmingTimeframes.length}/${execution.length} TF dominante confirmă: ${confirmingTimeframes.join(', ') || 'niciunul'}${ambivalentTimeframes.length ? `; ambivalente: ${ambivalentTimeframes.join(', ')}` : ''}`);
+  const hasUpFrame = frameBiases.some((item) => item.dominant === 'UP');
+  const hasDownFrame = frameBiases.some((item) => item.dominant === 'DOWN');
   const materialExecutionConflict = hasUpFrame && hasDownFrame;
   addGate(gateChecks, reasonCodes, 'EXECUTION_TF_CONFLICT', !materialExecutionConflict,
-    materialExecutionConflict ? 'TF-urile de execuție au biasuri materiale opuse' : 'fără conflict material între TF-urile de execuție');
+    materialExecutionConflict ? 'TF-urile de execuție au biasuri dominante opuse' : 'fără conflict dominant între TF-urile de execuție');
   const unusableFrames = execution.filter((analysis) => analysis.volatility !== 'USABLE').map((analysis) => analysis.timeframe);
-  const directionalFrames = frameBiases.filter((item) => Math.max(item.up, item.down) >= 2).length;
+  const directionalFrames = frameBiases.filter((item) => item.dominant !== 'NEUTRAL').length;
   const chopOrUnusable = unusableFrames.length > 0 || directionalFrames < 2;
   addGate(gateChecks, reasonCodes, 'CHOP_OR_VOLATILITY_UNUSABLE', !chopOrUnusable,
-    unusableFrames.length ? `volatilitate neutilizabilă: ${unusableFrames.join(', ')}` : directionalFrames < 2 ? 'chop: mai puțin de 2 TF au structură direcțională' : 'volatilitate și structură utilizabile');
+    unusableFrames.length ? `volatilitate neutilizabilă: ${unusableFrames.join(', ')}` : directionalFrames < 2 ? 'chop/ambivalență: mai puțin de 2 TF au bias dominant' : 'volatilitate și structură dominante utilizabile');
 
-  const opposite = candidate === 'UP' ? 'DOWN' : 'UP';
   const hardHigherConflict = candidate !== 'WAIT' && context.some((analysis) => analysis.trend === opposite
     && (analysis.momentum === opposite || analysis.structure === opposite) && analysis.trendStrengthPct >= 0.08);
   addGate(gateChecks, reasonCodes, 'HIGHER_TF_CONFLICT', !hardHigherConflict,
@@ -286,12 +327,16 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   const conflicts = [];
   const confirmations = new Set();
   if (candidate !== 'WAIT') {
+    const dominantConfirmingSet = new Set(confirmingTimeframes);
+    const dominantExecution = execution.filter((analysis) => dominantConfirmingSet.has(analysis.timeframe));
     for (const field of ['trend', 'momentum', 'structure', 'volume']) {
-      const frames = execution.filter((analysis) => analysis[field] === candidate).map((analysis) => analysis.timeframe);
-      if (frames.length) { confirmations.add(field); evidence.push(`${field} ${candidate}: ${frames.join(', ')}`); }
+      const frames = dominantExecution.filter((analysis) => analysis[field] === candidate).map((analysis) => analysis.timeframe);
+      if (frames.length) { confirmations.add(field); evidence.push(`${field} ${candidate} pe TF dominant: ${frames.join(', ')}`); }
     }
-    const rangeFrames = execution.filter((analysis) => candidate === 'UP' ? analysis.rangePosition >= 0.55 : analysis.rangePosition <= 0.45).map((analysis) => analysis.timeframe);
-    if (rangeFrames.length) { confirmations.add('range'); evidence.push(`range favorabil: ${rangeFrames.join(', ')}`); }
+    const rangeFrames = dominantExecution
+      .filter((analysis) => candidate === 'UP' ? analysis.rangePosition >= 0.55 : analysis.rangePosition <= 0.45)
+      .map((analysis) => analysis.timeframe);
+    if (rangeFrames.length) { confirmations.add('range'); evidence.push(`range favorabil pe TF dominant: ${rangeFrames.join(', ')}`); }
     opposingTimeframes.forEach((timeframe) => conflicts.push(`${timeframe}: confirmare materială ${opposite}`));
   }
   context.forEach((analysis) => {
@@ -299,27 +344,53 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
     else if (candidate !== 'WAIT' && analysis.trend !== 'NEUTRAL') conflicts.push(`${analysis.timeframe}: context trend ${analysis.trend}`);
   });
   if (materialOpposing) conflicts.push(`${materialOpposing.timeframe}: trigger opus ${materialOpposing.type}`);
+  if (triggerSelection.directionTie) conflicts.push(`trigger-ele de rang maxim sunt co-egale UP/DOWN; intrarea este blocată`);
+  ambivalentTimeframes.forEach((timeframe) => conflicts.push(`${timeframe}: scor direcțional ambivalent UP=DOWN`));
 
-  const quality = Math.max(0, Math.min(100, Math.round(
-    34 + (bestTrigger ? Math.min(18, bestTrigger.strength * 2) : 0)
-    + confirmingTimeframes.length * 10 + confirmations.size * 4 + Math.min(10, margin * 2)
-    + context.filter((analysis) => analysis.trend === candidate).length * 5
-    - opposingTimeframes.length * 7 - (materialOpposing ? 12 : 0) - (hardHigherConflict ? 20 : 0) - (chopOrUnusable ? 12 : 0)
-  )));
-  addGate(gateChecks, reasonCodes, 'QUALITY_BELOW_THRESHOLD', quality >= minQuality, `quality=${quality}, prag=${minQuality}`);
+  const contextAlignedCount = candidate === 'WAIT' ? 0 : context.filter((analysis) => analysis.trend === candidate).length;
+  const contextOpposedCount = candidate === 'WAIT' ? 0 : context.filter((analysis) => analysis.trend === opposite).length;
+  const qualityComponents = {
+    base: 34,
+    trigger: bestTrigger ? Math.min(18, bestTrigger.strength * 2) : 0,
+    dominantTimeframes: confirmingTimeframes.length * 10,
+    confirmationTypes: confirmations.size * 4,
+    directionalMargin: Math.min(10, margin * 2),
+    higherTimeframeSupport: contextAlignedCount * 5,
+    higherTimeframeOpposition: -contextOpposedCount * 5,
+    opposingTimeframes: -opposingTimeframes.length * 7,
+    opposingTrigger: materialOpposing ? -12 : 0,
+    triggerDirectionTie: triggerSelection.directionTie ? -20 : 0,
+    hardHigherTimeframeConflict: hardHigherConflict ? -20 : 0,
+    chopOrUnusable: chopOrUnusable ? -12 : 0,
+  };
+  const qualityRaw = Object.values(qualityComponents).reduce((sum, value) => sum + value, 0);
+  const quality = Math.max(0, Math.min(100, Math.round(qualityRaw)));
+  addGate(gateChecks, reasonCodes, 'QUALITY_BELOW_THRESHOLD', quality >= minQuality, `confluență=${quality}, prag=${minQuality}`);
   const uniqueReasonCodes = [...new Set(reasonCodes)];
   const verdict = uniqueReasonCodes.length ? 'WAIT' : candidate;
   const action = verdict === 'WAIT' ? 'WAIT' : 'ENTER';
   const direction = verdict === 'WAIT' ? null : verdict;
-  const bias = candidate !== 'WAIT' ? candidate : aggregateDirection === 'WAIT' ? 'NEUTRAL' : aggregateDirection;
+  const bias = triggerSelection.directionTie ? 'NEUTRAL'
+    : candidate !== 'WAIT' ? candidate : aggregateDirection === 'WAIT' ? 'NEUTRAL' : aggregateDirection;
   const latestCloseTime = Math.max(...spec.execution.map((timeframe) => analyses[timeframe].closeTime));
   const timing = contractBoundaries(generatedAt, horizon);
-  const signalKey = action === 'WAIT' || !bestTrigger ? null : `${symbol}:${horizon}m:${direction}:${bestTrigger.type}:${bestTrigger.closeTime}`;
+  const signalKey = action === 'WAIT' || !bestTrigger ? null
+    : `${ENGINE_VERSION}:${symbol}:${horizon}m:${direction}:${bestTrigger.timeframe}:${bestTrigger.type}:${bestTrigger.closeTime}`;
   return {
+    engineVersion: ENGINE_VERSION,
     symbol, horizonMin: horizon, action, direction, bias, verdict, quality,
-    qualityLabel: 'quality/confluence (nu probabilitate)', scoreMargin: margin,
+    qualityLabel: 'confluence score descriptiv (nu probabilitate)', qualityComponents,
+    directionScores: { up: round(bullish), down: round(bearish), margin, aggregate: aggregateDirection },
+    frameBiases, ambivalentTimeframes, scoreMargin: margin,
     reasonCodes: uniqueReasonCodes.length ? uniqueReasonCodes : ['SIGNAL_GATES_PASSED'], gateChecks,
     trigger: bestTrigger ? { ...bestTrigger, ageMs: Math.max(0, asOf - bestTrigger.closeTime) } : null,
+    triggerCandidates: triggerSelection.top.map((trigger) => ({ ...trigger, ageMs: Math.max(0, asOf - trigger.closeTime) })),
+    triggerSelection: {
+      rule: 'cel mai nou close, apoi strength maxim; tie UP/DOWN => WAIT',
+      directionTie: triggerSelection.directionTie,
+      eligibleCount: recentTriggers.length,
+      topCount: triggerSelection.top.length,
+    },
     triggerAgeMs: bestTrigger ? Math.max(0, asOf - bestTrigger.closeTime) : null,
     triggerWindowMs: spec.triggerMaxAgeMs,
     confirmingTimeframes, opposingTimeframes,
@@ -353,6 +424,7 @@ function analyzeSnapshot(snapshot, options = {}) {
 }
 
 module.exports = {
-  HORIZONS, ANALYSIS_CANDLE_COUNT, analyzeSnapshot, analyzeTimeframe, sanitizeInput, detectTriggers, decideHorizon,
+  HORIZONS, ANALYSIS_CANDLE_COUNT, ENGINE_VERSION,
+  analyzeSnapshot, analyzeTimeframe, sanitizeInput, detectTriggers, decideHorizon,
   indicators: { ema, rsi, atr, macd },
 };

@@ -45,8 +45,9 @@ function aggregate(entries) {
 }
 
 class Journal {
-  constructor(filePath) {
+  constructor(filePath, engineVersion = null) {
     this.filePath = filePath;
+    this.engineVersion = engineVersion;
     const loaded = loadJson(filePath, []);
     this.entries = Array.isArray(loaded) ? loaded : [];
     let migrated = false;
@@ -74,6 +75,7 @@ class Journal {
     const timing = contractBoundaries(generatedAt, horizonMin);
     const entry = {
       id: signal.signalKey, signalKey: signal.signalKey, symbol: signal.symbol,
+      engineVersion: signal.engineVersion || this.engineVersion,
       horizonMin, direction, quality: signal.quality, trigger: signal.trigger,
       signalCloseTime: signal.latestClosedCandleTime, generatedAt, observedAt: generatedAt,
       entryOpenTime: timing.entryOpenTime, entryPrice: null,
@@ -121,8 +123,15 @@ class Journal {
     return resolved;
   }
 
+  currentEntries() {
+    return this.engineVersion
+      ? this.entries.filter((entry) => entry.engineVersion === this.engineVersion)
+      : this.entries;
+  }
+
   calibration() {
-    const resolved = this.entries.filter((entry) => entry.status === 'resolved');
+    const current = this.currentEntries();
+    const resolved = current.filter((entry) => entry.status === 'resolved');
     const symbols = [...new Set(resolved.map((entry) => entry.symbol))];
     return {
       source: 'forward', minimumSample: 30,
@@ -132,7 +141,8 @@ class Journal {
   }
 
   stats() {
-    const resolved = this.entries.filter((entry) => entry.status === 'resolved');
+    const current = this.currentEntries();
+    const resolved = current.filter((entry) => entry.status === 'resolved');
     return {
       overall: aggregate(resolved),
       byHorizon: {
@@ -143,14 +153,22 @@ class Journal {
         UP: aggregate(resolved.filter((entry) => entry.direction === 'UP')),
         DOWN: aggregate(resolved.filter((entry) => entry.direction === 'DOWN')),
       },
-      pending: this.entries.filter((entry) => entry.status === 'pending').length,
-      invalid: this.entries.filter((entry) => entry.status === 'invalid').length,
-      total: this.entries.length,
+      issuedByDirection: {
+        UP: current.filter((entry) => entry.direction === 'UP').length,
+        DOWN: current.filter((entry) => entry.direction === 'DOWN').length,
+      },
+      pending: current.filter((entry) => entry.status === 'pending').length,
+      invalid: current.filter((entry) => entry.status === 'invalid').length,
+      total: current.length,
+      excludedOtherEngineVersions: this.entries.length - current.length,
     };
   }
 
   snapshot(limit = 100) {
-    return { stats: this.stats(), calibration: this.calibration(), recent: this.entries.slice(0, limit) };
+    return {
+      engineVersion: this.engineVersion,
+      stats: this.stats(), calibration: this.calibration(), recent: this.currentEntries().slice(0, limit),
+    };
   }
 }
 
