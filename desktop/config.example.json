@@ -1,0 +1,9 @@
+{
+  "symbols": ["BTCUSDT", "ETHUSDT"],
+  "scanIntervalSec": 15,
+  "settleDelayMs": 1500,
+  "minQuality10": 65,
+  "minQuality30": 68,
+  "payout10": 0.8,
+  "payout30": 0.8
+}

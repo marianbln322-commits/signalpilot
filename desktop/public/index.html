@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html lang="ro">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'">
+  <title>SignalPilot Expert — MEXC closed-candle analysis</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="logo">SP</span><div><h1>SignalPilot Expert</h1><p>MEXC live · analiză exclusiv pe lumânări închise · două decizii independente</p></div></div>
+    <div class="badges"><span id="clockBadge" class="badge">asOf —</span><span id="connBadge" class="badge badge-off">Conectare…</span></div>
+  </header>
+  <main>
+    <aside class="notice"><b>ENTER UP / ENTER DOWN apare numai când toate porțile trec; WAIT este o decizie.</b> Graficele arată în timp real lumânările MEXC deja închise și indicatorii folosiți: pentru intrarea de 10 minute se analizează 1m + 5m, cu 15m context; pentru 30 minute se analizează 5m + 15m + 30m, cu 60m context. Pentru WAIT nu se estimează probabilitate. Pentru ENTER, procentul apare numai din bucket-ul istoric comparabil (horizon + direction + quality band) cu N suficient; forward are prioritate, iar Binance este marcat proxy/in-sample. Quality/confluence nu este probabilitate. Niciun procent nu prezice sigur semnalul curent și nu există promisiune de precizie sau profit.</aside>
+
+    <section class="panel">
+      <div class="panel-head"><div><h2>Analiză live MEXC</h2><p id="sourceLine" class="muted">Aștept primul scan…</p></div><label class="toggle"><input id="soundToggle" type="checkbox" checked> sunet alerte</label></div>
+      <div id="symbols" class="symbols"><p class="muted">Se încarcă datele live…</p></div>
+      <div id="scanErrors" class="errors"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Flux alerte ENTER UP / ENTER DOWN</h2><button id="clearAlerts" class="btn-ghost">golește local</button></div>
+      <div id="alerts" class="alerts"><p class="muted">WAIT nu generează alertă. Aștept un semnal care trece toate porțile.</p></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><div><h2>Jurnal forward separat pe orizont</h2><p class="muted">Intrare la primul 1m open strict după generatedAt; expirare la closeTime exact al minutei finale după 10m/30m. Boundary lipsă după downtime/gap = INVALID și este exclus din win-rate.</p></div></div>
+      <div id="journalStats" class="stats"></div>
+      <div id="journalRows" class="journal"></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><h2>Configurație locală</h2></div>
+      <div class="form-grid">
+        <label>Simboluri, unul pe linie<textarea id="cfgSymbols" rows="3"></textarea></label>
+        <label>Interval scanare (sec)<input id="cfgScan" type="number" min="5" max="300"></label>
+        <label>Settle delay (ms)<input id="cfgSettle" type="number" min="0" max="30000"></label>
+        <label>Quality minim 10m<input id="cfgQ10" type="number" min="0" max="100"></label>
+        <label>Quality minim 30m<input id="cfgQ30" type="number" min="0" max="100"></label>
+        <label>Payout 10m (0.80 = 80%)<input id="cfgP10" type="number" min="0.01" max="5" step="0.01"></label>
+        <label>Payout 30m (0.80 = 80%)<input id="cfgP30" type="number" min="0.01" max="5" step="0.01"></label>
+      </div>
+      <div class="action-row"><button id="saveConfig" class="btn-primary">Salvează</button><span id="saveStatus" class="muted"></span></div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-head"><div><h2>Backtest fără look-ahead</h2><p class="muted">Binance Vision este doar proxy și nu reprezintă istoric MEXC exact.</p></div></div>
+      <div class="action-row"><select id="btSymbol"></select><select id="btDays"><option value="7">7 zile (implicit)</option><option value="14">14 zile</option><option value="30">30 zile (maxim)</option></select><button id="runBacktest" class="btn-primary">Rulează</button><span id="btStatus" class="muted"></span></div>
+      <div id="btResult"></div>
+    </section>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

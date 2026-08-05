@@ -133,3 +133,23 @@ Panoul „🧠 Ce a învățat" îți arată transparent ce merge și ce evită.
 ## ⚠️ Avertisment
 
 Tranzacționarea contractelor pe 10/30 min este **speculativă și riscantă**. Backtest-ul nu include comisioane/spread, iar rezultatele trecute **nu garantează** nimic în viitor. Folosește aplicația ca instrument de analiză, nu ca sfat financiar. Testează pe sume mici și verifică singur semnalele.
+
+
+## SignalPilot Expert desktop separat (127.0.0.1:3009)
+
+Varianta Expert este izolată în `desktop/` și rulează în paralel cu versiunile existente. Necesită Node.js 18+:
+
+```bash
+npm install
+npm run start:3009
+```
+
+Pe Windows se poate folosi `start-3009.bat`. Interfața acceptă **http://127.0.0.1:3009** și **http://localhost:3009**; serverul rămâne legat fix pe `127.0.0.1`. Se oprește cu eroare dacă portul 3009 este ocupat și nu alege automat alt port. Răspunsurile includ CSP și protecție anti-framing.
+
+Configurația locală este salvată atomic în `desktop/data/config.json`, iar jurnalul forward separat în `desktop/data/journal.json`; ambele sunt ignorate de Git. Exemplul complet este `desktop/config.example.json`. API-ul Expert expune `GET /api/state`, `GET /api/stream`, `POST /api/config` și `POST /api/backtest` cu JSON `{ "symbol": "BTCUSDT", "days": 7 }` (maximum 30 zile). Operațiile POST cer Origin same-origin.
+
+Scanarea live folosește `api.mexc.com`; ora de publicare este recalculată după fetch din ceasul local corectat cu skew-ul MEXC măsurat la midpoint. Dacă ora MEXC nu poate fi verificată, scannerul eșuează în siguranță, elimină rezultatele vechi și nu emite ENTER pe baza ceasului local. Freshness este strictă (aproximativ intervalul timeframe-ului plus settle/toleranță), iar un scan eșuat elimină rezultatul vechi. Sunt validate exact 300 de lumânări închise 1m, 5m, 15m, 30m și 60m, pe grila temporală exactă, cu metadata de prospețime și gaps pe întreaga fereastră. Graficele arată toate cele 300 candles folosite, EMA9/20/50, range high/low, toate trigger-ele recente, gate-urile și timeline-ul contractului.
+
+Live și replay folosesc aceeași fereastră de exact 300 candles pe fiecare timeframe și același contract din `desktop/lib/contract-timing.js`. Replay-ul descarcă 13 zile de pre-roll pentru a reconstrui cele 300 candles de 60m înaintea ferestrei evaluate. Intrarea este la primul 1m open strict după `generatedAt`, apoi exact 10/30 minute și `closeTime`-ul minutei finale. Un boundary lipsă după downtime/gap este INVALID, nu este înlocuit cu o lumânare ulterioară și este exclus din win-rate. Backtest-ul rulează într-un worker separat și folosește **Binance Vision numai ca proxy/in-sample**, nu istoric MEXC exact; OHLC, continuitatea 1m, agregatele și coverage-ul cache sunt validate. Parametrii rămân fixați.
+
+Pentru UP/DOWN, UI afișează o probabilitate istorică estimată numai din bucket-ul comparabil `horizon + direction + quality band`, cu win-rate, N și Wilson95: forward la N≥30 (preferat), altfel Binance proxy/in-sample la N≥50. La eșantion insuficient arată „necalibrat”, iar pentru WAIT nu estimează probabilitate. **`quality/confluence` nu este probabilitate.** Niciun procent istoric nu prezice sigur semnalul curent; datele și modelul pot greși și nu există promisiune de precizie sau profit.
