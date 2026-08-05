@@ -11,7 +11,7 @@ const { Journal, atomicWriteJson } = require('./lib/journal');
 const { chooseEstimate } = require('./lib/calibration');
 
 const HOST = '127.0.0.1';
-const PORT = 3009;
+const PORT = 3017;
 const APP_BUILD = expertEngine.ENGINE_VERSION;
 const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
@@ -332,7 +332,7 @@ app.use((request, response, next) => {
     ? ALLOWED_ORIGINS.has(request.headers.origin)
     : !request.headers.origin || ALLOWED_ORIGINS.has(request.headers.origin);
   if (!hostAllowed || !originAllowed) {
-    response.status(403).json({ error: 'SignalPilot Expert accepts only same-origin loopback requests on 127.0.0.1:3009 or localhost:3009' });
+    response.status(403).json({ error: `SignalPilot Expert accepts only same-origin loopback requests on 127.0.0.1:${PORT} or localhost:${PORT}` });
     return;
   }
   next();

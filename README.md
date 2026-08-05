@@ -135,16 +135,16 @@ Panoul „🧠 Ce a învățat" îți arată transparent ce merge și ce evită.
 Tranzacționarea contractelor pe 10/30 min este **speculativă și riscantă**. Backtest-ul nu include comisioane/spread, iar rezultatele trecute **nu garantează** nimic în viitor. Folosește aplicația ca instrument de analiză, nu ca sfat financiar. Testează pe sume mici și verifică singur semnalele.
 
 
-## SignalPilot Expert desktop separat (127.0.0.1:3009)
+## SignalPilot Expert desktop separat (127.0.0.1:3017)
 
 Varianta Expert este izolată în `desktop/` și rulează în paralel cu versiunile existente. Necesită Node.js 18+:
 
 ```bash
 npm install
-npm run start:3009
+npm run start:3017
 ```
 
-Pe Windows se poate folosi `start-3009.bat`. Interfața acceptă **http://127.0.0.1:3009** și **http://localhost:3009**; serverul rămâne legat fix pe `127.0.0.1`. Se oprește cu eroare dacă portul 3009 este ocupat și nu alege automat alt port. Răspunsurile includ CSP și protecție anti-framing.
+Pe Windows se poate folosi `start-3017.bat`. Interfața acceptă **http://127.0.0.1:3017** și **http://localhost:3017**; serverul rămâne legat fix pe `127.0.0.1`. Se oprește cu eroare dacă portul 3017 este ocupat și nu alege automat alt port. Răspunsurile includ CSP și protecție anti-framing.
 
 Configurația locală este salvată atomic în `desktop/data/config.json`, iar jurnalul forward separat în `desktop/data/journal.json`; ambele sunt ignorate de Git. Exemplul complet este `desktop/config.example.json`. API-ul Expert expune `GET /api/state`, `GET /api/stream`, `POST /api/config` și `POST /api/backtest` cu JSON `{ "symbol": "BTCUSDT", "days": 7 }` (maximum 30 zile). Operațiile POST cer Origin same-origin.
 
