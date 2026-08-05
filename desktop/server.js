@@ -203,7 +203,7 @@ async function scanOnce() {
       try {
         const snapshot = await market.fetchSymbolSnapshot(symbol, {
           asOf: market.correctedNow(clock), settleDelayMs: scanConfig.settleDelayMs,
-          limit: market.ANALYSIS_CANDLE_COUNT + 1, timeoutMs: 9_000,
+          limit: market.REQUEST_CANDLE_COUNT, timeoutMs: 9_000,
         });
         snapshots[symbol] = snapshot;
         oneMinuteBySymbol[symbol] = snapshot.candles['1m'];

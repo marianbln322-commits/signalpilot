@@ -12,6 +12,9 @@ const INTERVAL_MS = Object.freeze({
 const SOURCE = 'MEXC spot REST api.mexc.com';
 const FRESHNESS_TOLERANCE_MS = 5_000;
 const ANALYSIS_CANDLE_COUNT = 300;
+// MEXC can return the current forming candle and, during settleDelay, the candle
+// that just reached its end boundary. Two spare rows still leave 300 settled rows.
+const REQUEST_CANDLE_COUNT = ANALYSIS_CANDLE_COUNT + 2;
 
 function timeoutSignal(timeoutMs) {
   const controller = new AbortController();
@@ -82,20 +85,30 @@ function normalizeCandle(row, symbol, timeframe) {
   if (!Array.isArray(row) || row.length < 7) throw new Error(`${symbol} ${timeframe}: malformed kline row`);
   const intervalMs = INTERVAL_MS[timeframe];
   if (!intervalMs) throw new Error(`${symbol} ${timeframe}: unsupported timeframe`);
+  const openTime = Number(row[0]);
+  const rawEndTime = Number(row[6]);
+  const expectedEndTime = openTime + intervalMs;
+  // MEXC normally returns an exclusive interval-end boundary in row[6]. Accept
+  // the inclusive variant explicitly too, then keep one internal convention.
+  const boundaryFormat = rawEndTime === expectedEndTime
+    ? 'exclusive-end' : rawEndTime === expectedEndTime - 1 ? 'inclusive-close' : null;
   const candle = {
-    openTime: Number(row[0]), open: Number(row[1]), high: Number(row[2]), low: Number(row[3]),
-    close: Number(row[4]), volume: Number(row[5]), closeTime: Number(row[6]),
+    openTime, open: Number(row[1]), high: Number(row[2]), low: Number(row[3]),
+    close: Number(row[4]), volume: Number(row[5]),
+    endTime: expectedEndTime, closeTime: expectedEndTime - 1,
+    sourceEndTime: rawEndTime, boundaryFormat,
     quoteVolume: row[7] == null ? null : Number(row[7]),
   };
-  const finite = ['openTime', 'open', 'high', 'low', 'close', 'volume', 'closeTime'].every((key) => Number.isFinite(candle[key]));
-  const validRange = candle.openTime >= 0 && candle.closeTime > candle.openTime
+  const finite = ['openTime', 'open', 'high', 'low', 'close', 'volume', 'endTime', 'closeTime', 'sourceEndTime']
+    .every((key) => Number.isFinite(candle[key]));
+  const quoteVolumeValid = candle.quoteVolume == null || (Number.isFinite(candle.quoteVolume) && candle.quoteVolume >= 0);
+  const validRange = candle.openTime >= 0 && candle.endTime > candle.openTime
     && candle.open > 0 && candle.high > 0 && candle.low > 0 && candle.close > 0 && candle.volume >= 0
     && candle.high >= Math.max(candle.open, candle.close, candle.low)
     && candle.low <= Math.min(candle.open, candle.close, candle.high);
-  const validTiming = candle.openTime % intervalMs === 0
-    && candle.closeTime === candle.openTime + intervalMs - 1;
-  if (!finite || !validRange || !validTiming) {
-    throw new Error(`${symbol} ${timeframe}: invalid OHLCV/timing at openTime=${row[0]}`);
+  const validTiming = candle.openTime % intervalMs === 0 && boundaryFormat !== null;
+  if (!finite || !quoteVolumeValid || !validRange || !validTiming) {
+    throw new Error(`${symbol} ${timeframe}: invalid OHLCV/timing at openTime=${row[0]} rawEndTime=${row[6]} expectedEnd=${expectedEndTime}`);
   }
   return candle;
 }
@@ -110,7 +123,7 @@ function normalizeClosedRows(raw, {
   const byOpenTime = new Map();
   for (const row of raw) {
     const candle = normalizeCandle(row, symbol, timeframe);
-    if (candle.closeTime <= cutoff) byOpenTime.set(candle.openTime, candle);
+    if (candle.endTime <= cutoff) byOpenTime.set(candle.openTime, candle);
   }
   const candles = [...byOpenTime.values()].sort((a, b) => a.openTime - b.openTime);
   if (candles.length < minimumCandles) throw new Error(`${symbol} ${timeframe}: only ${candles.length} closed candles; need ${minimumCandles}`);
@@ -135,15 +148,18 @@ function buildMetadata(candles, { timeframe, asOf, settleDelayMs }) {
       });
     }
   }
-  const ageMs = Math.max(0, asOf - last.closeTime);
+  const hasExclusiveEnd = Number.isFinite(last.endTime);
+  const lastEndTime = hasExclusiveEnd ? last.endTime : last.closeTime + 1;
+  const settlementTime = hasExclusiveEnd ? last.endTime : last.closeTime;
+  const ageMs = Math.max(0, asOf - settlementTime);
   const freshnessLimitMs = intervalMs + settleDelayMs + FRESHNESS_TOLERANCE_MS;
   const gapsTotal = gaps.reduce((sum, gap) => sum + gap.missing, 0);
   const gapsRecent = gaps.filter((gap) => gap.recent).reduce((sum, gap) => sum + gap.missing, 0);
-  const closed = last.closeTime <= asOf - settleDelayMs;
+  const closed = settlementTime <= asOf - settleDelayMs;
   const fresh = ageMs <= freshnessLimitMs;
   return {
     timeframe, intervalMs, count: candles.length,
-    lastOpenTime: last.openTime, lastCloseTime: last.closeTime,
+    lastOpenTime: last.openTime, lastCloseTime: last.closeTime, lastEndTime,
     ageMs, freshnessLimitMs, closed,
     gaps: gapsTotal, gapsRecent, analysisWindowContinuous: gapsTotal === 0,
     gapDetails: gaps.slice(-10), fresh, valid: closed && fresh && gapsTotal === 0, source: SOURCE,
@@ -162,7 +178,7 @@ function revalidateSnapshot(snapshot, generatedAt) {
   return { ...snapshot, asOf: generatedAt, generatedAt, metadata };
 }
 
-async function fetchTimeframe(symbol, timeframe, { asOf, settleDelayMs, limit = ANALYSIS_CANDLE_COUNT + 1, timeoutMs = 8_000, fetchImpl } = {}) {
+async function fetchTimeframe(symbol, timeframe, { asOf, settleDelayMs, limit = REQUEST_CANDLE_COUNT, timeoutMs = 8_000, fetchImpl } = {}) {
   if (!TIMEFRAMES.includes(timeframe)) throw new Error(`unsupported MEXC timeframe: ${timeframe}`);
   const url = `${BASE_URL}/api/v3/klines?symbol=${encodeURIComponent(symbol)}&interval=${timeframe}&limit=${limit}`;
   let raw;
@@ -175,7 +191,7 @@ async function fetchTimeframe(symbol, timeframe, { asOf, settleDelayMs, limit = 
   return { candles, metadata: buildMetadata(candles, { timeframe, asOf, settleDelayMs }) };
 }
 
-async function fetchSymbolSnapshot(symbol, { asOf, settleDelayMs = 1_500, limit = ANALYSIS_CANDLE_COUNT + 1, timeoutMs = 8_000, fetchImpl } = {}) {
+async function fetchSymbolSnapshot(symbol, { asOf, settleDelayMs = 1_500, limit = REQUEST_CANDLE_COUNT, timeoutMs = 8_000, fetchImpl } = {}) {
   if (!Number.isFinite(asOf)) throw new Error('fetchSymbolSnapshot requires a finite scan asOf');
   const results = await Promise.all(TIMEFRAMES.map(async (timeframe) => [
     timeframe,
@@ -191,7 +207,8 @@ async function fetchSymbolSnapshot(symbol, { asOf, settleDelayMs = 1_500, limit 
 }
 
 module.exports = {
-  BASE_URL, SOURCE, TIMEFRAMES, INTERVAL_MS, FRESHNESS_TOLERANCE_MS, ANALYSIS_CANDLE_COUNT,
+  BASE_URL, SOURCE, TIMEFRAMES, INTERVAL_MS, FRESHNESS_TOLERANCE_MS,
+  ANALYSIS_CANDLE_COUNT, REQUEST_CANDLE_COUNT,
   fetchJson, getScanClock, correctedNow, normalizeCandle, normalizeClosedRows,
   buildMetadata, revalidateSnapshot, fetchTimeframe, fetchSymbolSnapshot,
 };

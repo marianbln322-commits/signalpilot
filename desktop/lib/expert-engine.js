@@ -188,7 +188,12 @@ function sanitizeInput(snapshot) {
   const sanitized = {};
   for (const [timeframe, candles] of Object.entries(snapshot.candles || {})) {
     const deduped = new Map();
-    for (const candle of candles || []) if (Number.isFinite(candle.closeTime) && candle.closeTime <= cutoff) deduped.set(candle.openTime, candle);
+    for (const candle of candles || []) {
+      const settlementTime = Number.isFinite(candle.endTime) ? candle.endTime : candle.closeTime;
+      if (Number.isFinite(candle.closeTime) && Number.isFinite(settlementTime) && settlementTime <= cutoff) {
+        deduped.set(candle.openTime, candle);
+      }
+    }
     sanitized[timeframe] = [...deduped.values()].sort((a, b) => a.openTime - b.openTime);
   }
   return sanitized;
