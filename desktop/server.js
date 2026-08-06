@@ -12,7 +12,7 @@ const { GeminiLossReviewer } = require('./lib/gemini-reviewer');
 const { chooseEstimate } = require('./lib/calibration');
 
 const HOST = '127.0.0.1';
-const PORT = 3017;
+const PORT = 3013;
 const APP_BUILD = expertEngine.ENGINE_VERSION;
 const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');

@@ -135,16 +135,16 @@ Panoul „🧠 Ce a învățat" îți arată transparent ce merge și ce evită.
 Tranzacționarea contractelor pe 10/30 min este **speculativă și riscantă**. Backtest-ul nu include comisioane/spread, iar rezultatele trecute **nu garantează** nimic în viitor. Folosește aplicația ca instrument de analiză, nu ca sfat financiar. Testează pe sume mici și verifică singur semnalele.
 
 
-## SignalPilot Expert desktop separat (127.0.0.1:3017)
+## SignalPilot Expert desktop separat (127.0.0.1:3013)
 
 Varianta Expert este izolată în `desktop/` și rulează în paralel cu versiunile existente. Necesită Node.js 18+:
 
 ```bash
 npm install
-npm run start:3017
+npm run start:3013
 ```
 
-Pe Windows se poate folosi `start-3017.bat`. Interfața acceptă **http://127.0.0.1:3017** și **http://localhost:3017**; serverul rămâne legat fix pe `127.0.0.1`. Se oprește cu eroare dacă portul 3017 este ocupat și nu alege automat alt port. Răspunsurile includ CSP și protecție anti-framing.
+Pe Windows se poate folosi `start-3013.bat`. Interfața acceptă **http://127.0.0.1:3013** și **http://localhost:3013**; serverul rămâne legat fix pe `127.0.0.1`. Se oprește cu eroare dacă portul 3013 este ocupat și nu alege automat alt port. Răspunsurile includ CSP și protecție anti-framing.
 
 Configurația locală este salvată atomic în `desktop/data/config.json`, iar jurnalul forward separat în `desktop/data/journal.json`; ambele sunt ignorate de Git. Stația expert monitorizează intenționat exact `BTCUSDT` și `ETHUSDT`; lista nu este extensibilă din UI, pentru a păstra două grafice și aceeași disciplină de analiză. Exemplul complet este `desktop/config.example.json`. API-ul Expert expune `GET /api/state`, `GET /api/stream`, `POST /api/config` și `POST /api/backtest` cu JSON `{ "symbol": "BTCUSDT", "days": 7 }` (maximum 30 zile). Operațiile POST cer Origin same-origin.
 
@@ -160,12 +160,12 @@ Gemini este opțional și rulează numai ca auditor post-loss cu răspuns JSON s
 
 ```bash
 # Linux/macOS
-GEMINI_API_KEY="cheia-ta" GEMINI_MODEL="gemini-3-pro-preview" npm run start:3017
+GEMINI_API_KEY="cheia-ta" GEMINI_MODEL="gemini-3-pro-preview" npm run start:3013
 
 # Windows CMD
 set GEMINI_API_KEY=cheia-ta
 set GEMINI_MODEL=gemini-3-pro-preview
-start-3017.bat
+start-3013.bat
 ```
 
 Pentru UP/DOWN, UI afișează o probabilitate istorică estimată numai din bucket-ul comparabil `horizon + direction + quality band`, cu win-rate, N și Wilson95: forward la N≥30 (preferat), altfel Binance proxy/in-sample la N≥50. La eșantion insuficient arată „necalibrat”, iar pentru WAIT nu estimează probabilitate. **`quality/confluence` nu este probabilitate.** MEXC Spot este proxy pentru grafic; settlement-ul Event Futures poate diferi. Niciun procent istoric nu prezice sigur semnalul curent și nu există promisiune de precizie sau profit.
