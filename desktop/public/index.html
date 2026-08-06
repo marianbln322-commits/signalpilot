@@ -4,53 +4,61 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'">
-  <title>SignalPilot Expert — MEXC closed-candle analysis</title>
+  <title>SignalPilot Event Futures Expert</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header>
-    <div class="brand"><span class="logo">SP</span><div><h1>SignalPilot Expert</h1><p>MEXC live · analiză exclusiv pe lumânări închise · două decizii independente</p></div></div>
-    <div class="badges"><span id="clockBadge" class="badge">asOf —</span><span id="connBadge" class="badge badge-off">Conectare…</span></div>
+    <div class="brand"><span class="logo">SP</span><div><h1>Event Futures Expert</h1><p>BTCUSDT + ETHUSDT · MEXC Spot live · decizii 10m / 30m auditate</p></div></div>
+    <div class="badges"><span id="liveBadge" class="badge badge-off">Preț live —</span><span id="clockBadge" class="badge">Analiză —</span><span id="connBadge" class="badge badge-off">Conectare…</span></div>
   </header>
-  <main>
-    <aside class="notice"><b>ENTER UP / ENTER DOWN apare numai când toate porțile trec; WAIT este o decizie.</b> Graficele arată în timp real lumânările MEXC deja închise și indicatorii folosiți: pentru intrarea de 10 minute se analizează 1m + 5m, cu 15m context; pentru 30 minute se analizează 5m + 15m + 30m, cu 60m context. Pentru WAIT nu se estimează probabilitate. Pentru ENTER, procentul apare numai din bucket-ul istoric comparabil (horizon + direction + quality band) cu N suficient; forward are prioritate, iar Binance este marcat proxy/in-sample. Quality/confluence nu este probabilitate. Niciun procent nu prezice sigur semnalul curent și nu există promisiune de precizie sau profit.</aside>
 
-    <section class="panel">
-      <div class="panel-head"><div><h2>Analiză live MEXC</h2><p id="sourceLine" class="muted">Aștept primul scan…</p></div><label class="toggle"><input id="soundToggle" type="checkbox" checked> sunet alerte</label></div>
-      <div id="symbols" class="symbols"><p class="muted">Se încarcă datele live…</p></div>
+  <main>
+    <aside class="notice"><b>WAIT este o decizie profesională, nu o eroare.</b> Pentru 10 minute motorul cere acord dominant 1m + 5m și folosește 15m drept context/veto. Pentru 30 minute cere obligatoriu 5m + 15m și folosește 30m + 60m drept context/veto. Prețul live este observat la fiecare secundă; deciziile se calculează numai din lumânări închise și validate. MEXC Spot este proxy pentru grafic, iar regulile/prețul de settlement Event Futures pot diferi. Nu există promisiune de precizie sau profit.</aside>
+
+    <section class="panel market-panel">
+      <div class="panel-head"><div><h2>Piață live</h2><p id="sourceLine" class="muted">Aștept primul preț și primul snapshot valid…</p></div><label class="toggle"><input id="soundToggle" type="checkbox" checked> sunet doar la ENTER</label></div>
+      <div id="markets" class="market-grid"><p class="muted">Se încarcă BTCUSDT și ETHUSDT…</p></div>
       <div id="scanErrors" class="errors"></div>
     </section>
 
     <section class="panel">
-      <div class="panel-head"><h2>Flux alerte ENTER UP / ENTER DOWN</h2><button id="clearAlerts" class="btn-ghost">golește local</button></div>
-      <div id="alerts" class="alerts"><p class="muted">WAIT nu generează alertă. Aștept un semnal care trece toate porțile.</p></div>
+      <div class="panel-head"><div><h2>Radar oportunități 10m / 30m</h2><p class="muted">Direcția apare numai când toate porțile, alinierea timeframe-urilor și protecția anti-overextension trec.</p></div></div>
+      <div id="decisions" class="decision-board"><p class="muted">Aștept analiza pe lumânări închise…</p></div>
     </section>
 
     <section class="panel">
-      <div class="panel-head"><div><h2>Jurnal forward separat pe orizont</h2><p class="muted">Intrare la primul 1m open strict după generatedAt; expirare la closeTime exact al minutei finale după 10m/30m. Boundary lipsă după downtime/gap = INVALID și este exclus din win-rate.</p></div></div>
+      <div class="panel-head"><div><h2>Învățare controlată și review automat</h2><p class="muted">Fiecare pierdere primește MFE/MAE și cauze candidate. Sistemul poate doar bloca un setup demonstrat slab după N≥30; nu poate inventa sau inversa semnale.</p></div><span id="aiStatus" class="ai-status">Gemini —</span></div>
       <div id="journalStats" class="stats"></div>
+      <div id="learningSummary" class="learning-summary"></div>
       <div id="journalRows" class="journal"></div>
     </section>
 
     <section class="panel">
-      <div class="panel-head"><h2>Configurație locală</h2></div>
+      <div class="panel-head"><h2>Flux alerte ENTER</h2><button id="clearAlerts" class="btn-ghost">golește local</button></div>
+      <div id="alerts" class="alerts"><p class="muted">WAIT nu generează alertă.</p></div>
+    </section>
+
+    <details class="panel collapsible">
+      <summary>Configurație și praguri</summary>
       <div class="form-grid">
-        <label>Simboluri, unul pe linie<textarea id="cfgSymbols" rows="3"></textarea></label>
-        <label>Interval scanare (sec)<input id="cfgScan" type="number" min="5" max="300"></label>
+        <label>Piețe expert fixe<input id="cfgSymbols" type="text" value="BTCUSDT, ETHUSDT" readonly></label>
+        <label>Analiză closed-candle (sec)<input id="cfgScan" type="number" min="5" max="300"></label>
         <label>Settle delay (ms)<input id="cfgSettle" type="number" min="0" max="30000"></label>
-        <label>Quality minim 10m<input id="cfgQ10" type="number" min="0" max="100"></label>
-        <label>Quality minim 30m<input id="cfgQ30" type="number" min="0" max="100"></label>
+        <label>Confluență minimă 10m<input id="cfgQ10" type="number" min="0" max="100"></label>
+        <label>Confluență minimă 30m<input id="cfgQ30" type="number" min="0" max="100"></label>
         <label>Payout 10m (0.80 = 80%)<input id="cfgP10" type="number" min="0.01" max="5" step="0.01"></label>
         <label>Payout 30m (0.80 = 80%)<input id="cfgP30" type="number" min="0.01" max="5" step="0.01"></label>
       </div>
       <div class="action-row"><button id="saveConfig" class="btn-primary">Salvează</button><span id="saveStatus" class="muted"></span></div>
-    </section>
+    </details>
 
-    <section class="panel">
-      <div class="panel-head"><div><h2>Backtest fără look-ahead</h2><p class="muted">Binance Vision este doar proxy și nu reprezintă istoric MEXC exact.</p></div></div>
-      <div class="action-row"><select id="btSymbol"></select><select id="btDays"><option value="7">7 zile (implicit)</option><option value="14">14 zile</option><option value="30">30 zile (maxim)</option></select><button id="runBacktest" class="btn-primary">Rulează</button><span id="btStatus" class="muted"></span></div>
+    <details class="panel collapsible">
+      <summary>Backtest și calibrare</summary>
+      <p class="muted">Binance Vision rămâne proxy in-sample, nu istoric exact MEXC Event Futures. Forward-ul real are prioritate.</p>
+      <div class="action-row"><select id="btSymbol"></select><select id="btDays"><option value="7">7 zile</option><option value="14">14 zile</option><option value="30">30 zile</option></select><button id="runBacktest" class="btn-primary">Rulează</button><span id="btStatus" class="muted"></span></div>
       <div id="btResult"></div>
-    </section>
+    </details>
   </main>
   <script src="app.js"></script>
 </body>

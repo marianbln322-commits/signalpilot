@@ -3,11 +3,25 @@
 const { contractBoundaries } = require('./contract-timing');
 
 const ANALYSIS_CANDLE_COUNT = 300;
-const ENGINE_VERSION = 'direction-balanced-v2';
+const ENGINE_VERSION = 'event-futures-expert-v3';
 
 const HORIZONS = Object.freeze({
-  10: { minutes: 10, execution: ['1m', '5m'], context: ['15m'], triggerFrames: ['1m', '5m'], triggerMaxAgeMs: 10 * 60_000 },
-  30: { minutes: 30, execution: ['5m', '15m', '30m'], context: ['60m'], triggerFrames: ['5m', '15m', '30m'], triggerMaxAgeMs: 30 * 60_000 },
+  10: {
+    minutes: 10,
+    execution: ['1m', '5m'],
+    context: ['15m'],
+    triggerFrames: ['1m', '5m'],
+    triggerMaxAgeMs: 10 * 60_000,
+    protocol: '1m timing + 5m structură; ambele trebuie să confirme, 15m este context/veto',
+  },
+  30: {
+    minutes: 30,
+    execution: ['5m', '15m'],
+    context: ['30m', '60m'],
+    triggerFrames: ['5m', '15m'],
+    triggerMaxAgeMs: 30 * 60_000,
+    protocol: '5m timing + 15m structură; ambele trebuie să confirme, 30m/60m sunt context/veto',
+  },
 });
 
 const round = (value, digits = 2) => (Number.isFinite(value) ? Number(value.toFixed(digits)) : null);
@@ -183,11 +197,20 @@ function analyzeTimeframe(candles, timeframe) {
   const volatility = volatilityPct >= 0.0005 && volatilityPct <= 0.05 ? 'USABLE' : 'UNUSABLE';
   const volumeDirection = volumeRatio < 1.15 ? 'NEUTRAL'
     : candle.close > previous.close ? 'UP' : candle.close < previous.close ? 'DOWN' : 'NEUTRAL';
+  const ema20Value = last(ema20);
+  const distanceFromEma20Atr = currentAtr > 0 ? (candle.close - ema20Value) / currentAtr : 0;
+  const candleRange = Math.max(Number.EPSILON, candle.high - candle.low);
+  const closeLocation = (candle.close - candle.low) / candleRange;
+  const trendStrengthPct = Math.abs(last(ema9) - last(ema50)) / candle.close * 100;
+  const regime = volatility === 'UNUSABLE' ? 'UNUSABLE'
+    : trend !== 'NEUTRAL' && trendStrengthPct >= 0.08 ? 'TRENDING'
+      : structure === 'NEUTRAL' ? 'RANGE' : 'TRANSITION';
   return {
     timeframe, closeTime: candle.closeTime, price: candle.close, usedCandleCount: candles.length,
-    ema: { fast: round(last(ema9), 8), medium: round(last(ema20), 8), slow: round(last(ema50), 8) },
+    ema: { fast: round(last(ema9), 8), medium: round(ema20Value, 8), slow: round(last(ema50), 8) },
     overlay: { rangeHigh: round(rangeHigh, 8), rangeLow: round(rangeLow, 8), lastClose: round(candle.close, 8) },
-    trend, trendStrengthPct: round(Math.abs(last(ema9) - last(ema50)) / candle.close * 100, 3),
+    trend, trendStrengthPct: round(trendStrengthPct, 3), regime,
+    distanceFromEma20Atr: round(distanceFromEma20Atr, 3), closeLocation: round(closeLocation, 3),
     rsi: round(currentRsi), macd: {
       histogram: round(histogram, 8), deadZone: round(macdDeadZone, 8),
       accelerating: Math.abs(histogramDelta) <= macdDeadZone || Math.abs(histogram) >= Math.abs(previousHistogram || 0),
@@ -302,8 +325,9 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   const opposingTimeframes = candidate === 'WAIT' ? []
     : frameBiases.filter((item) => item.dominant === opposite).map((item) => item.timeframe);
   const ambivalentTimeframes = frameBiases.filter((item) => item.state === 'AMBIVALENT').map((item) => item.timeframe);
-  addGate(gateChecks, reasonCodes, 'EXECUTION_TF_CONFIRMATIONS_LT_2', confirmingTimeframes.length >= 2,
-    `${confirmingTimeframes.length}/${execution.length} TF dominante confirmă: ${confirmingTimeframes.join(', ') || 'niciunul'}${ambivalentTimeframes.length ? `; ambivalente: ${ambivalentTimeframes.join(', ')}` : ''}`);
+  const requiredConfirmations = spec.execution.length;
+  addGate(gateChecks, reasonCodes, 'EXECUTION_TF_ALIGNMENT_INCOMPLETE', confirmingTimeframes.length === requiredConfirmations,
+    `${confirmingTimeframes.length}/${requiredConfirmations} TF obligatorii confirmă: ${confirmingTimeframes.join(', ') || 'niciunul'}${ambivalentTimeframes.length ? `; ambivalente: ${ambivalentTimeframes.join(', ')}` : ''}`);
   const hasUpFrame = frameBiases.some((item) => item.dominant === 'UP');
   const hasDownFrame = frameBiases.some((item) => item.dominant === 'DOWN');
   const materialExecutionConflict = hasUpFrame && hasDownFrame;
@@ -314,6 +338,15 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   const chopOrUnusable = unusableFrames.length > 0 || directionalFrames < 2;
   addGate(gateChecks, reasonCodes, 'CHOP_OR_VOLATILITY_UNUSABLE', !chopOrUnusable,
     unusableFrames.length ? `volatilitate neutilizabilă: ${unusableFrames.join(', ')}` : directionalFrames < 2 ? 'chop/ambivalență: mai puțin de 2 TF au bias dominant' : 'volatilitate și structură dominante utilizabile');
+
+  const triggerAnalysis = bestTrigger ? analyses[bestTrigger.timeframe] : null;
+  const signedExtensionAtr = triggerAnalysis
+    ? (candidate === 'UP' ? triggerAnalysis.distanceFromEma20Atr : -triggerAnalysis.distanceFromEma20Atr)
+    : 0;
+  const overextended = candidate !== 'WAIT' && Number.isFinite(signedExtensionAtr) && signedExtensionAtr > 2.2;
+  addGate(gateChecks, reasonCodes, 'ENTRY_OVEREXTENDED', !overextended,
+    triggerAnalysis ? `${bestTrigger.timeframe}: extensie ${round(signedExtensionAtr, 2)} ATR față de EMA20; maxim 2.2 ATR în direcția intrării`
+      : 'fără trigger selectat; extensia nu poate valida intrarea');
 
   const hardHigherConflict = candidate !== 'WAIT' && context.some((analysis) => analysis.trend === opposite
     && (analysis.momentum === opposite || analysis.structure === opposite) && analysis.trendStrengthPct >= 0.08);
@@ -361,6 +394,7 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
     opposingTrigger: materialOpposing ? -12 : 0,
     triggerDirectionTie: triggerSelection.directionTie ? -20 : 0,
     hardHigherTimeframeConflict: hardHigherConflict ? -20 : 0,
+    overextendedEntry: overextended ? -15 : 0,
     chopOrUnusable: chopOrUnusable ? -12 : 0,
   };
   const qualityRaw = Object.values(qualityComponents).reduce((sum, value) => sum + value, 0);
@@ -379,6 +413,9 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   return {
     engineVersion: ENGINE_VERSION,
     symbol, horizonMin: horizon, action, direction, bias, verdict, quality,
+    protocol: spec.protocol,
+    executionTimeframes: [...spec.execution], contextTimeframes: [...spec.context],
+    setupFingerprint: bestTrigger ? `${horizon}m|${bestTrigger.timeframe}|${bestTrigger.type}|${candidate}` : null,
     qualityLabel: 'confluence score descriptiv (nu probabilitate)', qualityComponents,
     directionScores: { up: round(bullish), down: round(bearish), margin, aggregate: aggregateDirection },
     frameBiases, ambivalentTimeframes, scoreMargin: margin,

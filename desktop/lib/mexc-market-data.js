@@ -206,9 +206,49 @@ async function fetchSymbolSnapshot(symbol, { asOf, settleDelayMs = 1_500, limit 
   return { symbol, asOf, generatedAt: asOf, settleDelayMs, source: SOURCE, candles, metadata };
 }
 
+async function fetchLiveTicker(symbol, { timeoutMs = 1_500, fetchImpl } = {}) {
+  const startedAt = Date.now();
+  const url = `${BASE_URL}/api/v3/ticker/24hr?symbol=${encodeURIComponent(symbol)}`;
+  let payload;
+  try {
+    payload = await fetchJson(url, { timeoutMs, fetchImpl });
+  } catch (error) {
+    throw new Error(`MEXC ${symbol} live ticker failed: ${error.message}`);
+  }
+  const lastPrice = Number(payload && (payload.lastPrice ?? payload.price));
+  const bidPrice = Number(payload && payload.bidPrice);
+  const askPrice = Number(payload && payload.askPrice);
+  const priceChangePercent = Number(payload && payload.priceChangePercent);
+  if (!Number.isFinite(lastPrice) || lastPrice <= 0) throw new Error(`MEXC ${symbol} live ticker returned invalid lastPrice`);
+  const bid = Number.isFinite(bidPrice) && bidPrice > 0 ? bidPrice : null;
+  const ask = Number.isFinite(askPrice) && askPrice > 0 ? askPrice : null;
+  const spreadBps = bid && ask && ask >= bid ? ((ask - bid) / ((ask + bid) / 2)) * 10_000 : null;
+  const receivedAt = Date.now();
+  return {
+    symbol, lastPrice, bidPrice: bid, askPrice: ask,
+    spreadBps: Number.isFinite(spreadBps) ? Number(spreadBps.toFixed(3)) : null,
+    priceChangePercent: Number.isFinite(priceChangePercent) ? priceChangePercent : null,
+    receivedAt, latencyMs: receivedAt - startedAt,
+    source: 'MEXC spot REST /api/v3/ticker/24hr · refresh 1s',
+  };
+}
+
+async function fetchLiveTickers(symbols, options = {}) {
+  const results = await Promise.allSettled((symbols || []).map((symbol) => fetchLiveTicker(symbol, options)));
+  const tickers = {};
+  const errors = {};
+  results.forEach((result, index) => {
+    const symbol = symbols[index];
+    if (result.status === 'fulfilled') tickers[symbol] = result.value;
+    else errors[symbol] = { at: Date.now(), message: result.reason.message };
+  });
+  return { tickers, errors, fetchedAt: Date.now() };
+}
+
 module.exports = {
   BASE_URL, SOURCE, TIMEFRAMES, INTERVAL_MS, FRESHNESS_TOLERANCE_MS,
   ANALYSIS_CANDLE_COUNT, REQUEST_CANDLE_COUNT,
   fetchJson, getScanClock, correctedNow, normalizeCandle, normalizeClosedRows,
   buildMetadata, revalidateSnapshot, fetchTimeframe, fetchSymbolSnapshot,
+  fetchLiveTicker, fetchLiveTickers,
 };

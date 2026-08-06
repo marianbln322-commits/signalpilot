@@ -11,7 +11,7 @@ function buildChartData(snapshot, result) {
     const ema50 = expertEngine.indicators.ema(closes, 50) || [];
     const visible = candles.map((candle, index) => ({
       openTime: candle.openTime, open: candle.open, high: candle.high, low: candle.low,
-      close: candle.close, closeTime: candle.closeTime,
+      close: candle.close, volume: candle.volume, closeTime: candle.closeTime,
       ema9: ema9[index], ema20: ema20[index], ema50: ema50[index],
     }));
     return [timeframe, {
