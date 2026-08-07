@@ -136,12 +136,17 @@ function gatesTable(gates) {
   return `<table class="gate-table"><tbody>${(gates || []).map((gate) => `<tr><td class="${gate.pass ? 'fresh' : 'stale'}">${gate.pass ? 'PASS' : 'FAIL'}</td><td>${safe(gate.code)}</td><td>${safe(gate.detail)}</td></tr>`).join('')}</tbody></table>`;
 }
 
-function aiConsensusBlock(consensus) {
-  if (!consensus) return '<div class="brain-box unavailable"><b>Creier Gemini:</b> analiza nu este încă disponibilă.</div>';
-  const decision = consensus.decision;
-  const verdict = decision && decision.verdict || 'INDISPONIBIL';
-  const stateClass = consensus.agreed ? 'agreed' : 'unavailable';
-  return `<div class="brain-box ${safe(stateClass)}"><div class="brain-head"><b>Creier Gemini · ${safe(verdict)}</b><span>${safe(consensus.agreed ? 'ACORD EXACT' : consensus.code || 'WAIT')}</span></div><div>${safe(consensus.model || 'model neconfigurat')}${consensus.latencyMs != null ? ` · ${safe(consensus.latencyMs)}ms` : ''}${decision ? ` · confidence ${safe(decision.confidence)}` : ''}</div>${decision ? `<p>${safe(decision.thesis)}</p><div><b>Dovezi AI:</b> ${safe((decision.evidence || []).join(' · '))}</div><div><b>Riscuri AI:</b> ${safe((decision.risks || []).join(' · '))}</div>` : `<p>${safe(consensus.error || 'Gemini live este obligatoriu pentru ENTER. Configurează GEMINI_API_KEY.')}</p>`}</div>`;
+function localLearningBlock(learning) {
+  if (!learning || !learning.considered) {
+    return '<div class="learner-box neutral"><b>Learner local:</b> motorul determinist este WAIT; modelul nu poate crea o intrare.</div>';
+  }
+  const phase = learning.phase || 'WARMUP';
+  const stateClass = learning.blocked ? 'blocked' : learning.active ? 'active' : 'neutral';
+  const probability = learning.active && learning.probability != null
+    ? ` · probabilitate model ${formatNumber(learning.probability * 100, 2)}% · prag ${formatNumber(learning.threshold * 100, 2)}%`
+    : ' · probabilitatea nu este folosită înainte de calificare';
+  const eligibility = learning.trainingEligible ? 'eligibil pentru training' : `audit-only: ${learning.exclusionReason || 'overlap'}`;
+  return `<div class="learner-box ${safe(stateClass)}"><div class="learner-head"><b>Learner local · ${safe(phase)}</b><span>${safe(learning.blocked ? 'ENTER BLOCAT' : learning.active ? 'ENTER PĂSTRAT' : 'DOAR MONITORIZARE')}</span></div><div>${safe(learning.bucketKey)} · N efectiv ${safe(learning.effectiveSamples)}/${safe(learning.minimumEffectiveSamples)} · W/L ${safe(learning.wins)}/${safe(learning.losses)}${safe(probability)}</div><p>${safe(eligibility)} · modelul nu poate crea sau inversa semnale.</p></div>`;
 }
 
 function decisionCard(symbol, prediction) {
@@ -151,8 +156,8 @@ function decisionCard(symbol, prediction) {
   const trigger = prediction.trigger ? `${prediction.trigger.type} ${prediction.trigger.direction} · ${prediction.trigger.timeframe} · ${prediction.trigger.detail}` : 'niciun trigger eligibil';
   const reasons = (prediction.reasonCodes || []).slice(0, 5).map((reason) => `<span class="reason">${safe(reason)}</span>`).join('');
   const frameRows = (prediction.frameBiases || []).map((frame) => `<span class="frame-chip ${safe(directionClass(frame.dominant))}">${safe(frame.timeframe)} ${safe(frame.state)} · ${safe(frame.up)}:${safe(frame.down)}</span>`).join('');
-  const learning = prediction.learningGuard;
-  return `<article class="decision-card ${safe(visual)}"><div class="decision-top"><div><span class="symbol-label">${safe(symbol)}</span><h3>${safe(prediction.horizonMin)} minute</h3></div><span class="quality-ring">${safe(prediction.quality)}<small>/100</small></span></div><div class="decision-verdict ${safe(visual)}">${safe(title)}</div><p class="protocol">${safe(prediction.protocol)}</p><div class="frame-row">${frameRows}</div><div class="reason-codes">${reasons}</div><div class="decision-facts"><span>Bias <b class="${safe(directionClass(prediction.bias))}">${safe(prediction.bias)}</b></span><span>UP ${safe(formatNumber(prediction.directionScores && prediction.directionScores.up))} / DOWN ${safe(formatNumber(prediction.directionScores && prediction.directionScores.down))}</span><span>Trigger: ${safe(trigger)}</span><span>${safe(probabilityText(prediction))}</span>${learning ? `<span>Learning guard: N=${safe(learning.sample)} · ${learning.blocked ? 'BLOCAT' : 'nu blochează'}</span>` : ''}</div>${aiConsensusBlock(prediction.aiConsensus)}<details class="audit"><summary>Audit complet al deciziei</summary><div class="audit-grid"><b>Execuție</b><span>${safe((prediction.executionTimeframes || []).join(' + '))}</span><b>Context</b><span>${safe((prediction.contextTimeframes || []).join(' + '))}</span><b>Confirmări</b><span>${safe((prediction.confirmations || []).join(', ') || '—')}</span><b>Dovezi</b><span>${compactList(prediction.evidence)}</span><b>Conflicte</b><span>${compactList(prediction.conflicts, 'niciun conflict explicit')}</span><b>Invalidare</b><span>${safe(prediction.invalidation)}</span><b>Entry</b><span>${safe(formatTime(prediction.entryBoundaryOpenTime))}</span><b>Expiry</b><span>${safe(formatTime(prediction.expiryEstimateCloseTime))}</span><b>Porți</b><span>${gatesTable(prediction.gateChecks)}</span><b>Signal key</b><span>${safe(prediction.signalKey || '—')}</span></div></details></article>`;
+  const learning = prediction.localLearning;
+  return `<article class="decision-card ${safe(visual)}"><div class="decision-top"><div><span class="symbol-label">${safe(symbol)}</span><h3>${safe(prediction.horizonMin)} minute</h3></div><span class="quality-ring">${safe(prediction.quality)}<small>/100</small></span></div><div class="decision-verdict ${safe(visual)}">${safe(title)}</div><p class="protocol">${safe(prediction.protocol)}</p><div class="frame-row">${frameRows}</div><div class="reason-codes">${reasons}</div><div class="decision-facts"><span>Bias <b class="${safe(directionClass(prediction.bias))}">${safe(prediction.bias)}</b></span><span>UP ${safe(formatNumber(prediction.directionScores && prediction.directionScores.up))} / DOWN ${safe(formatNumber(prediction.directionScores && prediction.directionScores.down))}</span><span>Trigger: ${safe(trigger)}</span><span>${safe(probabilityText(prediction))}</span></div>${localLearningBlock(learning)}<details class="audit"><summary>Audit complet al deciziei</summary><div class="audit-grid"><b>Execuție</b><span>${safe((prediction.executionTimeframes || []).join(' + '))}</span><b>Context</b><span>${safe((prediction.contextTimeframes || []).join(' + '))}</span><b>Confirmări</b><span>${safe((prediction.confirmations || []).join(', ') || '—')}</span><b>Dovezi</b><span>${compactList(prediction.evidence)}</span><b>Conflicte</b><span>${compactList(prediction.conflicts, 'niciun conflict explicit')}</span><b>Invalidare</b><span>${safe(prediction.invalidation)}</span><b>Entry</b><span>${safe(formatTime(prediction.entryBoundaryOpenTime))}</span><b>Expiry</b><span>${safe(formatTime(prediction.expiryEstimateCloseTime))}</span><b>Porți</b><span>${gatesTable(prediction.gateChecks)}</span><b>Signal key</b><span>${safe(prediction.signalKey || '—')}</span></div></details></article>`;
 }
 
 function renderDecisions() {
@@ -167,12 +172,12 @@ function renderJournal(journal) {
   const learning = journal.learning || {};
   const setups = Object.values(learning.bySetup || {}).sort((a, b) => b.n - a.n).slice(0, 8);
   const tags = Object.entries(learning.lossTagCounts || {}).sort((a, b) => b[1] - a[1]);
-  byId('learningSummary').innerHTML = `<div class="learning-policy"><b>Politică:</b> ${safe(learning.policy || '—')}<br><b>Break-even:</b> 10m ${safe(formatNumber(learning.breakEvenWinRate && learning.breakEvenWinRate['10m'], 2))}% · 30m ${safe(formatNumber(learning.breakEvenWinRate && learning.breakEvenWinRate['30m'], 2))}% · minimum N=${safe(learning.minimumSample || 30)}</div><div><b>Setup-uri observate</b>${setups.length ? compactList(setups.map((item) => `${item.key}: ${formatNumber(item.winRate, 1)}% · N=${item.n} · Wilson95 ${formatNumber(item.wilson95.low, 1)}–${formatNumber(item.wilson95.high, 1)}%`)) : '<p class="muted">Încă nu există setup-uri rezolvate în această versiune.</p>'}</div><div><b>Cauze candidate în pierderi</b>${tags.length ? compactList(tags.map(([tag, count]) => `${tag}: ${count}`)) : '<p class="muted">Nicio pierdere revizuită încă.</p>'}</div>`;
+  byId('learningSummary').innerHTML = `<div class="learning-policy"><b>Politică:</b> ${safe(learning.policy || '—')}<br><b>Break-even:</b> 10m ${safe(formatNumber(learning.breakEvenWinRate && learning.breakEvenWinRate['10m'], 2))}% · 30m ${safe(formatNumber(learning.breakEvenWinRate && learning.breakEvenWinRate['30m'], 2))}% · minimum calibrare N=${safe(learning.minimumSample || 30)}</div><div><b>Setup-uri observate</b>${setups.length ? compactList(setups.map((item) => `${item.key}: ${formatNumber(item.winRate, 1)}% · N=${item.n} · Wilson95 ${formatNumber(item.wilson95.low, 1)}–${formatNumber(item.wilson95.high, 1)}%`)) : '<p class="muted">Încă nu există setup-uri rezolvate în această versiune.</p>'}</div><div><b>Cauze candidate în pierderi</b>${tags.length ? compactList(tags.map(([tag, count]) => `${tag}: ${count}`)) : '<p class="muted">Nicio pierdere revizuită încă.</p>'}</div>`;
   const rows = (journal.recent || []).map((entry) => {
     const result = entry.status === 'resolved' ? (entry.win ? 'WIN' : 'LOSS') : entry.status === 'invalid' ? `INVALID · ${entry.invalidReason}` : 'PENDING';
     const review = entry.review;
-    const ai = review && review.ai;
-    return `<article class="journal-row ${entry.win === false ? 'loss-row' : ''}"><div><b>${safe(entry.symbol)}</b> · ${safe(entry.horizonMin)}m · <span class="${safe(directionClass(entry.direction))}">${safe(entry.direction)}</span> · quality ${safe(entry.quality)}<div class="muted">${safe(formatTime(entry.entryOpenTime))} ${safe(formatPrice(entry.entryPrice))} → ${safe(formatTime(entry.targetCloseTime))} ${safe(formatPrice(entry.exitPrice))}</div>${review ? `<div class="review"><b>Review determinist:</b> ${safe(review.summary)}<br>MFE ${safe(formatNumber(review.maximumFavorableExcursionPct, 4))}% · MAE ${safe(formatNumber(review.maximumAdverseExcursionPct, 4))}% · ${safe((review.tags || []).join(', ') || 'fără tag')}</div>` : ''}${ai ? `<div class="ai-review"><b>Gemini ${safe(ai.model)}:</b> ${safe(ai.diagnosis)} · confidence ${safe(ai.confidence)}<br><b>Verificări:</b> ${safe((ai.researchChecks || []).join(' | '))}</div>` : ''}</div><strong class="${entry.win ? 'fresh' : entry.win === false ? 'stale' : ''}">${safe(result)}</strong></article>`;
+    const local = entry.features && entry.features.localLearning;
+    return `<article class="journal-row ${entry.win === false ? 'loss-row' : ''}"><div><b>${safe(entry.symbol)}</b> · ${safe(entry.horizonMin)}m · <span class="${safe(directionClass(entry.direction))}">${safe(entry.direction)}</span> · quality ${safe(entry.quality)}<div class="muted">${safe(formatTime(entry.entryOpenTime))} ${safe(formatPrice(entry.entryPrice))} → ${safe(formatTime(entry.targetCloseTime))} ${safe(formatPrice(entry.exitPrice))}</div>${review ? `<div class="review"><b>Review determinist:</b> ${safe(review.summary)}<br>MFE ${safe(formatNumber(review.maximumFavorableExcursionPct, 4))}% · MAE ${safe(formatNumber(review.maximumAdverseExcursionPct, 4))}% · ${safe((review.tags || []).join(', ') || 'fără tag')}</div>` : ''}${local ? `<div class="review"><b>Learner la emitere:</b> ${safe(local.bucketKey)} · ${safe(local.phase)} · N=${safe(local.effectiveSamples)}${local.active ? ` · p=${safe(formatNumber(local.probability * 100, 2))}% · prag=${safe(formatNumber(local.threshold * 100, 2))}%` : ''} · ${local.trainingEligible ? 'training eligibil' : 'audit-only overlap'}</div>` : ''}</div><strong class="${entry.win ? 'fresh' : entry.win === false ? 'stale' : ''}">${safe(result)}</strong></article>`;
   }).join('');
   byId('journalRows').innerHTML = rows || '<p class="muted">Niciun ENTER înregistrat pentru motorul curent.</p>';
 }
@@ -204,24 +209,27 @@ function fillConfig(config, force = false) {
   byId('btSymbol').innerHTML = (config.symbols || []).map((symbol) => `<option value="${safe(symbol)}">${safe(symbol)}</option>`).join('');
 }
 
-function renderAiStatus(strategist, reviewer) {
-  const brain = byId('brainBadge');
-  const configured = Boolean(strategist && strategist.enabled);
-  const healthy = Boolean(configured && strategist.lastSuccessfulAt && !strategist.lastError);
-  const waiting = Boolean(configured && !strategist.lastSuccessfulAt && !strategist.lastError);
-  brain.textContent = !configured ? 'Creier AI oprit'
-    : strategist.inFlight ? `${strategist.model} · gândește…`
-      : healthy ? `${strategist.model} · sănătos`
-        : waiting ? `${strategist.model} · așteaptă prima analiză`
-          : `${strategist.model} · eroare`;
-  brain.className = `badge ${healthy || strategist && strategist.inFlight ? 'badge-on' : 'badge-off'}`;
-  const reviewerEnabled = Boolean(reviewer && reviewer.enabled);
-  byId('aiStatus').textContent = !configured
-    ? 'Gemini live obligatoriu pentru ENTER · setează GEMINI_API_KEY'
-    : strategist.lastError
-      ? `Strateg live configurat, dar ultima analiză a eșuat: ${strategist.lastError}`
-      : `Strateg live ${strategist.model} · ${strategist.totalRequests || 0} analize · loss review ${reviewerEnabled ? 'activ cu prioritate secundară' : 'oprit'}`;
-  byId('aiStatus').className = `ai-status ${healthy ? 'enabled' : ''}`;
+function renderLocalLearning(learner) {
+  const badge = byId('learnerBadge');
+  const status = byId('learnerStatus');
+  const buckets = Object.values(learner && learner.byBucket || {}).sort((a, b) => a.symbol.localeCompare(b.symbol) || a.horizonMin - b.horizonMin);
+  const unavailable = Boolean(learner && learner.available === false);
+  const activeCount = buckets.filter((bucket) => bucket.active).length;
+  const monitoringCount = buckets.filter((bucket) => bucket.phase === 'MONITORING').length;
+  const globalPhase = unavailable ? 'ERROR' : activeCount ? `ACTIVE ${activeCount}/4` : monitoringCount ? `MONITORING ${monitoringCount}/4` : 'WARMUP';
+  badge.textContent = `Learner local · ${globalPhase}`;
+  badge.className = `badge ${unavailable ? 'badge-off' : activeCount ? 'badge-on' : ''}`;
+  status.textContent = unavailable
+    ? `ERROR · ENTER blocat · ${learner.lastError || 'starea locală nu este disponibilă'}${learner.recovery ? ` · ${learner.recovery}` : ''}`
+    : learner && learner.externalApi === false
+      ? `${globalPhase} · cost API 0 · N efectiv ${learner.totals && learner.totals.effectiveSamples || 0}`
+      : 'Learner local indisponibil';
+  status.className = `learner-status ${activeCount && !unavailable ? 'enabled' : unavailable ? 'error' : ''}`;
+  byId('localLearningSummary').innerHTML = buckets.length ? buckets.map((bucket) => {
+    const phaseClass = bucket.phase === 'ERROR' ? 'error' : bucket.active ? 'active' : bucket.phase === 'MONITORING' ? 'monitoring' : 'warmup';
+    const losses = bucket.modelLogLoss == null ? 'așteaptă rezultate' : `log-loss model ${formatNumber(bucket.modelLogLoss, 4)} / baseline ${formatNumber(bucket.baselineLogLoss, 4)} · ${bucket.beatsBaseline ? 'model mai bun' : 'încă nu bate baseline-ul'}`;
+    return `<article class="learner-bucket ${safe(phaseClass)}"><div><b>${safe(bucket.symbol)} · ${safe(bucket.horizonMin)}m</b><span>${safe(bucket.phase)}</span></div><strong>N ${safe(bucket.effectiveSamples)}/${safe(bucket.minimumEffectiveSamples)}</strong><p>W/L ${safe(bucket.wins)}/${safe(bucket.losses)} · pending ${safe(bucket.pending)} · overlap exclus ${safe(bucket.excludedOverlap)} · invalid ${safe(bucket.invalid)}</p><small>${safe(losses)}</small></article>`;
+  }).join('') : '<p class="muted">Aștept inițializarea celor patru bucket-uri locale.</p>';
 }
 
 function renderState(state) {
@@ -234,17 +242,14 @@ function renderState(state) {
   renderJournal(state.journal);
   renderAlerts(state.alerts);
   renderErrors();
-  renderAiStatus(state.aiStrategist, state.aiReviewer);
+  renderLocalLearning(state.localLearning);
   const clock = state.status && state.status.scanClock;
   byId('clockBadge').textContent = clock ? (clock.failClosed ? 'Analiză blocată' : `Analiză ${formatAge(Date.now() - (clock.publishedAtCorrected || clock.asOf))}`) : 'Analiză —';
   byId('clockBadge').className = `badge ${clock && clock.failClosed ? 'badge-off' : ''}`;
   const newestTicker = Object.values(currentTickers).sort((a, b) => b.receivedAt - a.receivedAt)[0];
   byId('liveBadge').textContent = newestTicker ? `Preț live ${formatAge(Date.now() - newestTicker.receivedAt)}` : 'Preț live —';
   byId('liveBadge').className = `badge ${newestTicker && Date.now() - newestTicker.receivedAt <= 3_000 ? 'badge-on' : 'badge-off'}`;
-  const aiSource = !state.aiStrategist || !state.aiStrategist.enabled ? 'oprit (ENTER blocat)'
-    : state.aiStrategist.lastError ? `eroare (ENTER blocat)`
-      : state.aiStrategist.lastSuccessfulAt ? `${state.aiStrategist.model} sănătos` : `${state.aiStrategist.model} așteaptă`;
-  byId('sourceLine').textContent = `Build ${state.build || '—'} · preț MEXC Spot refresh 1s · analiză closed-candle ${state.config && state.config.scanIntervalSec || '—'}s · AI ${aiSource}${clock ? ` · clock RTT ${clock.roundTripMs}ms · skew ${clock.localSkewMs}ms` : ''}`;
+  byId('sourceLine').textContent = `Build ${state.build || '—'} · preț MEXC Spot refresh 1s · analiză closed-candle ${state.config && state.config.scanIntervalSec || '—'}s · learner local ${state.localLearning && state.localLearning.available !== false ? 'persistent, API 0' : 'ERROR, ENTER blocat'}${clock ? ` · clock RTT ${clock.roundTripMs}ms · skew ${clock.localSkewMs}ms` : ''}`;
   const progress = state.status && state.status.backtestProgress;
   if (progress) byId('btStatus').textContent = `${progress.phase}: ${progress.percent}%`;
 }
@@ -352,11 +357,6 @@ stream.addEventListener('price-tick', (event) => {
     byId('liveBadge').textContent = newest ? `Preț live ${formatAge(Date.now() - newest.receivedAt)}` : 'Preț live —';
     byId('liveBadge').className = `badge ${newest && Date.now() - newest.receivedAt <= 3_000 ? 'badge-on' : 'badge-off'}`;
   }
-});
-stream.addEventListener('learning-update', (event) => {
-  const update = JSON.parse(event.data);
-  if (currentState && update.journal) { currentState.journal = update.journal; renderJournal(update.journal); }
-  renderAiStatus(currentState && currentState.aiStrategist, update.aiReviewer || currentState && currentState.aiReviewer);
 });
 stream.addEventListener('config', (event) => fillConfig(JSON.parse(event.data)));
 stream.addEventListener('backtest-progress', (event) => { const progress = JSON.parse(event.data); byId('btStatus').textContent = `${progress.phase}: ${progress.percent}%`; });

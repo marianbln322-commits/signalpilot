@@ -3,7 +3,7 @@
 const { contractBoundaries } = require('./contract-timing');
 
 const ANALYSIS_CANDLE_COUNT = 300;
-const ENGINE_VERSION = 'event-futures-expert-v3';
+const ENGINE_VERSION = 'event-futures-expert-v4-local-learning';
 
 const HORIZONS = Object.freeze({
   10: {

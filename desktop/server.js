@@ -8,8 +8,7 @@ const market = require('./lib/mexc-market-data');
 const expertEngine = require('./lib/expert-engine');
 const { buildChartData } = require('./lib/chart-state');
 const { Journal, atomicWriteJson } = require('./lib/journal');
-const { GeminiLossReviewer } = require('./lib/gemini-reviewer');
-const { GeminiLiveStrategist, applyAiConsensus } = require('./lib/gemini-live-strategist');
+const { LocalAdaptiveLearner } = require('./lib/local-adaptive-learner');
 const { chooseEstimate } = require('./lib/calibration');
 
 const HOST = '127.0.0.1';
@@ -18,6 +17,7 @@ const APP_BUILD = expertEngine.ENGINE_VERSION;
 const DATA_DIR = path.join(__dirname, 'data');
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const JOURNAL_FILE = path.join(DATA_DIR, 'journal.json');
+const LOCAL_LEARNING_FILE = path.join(DATA_DIR, 'local-learning.json');
 const CACHE_DIR = path.join(DATA_DIR, 'cache');
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const BACKTEST_WORKER = path.join(__dirname, 'lib', 'backtest-worker.js');
@@ -46,7 +46,7 @@ function validateConfig(input) {
   }
   return {
     symbols: [...EXPERT_SYMBOLS],
-    scanIntervalSec: Math.round(finiteInRange(input.scanIntervalSec, 'scanIntervalSec', 15, 300)),
+    scanIntervalSec: Math.round(finiteInRange(input.scanIntervalSec, 'scanIntervalSec', 5, 300)),
     settleDelayMs: Math.round(finiteInRange(input.settleDelayMs, 'settleDelayMs', 0, 30_000)),
     minQuality10: Math.round(finiteInRange(input.minQuality10, 'minQuality10', 0, 100)),
     minQuality30: Math.round(finiteInRange(input.minQuality30, 'minQuality30', 0, 100)),
@@ -66,8 +66,7 @@ function loadConfig() {
 
 let config = loadConfig();
 const journal = new Journal(JOURNAL_FILE, expertEngine.ENGINE_VERSION);
-const geminiReviewer = new GeminiLossReviewer();
-const geminiStrategist = new GeminiLiveStrategist();
+const localLearner = new LocalAdaptiveLearner(LOCAL_LEARNING_FILE);
 const state = {
   startedAt: Date.now(), scanning: false, lastScanStartedAt: null, lastScanCompletedAt: null,
   scanClock: null, latest: {}, errors: {}, alerts: [], backtests: {}, backtestProgress: null,
@@ -76,14 +75,8 @@ const state = {
 const clients = new Set();
 let stopped = false;
 let schedulerTimer = null;
-let nextScanDueAt = null;
 let tickerTimer = null;
 let tickerPromise = null;
-let aiReviewChain = Promise.resolve();
-let aiRetryTimer = null;
-let aiBacklogDueAt = null;
-const queuedAiSignalKeys = new Set();
-const aiRetryState = new Map();
 let scanPromise = null;
 let activeBacktest = null;
 let shuttingDown = false;
@@ -141,9 +134,9 @@ function publicState() {
       scanClock: state.scanClock, errors: state.errors, backtestProgress: state.backtestProgress,
     },
     latest, tickers: state.tickers, tickerErrors: state.tickerErrors,
-    liveFeed: state.liveFeed, aiStrategist: geminiStrategist.status(), aiReviewer: geminiReviewer.status(),
+    liveFeed: state.liveFeed, localLearning: localLearner.snapshot(config.symbols),
     alerts: state.alerts, journal: journalState, backtests: state.backtests,
-    warning: 'Prețul live este observat din MEXC Spot la 1 secundă; deciziile folosesc exclusiv lumânări închise. ENTER este doar o recomandare manuală și cere acord exact între porțile deterministe și strategul Gemini live. Event Futures poate avea reguli/preț de settlement diferite. Nu există promisiune de precizie sau profit.',
+    warning: 'Prețul live este observat din MEXC Spot la 1 secundă; deciziile folosesc exclusiv lumânări închise. ENTER este doar o recomandare manuală și cere toate porțile deterministe; după warm-up, learnerul local poate doar să blocheze intrări sub pragul payout-ului. Event Futures poate avea reguli/preț de settlement diferite. Nu există promisiune de precizie sau profit.',
   };
 }
 
@@ -197,74 +190,6 @@ function scheduleLiveTicker(delayMs = 0) {
   }, delayMs);
 }
 
-function eligibleAiBacklog(limit = 1, now = Date.now()) {
-  return journal.lossesNeedingAiReview(5_000)
-    .filter((entry) => !queuedAiSignalKeys.has(entry.signalKey))
-    .filter((entry) => {
-      const retry = aiRetryState.get(entry.signalKey);
-      return !retry || retry.nextEligibleAt <= now;
-    })
-    .sort((a, b) => {
-      const attemptsA = aiRetryState.get(a.signalKey)?.attempts || 0;
-      const attemptsB = aiRetryState.get(b.signalKey)?.attempts || 0;
-      return attemptsA - attemptsB || a.generatedAt - b.generatedAt;
-    })
-    .slice(0, limit);
-}
-
-function scheduleAiBacklog(delayMs = 0) {
-  if (!geminiReviewer.status().enabled || stopped) return;
-  const dueAt = Date.now() + Math.max(0, delayMs);
-  if (aiRetryTimer && Number.isFinite(aiBacklogDueAt) && aiBacklogDueAt <= dueAt) return;
-  clearTimeout(aiRetryTimer);
-  aiBacklogDueAt = dueAt;
-  aiRetryTimer = setTimeout(() => {
-    aiRetryTimer = null;
-    aiBacklogDueAt = null;
-    const eligible = eligibleAiBacklog(1);
-    if (eligible.length) {
-      queueAiLossReviews(eligible);
-      return;
-    }
-    const futureRetries = [...aiRetryState.values()].map((item) => item.nextEligibleAt).filter((time) => time > Date.now());
-    if (futureRetries.length) scheduleAiBacklog(Math.max(100, Math.min(...futureRetries) - Date.now()));
-  }, Math.max(0, delayMs));
-}
-
-function queueAiLossReviews(entries = eligibleAiBacklog(1)) {
-  if (!geminiReviewer.status().enabled) return;
-  const liveRequestPending = state.scanning || geminiStrategist.status().inFlight > 0
-    || (Number.isFinite(nextScanDueAt) && nextScanDueAt - Date.now() <= 12_000);
-  if (liveRequestPending) {
-    scheduleAiBacklog(500);
-    return;
-  }
-  for (const entry of (entries || []).filter((item) => item.win === false
-    && item.review && item.review.complete !== false && !item.review.ai).slice(0, 1)) {
-    const retry = aiRetryState.get(entry.signalKey);
-    if (queuedAiSignalKeys.has(entry.signalKey) || (retry && retry.nextEligibleAt > Date.now())) continue;
-    queuedAiSignalKeys.add(entry.signalKey);
-    aiReviewChain = aiReviewChain.then(async () => {
-      const review = await geminiReviewer.review(entry, { timeoutMs: 10_000 });
-      if (review && journal.attachAiReview(entry.signalKey, review)) {
-        aiRetryState.delete(entry.signalKey);
-        broadcast('learning-update', {
-          journal: journal.snapshot(100, { 10: config.payout10, 30: config.payout30 }),
-          aiReviewer: geminiReviewer.status(),
-        });
-      }
-    }).catch((error) => {
-      const attempts = (aiRetryState.get(entry.signalKey)?.attempts || 0) + 1;
-      const delayMs = Math.min(3_600_000, 60_000 * (2 ** Math.min(5, attempts - 1)));
-      aiRetryState.set(entry.signalKey, { attempts, nextEligibleAt: Date.now() + delayMs, lastError: error.message });
-      console.error(`[gemini-review] ${entry.signalKey}: ${error.message}; retry ${attempts} in ${delayMs}ms`);
-    }).finally(() => {
-      queuedAiSignalKeys.delete(entry.signalKey);
-      scheduleAiBacklog(100);
-    });
-  }
-}
-
 function pruneUnconfiguredState() {
   for (const symbol of Object.keys(state.latest)) if (!config.symbols.includes(symbol)) delete state.latest[symbol];
   for (const symbol of Object.keys(state.errors)) if (!config.symbols.includes(symbol)) delete state.errors[symbol];
@@ -275,25 +200,15 @@ function pruneUnconfiguredState() {
 function prepareSnapshot(symbol, rawSnapshot, clock, analyzedAt, analysisConfig) {
   const snapshot = market.revalidateSnapshot(rawSnapshot, analyzedAt);
   snapshot.clockSource = clock.source;
-  const result = expertEngine.analyzeSnapshot(snapshot, analysisConfig);
+  return { symbol, snapshot, result: expertEngine.analyzeSnapshot(snapshot, analysisConfig) };
+}
+
+function finalizeSnapshot(prepared, clock, availableAt, analysisConfig) {
+  const { symbol, snapshot, result } = prepared;
   result.predictions = Object.fromEntries(Object.entries(result.predictions).map(([key, prediction]) => {
     const payout = prediction.horizonMin === 10 ? analysisConfig.payout10 : analysisConfig.payout30;
-    return [key, journal.applyLearningGuard(prediction, payout)];
+    return [key, localLearner.observeAndGuard(prediction, payout, availableAt)];
   }));
-  return { symbol, snapshot, result };
-}
-
-function analysesFromResult(result) {
-  return Object.values(result.predictions || {}).reduce((all, prediction) => ({
-    ...all,
-    ...(prediction.timeframeAnalyses || {}),
-  }), {});
-}
-
-function finalizeSnapshot(prepared, strategy, clock, availableAt) {
-  const { symbol, snapshot, result } = prepared;
-  result.predictions = Object.fromEntries(Object.entries(result.predictions)
-    .map(([key, prediction]) => [key, applyAiConsensus(prediction, strategy, availableAt)]));
   result.generatedAt = availableAt;
   result.chartData = buildChartData(snapshot, result);
   result.clockSource = clock.source;
@@ -308,8 +223,6 @@ function finalizeSnapshot(prepared, strategy, clock, availableAt) {
 async function scanOnce() {
   if (scanPromise) return scanPromise;
   scanPromise = (async () => {
-    const reviewCancelled = geminiReviewer.cancel('live scan started');
-    if (reviewCancelled) await aiReviewChain.catch(() => {});
     const scanRevision = configRevision;
     const scanConfig = { ...config, symbols: [...config.symbols] };
     state.scanning = true;
@@ -368,12 +281,28 @@ async function scanOnce() {
       return;
     }
 
-    // Resolve outcomes before building AI memory so the strategist sees every result that is
-    // already knowable from the current closed 1m candles, without future leakage.
-    const resolvedEntries = journal.resolveFromClosedCandles(oneMinuteBySymbol);
+    // Rezolvă mai întâi toate rezultatele care sunt deja cunoscute din lumânările 1m
+    // închise. Learnerul vede strict boundary-ul exact și se actualizează walk-forward.
+    try {
+      journal.resolveFromClosedCandles(oneMinuteBySymbol);
+      localLearner.resolveFromClosedCandles(oneMinuteBySymbol);
+    } catch (error) {
+      const completedAt = Date.now();
+      for (const symbol of scanConfig.symbols) {
+        state.errors[symbol] = {
+          at: completedAt,
+          message: `LOCAL_LEARNING_FAIL_CLOSED: ${error.message}`,
+          staleResultRemoved: true,
+        };
+        delete state.latest[symbol];
+      }
+      state.lastScanCompletedAt = completedAt;
+      state.scanClock = { ...clock, failClosed: true, failClosedReason: 'LOCAL_LEARNING_UNAVAILABLE', completedAtLocal: completedAt };
+      state.scanning = false;
+      broadcast('scan-complete', { ...publicState(), newAlerts: [] });
+      return;
+    }
 
-    // Deterministic analysis is captured after acquisition. Gemini receives the complete compact
-    // numerical snapshot plus a locally rendered multi-timeframe chart, once per new 1m candle.
     const analyzedAt = market.correctedNow(clock);
     const preparedResults = [];
     for (const [symbol, snapshot] of Object.entries(snapshots)) {
@@ -384,36 +313,14 @@ async function scanOnce() {
         delete state.latest[symbol];
       }
     }
-    const strategyPairs = await Promise.all(preparedResults.map(async (prepared) => [
-      prepared.symbol,
-      await geminiStrategist.analyze({
-        symbol: prepared.symbol,
-        snapshot: prepared.snapshot,
-        analyses: analysesFromResult(prepared.result),
-        memory: journal.strategistMemory(prepared.symbol,
-          prepared.snapshot.candles['1m'][prepared.snapshot.candles['1m'].length - 1].closeTime),
-        analyzedAt,
-      }),
-    ]));
-    const strategies = Object.fromEntries(strategyPairs);
 
-    if (scanRevision !== configRevision) {
-      pruneUnconfiguredState();
-      state.lastScanCompletedAt = Date.now();
-      state.scanClock = { ...clock, discarded: true, discardReason: 'CONFIG_CHANGED_DURING_AI_ANALYSIS' };
-      state.scanning = false;
-      queueAiLossReviews(resolvedEntries);
-      broadcast('scan-complete', { ...publicState(), newAlerts: [] });
-      return;
-    }
-
-    // Entry boundaries start strictly after the AI answer is available, never before it.
+    // Boundary-ul intrării începe strict după ce analiza locală este disponibilă.
     const availableAt = market.correctedNow(clock);
     const alerts = [];
     for (const prepared of preparedResults) {
       const { symbol } = prepared;
       try {
-        const result = finalizeSnapshot(prepared, strategies[symbol], clock, availableAt);
+        const result = finalizeSnapshot(prepared, clock, availableAt, scanConfig);
         for (const prediction of Object.values(result.predictions)) {
           const entry = journal.record(prediction);
           if (!entry) continue;
@@ -422,7 +329,7 @@ async function scanOnce() {
             action: prediction.action, direction: prediction.direction, verdict: prediction.verdict,
             quality: prediction.quality, trigger: prediction.trigger,
             generatedAt: prediction.generatedAt,
-            aiConsensus: prediction.aiConsensus,
+            localLearning: prediction.localLearning,
           };
           state.alerts.unshift(alert);
           alerts.push(alert);
@@ -434,7 +341,6 @@ async function scanOnce() {
     }
     state.alerts.length = Math.min(state.alerts.length, 100);
 
-    queueAiLossReviews(resolvedEntries);
     state.lastScanCompletedAt = Date.now();
     state.scanClock = {
       ...clock,
@@ -453,9 +359,7 @@ async function scanOnce() {
 
 function scheduleNext(delayMs = 0) {
   clearTimeout(schedulerTimer);
-  nextScanDueAt = Date.now() + Math.max(0, delayMs);
   schedulerTimer = setTimeout(async () => {
-    nextScanDueAt = null;
     try {
       await scanOnce();
     } catch (error) {
@@ -584,7 +488,6 @@ server.once('listening', () => {
   console.log(`SignalPilot Expert listening only on http://${HOST}:${PORT} (localhost alias accepted)`);
   scheduleLiveTicker(0);
   scheduleNext(0);
-  scheduleAiBacklog(1_000);
 });
 server.once('error', (error) => {
   if (error.code === 'EADDRINUSE') console.error(`SignalPilot Expert cannot start: ${HOST}:${PORT} is already occupied. No fallback port is used.`);
@@ -598,7 +501,6 @@ async function shutdown() {
   stopped = true;
   clearTimeout(schedulerTimer);
   clearTimeout(tickerTimer);
-  clearTimeout(aiRetryTimer);
   for (const client of [...clients]) removeClient(client);
   const tasks = [];
   if (activeBacktest && activeBacktest.worker) tasks.push(activeBacktest.worker.terminate().catch(() => {}));
@@ -612,6 +514,6 @@ process.once('SIGTERM', shutdown);
 
 module.exports = {
   app, server, scanOnce, validateConfig, publicState, probabilityEstimate,
-  buildChartData, prepareSnapshot, applyAiConsensus, finalizeSnapshot,
-  scheduleLiveTicker, queueAiLossReviews, scheduleAiBacklog, shutdown, EXPERT_SYMBOLS,
+  buildChartData, prepareSnapshot, finalizeSnapshot, scheduleLiveTicker,
+  localLearner, shutdown, EXPERT_SYMBOLS,
 };

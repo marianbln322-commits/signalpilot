@@ -85,7 +85,6 @@ function outcomeReview(entry, candles) {
       signedMovePct: null, maximumFavorableExcursionPct: null, maximumAdverseExcursionPct: null,
       tags: ['REVIEW_WINDOW_INCOMPLETE'],
       summary: `Review incomplet: ${window.length}/${expectedCandles} lumânări 1m continue; MFE/MAE nu sunt calculate.`,
-      ai: null,
     };
   }
   const high = Math.max(...window.map((candle) => candle.high));
@@ -187,16 +186,20 @@ class Journal {
         frameBiases: signal.frameBiases,
         qualityComponents: signal.qualityComponents,
         analyses: compactAnalyses(signal),
-        aiConsensus: signal.aiConsensus ? {
-          available: signal.aiConsensus.available,
-          agreed: signal.aiConsensus.agreed,
-          model: signal.aiConsensus.model,
-          strategistVersion: signal.aiConsensus.strategistVersion,
-          verdict: signal.aiConsensus.decision && signal.aiConsensus.decision.verdict,
-          confidence: signal.aiConsensus.decision && signal.aiConsensus.decision.confidence,
-          thesis: signal.aiConsensus.decision && signal.aiConsensus.decision.thesis,
-          candleCloseTime: signal.aiConsensus.candleCloseTime,
-          latencyMs: signal.aiConsensus.latencyMs,
+        localLearning: signal.localLearning && signal.localLearning.considered ? {
+          observationId: signal.localLearning.observationId,
+          bucketKey: signal.localLearning.bucketKey,
+          phase: signal.localLearning.phase,
+          active: signal.localLearning.active,
+          blocked: signal.localLearning.blocked,
+          probability: signal.localLearning.probability,
+          threshold: signal.localLearning.threshold,
+          effectiveSamples: signal.localLearning.effectiveSamples,
+          wins: signal.localLearning.wins,
+          losses: signal.localLearning.losses,
+          beatsBaseline: signal.localLearning.beatsBaseline,
+          trainingEligible: signal.localLearning.trainingEligible,
+          exclusionReason: signal.localLearning.exclusionReason,
         } : null,
       },
       signalCloseTime: signal.latestClosedCandleTime,
@@ -251,21 +254,6 @@ class Journal {
     return resolved;
   }
 
-  attachAiReview(signalKey, aiReview) {
-    const entry = this.entries.find((item) => item.signalKey === signalKey);
-    if (!entry || entry.status !== 'resolved' || entry.win !== false || !entry.review) return false;
-    entry.review.ai = { ...aiReview, attachedAt: Date.now() };
-    this.save();
-    return true;
-  }
-
-  lossesNeedingAiReview(limit = 3) {
-    return this.currentEntries()
-      .filter((entry) => entry.status === 'resolved' && entry.win === false
-        && entry.review && entry.review.complete !== false && !entry.review.ai)
-      .slice(0, Math.max(0, limit));
-  }
-
   currentEntries() {
     return this.engineVersion
       ? this.entries.filter((entry) => entry.engineVersion === this.engineVersion)
@@ -296,109 +284,12 @@ class Journal {
       return [`${horizon}m`, Number.isFinite(payout) && payout > 0 ? Number((100 / (1 + payout)).toFixed(2)) : null];
     }));
     return {
-      policy: 'fail-closed only: learning may block a statistically unreliable ENTER, never create or flip a signal',
+      policy: 'audit descriptiv: rezultatele forward și review-ul determinist sunt raportate separat de learnerul local',
       minimumSample: LEARNING_MINIMUM_SAMPLE,
       breakEvenWinRate: breakEven,
       bySetup: setupPerformance,
       lossTagCounts: tagCounts,
       reviewedLosses: resolved.filter((entry) => entry.win === false && entry.review).length,
-      aiReviewedLosses: resolved.filter((entry) => entry.win === false && entry.review && entry.review.ai).length,
-    };
-  }
-
-  strategistMemory(symbol, knowledgeCutoff) {
-    if (!Number.isSafeInteger(knowledgeCutoff)) throw new Error('strategist memory knowledgeCutoff must be a safe integer timestamp');
-    const resolved = this.currentEntries()
-      .filter((entry) => entry.status === 'resolved' && entry.symbol === symbol
-        && Number.isFinite(Number(entry.targetCloseTime)) && Number(entry.targetCloseTime) <= knowledgeCutoff)
-      .sort((a, b) => Number(b.targetCloseTime) - Number(a.targetCloseTime));
-    const knowableReview = (entry) => entry.review && Number.isFinite(Number(entry.review.reviewedAt))
-      && Number(entry.review.reviewedAt) <= knowledgeCutoff ? entry.review : null;
-    const setupPerformance = groupedPerformance(resolved, setupKey);
-    const lossTagCounts = {};
-    for (const entry of resolved.filter((item) => item.win === false)) {
-      const review = knowableReview(entry);
-      for (const tag of review && review.tags || []) lossTagCounts[tag] = (lossTagCounts[tag] || 0) + 1;
-    }
-    return {
-      memoryVersion: 'audited-forward-v1',
-      engineVersion: this.engineVersion,
-      symbol,
-      knowledgeCutoff,
-      policy: 'Folosește numai rezultate cu targetCloseTime <= knowledgeCutoff. Memoria este context, nu permisiune de a ignora datele curente.',
-      overall: aggregate(resolved),
-      byHorizon: {
-        '10m': aggregate(resolved.filter((entry) => entry.horizonMin === 10)),
-        '30m': aggregate(resolved.filter((entry) => entry.horizonMin === 30)),
-      },
-      byDirection: {
-        UP: aggregate(resolved.filter((entry) => entry.direction === 'UP')),
-        DOWN: aggregate(resolved.filter((entry) => entry.direction === 'DOWN')),
-      },
-      bySetup: Object.fromEntries(Object.entries(setupPerformance)
-        .sort(([, a], [, b]) => b.n - a.n).slice(0, 20)),
-      lossTagCounts,
-      recentResolved: resolved.slice(0, 20).map((entry) => {
-        const review = knowableReview(entry);
-        const aiReview = review && review.ai && Number.isFinite(Number(review.ai.attachedAt))
-          && Number(review.ai.attachedAt) <= knowledgeCutoff ? review.ai : null;
-        return {
-          signalKey: entry.signalKey,
-          horizonMin: entry.horizonMin,
-          direction: entry.direction,
-          quality: entry.quality,
-          trigger: entry.trigger ? { type: entry.trigger.type, timeframe: entry.trigger.timeframe } : null,
-          targetCloseTime: entry.targetCloseTime,
-          outcome: entry.win ? 'WIN' : 'LOSS',
-          signedMovePct: review && review.signedMovePct,
-          maximumFavorableExcursionPct: review && review.maximumFavorableExcursionPct,
-          maximumAdverseExcursionPct: review && review.maximumAdverseExcursionPct,
-          tags: review && review.tags || [],
-          aiDiagnosis: aiReview && aiReview.diagnosis || null,
-        };
-      }),
-    };
-  }
-
-  applyLearningGuard(signal, payout) {
-    if (!signal || signal.action !== 'ENTER' || !signal.trigger) return signal;
-    const comparable = this.currentEntries().filter((entry) => entry.status === 'resolved'
-      && entry.symbol === signal.symbol
-      && entry.horizonMin === signal.horizonMin
-      && entry.direction === signal.direction
-      && entry.trigger && entry.trigger.type === signal.trigger.type
-      && entry.trigger.timeframe === signal.trigger.timeframe);
-    const performance = aggregate(comparable);
-    const breakEvenWinRate = Number.isFinite(Number(payout)) && Number(payout) > 0 ? 100 / (1 + Number(payout)) : null;
-    const enough = performance.n >= LEARNING_MINIMUM_SAMPLE;
-    const blocked = enough && Number.isFinite(breakEvenWinRate)
-      && Number.isFinite(performance.wilson95.high) && performance.wilson95.high < breakEvenWinRate;
-    const learningGuard = {
-      key: setupKey(signal),
-      sample: performance.n,
-      minimumSample: LEARNING_MINIMUM_SAMPLE,
-      winRate: performance.winRate,
-      wilson95: performance.wilson95,
-      breakEvenWinRate: Number.isFinite(breakEvenWinRate) ? Number(breakEvenWinRate.toFixed(2)) : null,
-      blocked,
-      rule: 'blochează numai dacă N>=30 și limita superioară Wilson95 este sub break-even; nu poate crea sau inversa semnale',
-    };
-    if (!blocked) return { ...signal, learningGuard };
-    return {
-      ...signal,
-      intendedDirection: signal.direction,
-      action: 'WAIT',
-      direction: null,
-      verdict: 'WAIT',
-      signalKey: null,
-      learningGuard,
-      reasonCodes: [...new Set([...(signal.reasonCodes || []), 'LEARNED_SETUP_UNRELIABLE'])],
-      gateChecks: [...(signal.gateChecks || []), {
-        code: 'LEARNED_SETUP_UNRELIABLE',
-        pass: false,
-        detail: `N=${performance.n}, Wilson95 high=${performance.wilson95.high}% < break-even=${learningGuard.breakEvenWinRate}%`,
-      }],
-      conflicts: [...(signal.conflicts || []), 'profilul forward comparabil este statistic sub break-even; intrarea a fost blocată'],
     };
   }
 
