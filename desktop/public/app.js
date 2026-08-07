@@ -136,6 +136,14 @@ function gatesTable(gates) {
   return `<table class="gate-table"><tbody>${(gates || []).map((gate) => `<tr><td class="${gate.pass ? 'fresh' : 'stale'}">${gate.pass ? 'PASS' : 'FAIL'}</td><td>${safe(gate.code)}</td><td>${safe(gate.detail)}</td></tr>`).join('')}</tbody></table>`;
 }
 
+function aiConsensusBlock(consensus) {
+  if (!consensus) return '<div class="brain-box unavailable"><b>Creier Gemini:</b> analiza nu este încă disponibilă.</div>';
+  const decision = consensus.decision;
+  const verdict = decision && decision.verdict || 'INDISPONIBIL';
+  const stateClass = consensus.agreed ? 'agreed' : 'unavailable';
+  return `<div class="brain-box ${safe(stateClass)}"><div class="brain-head"><b>Creier Gemini · ${safe(verdict)}</b><span>${safe(consensus.agreed ? 'ACORD EXACT' : consensus.code || 'WAIT')}</span></div><div>${safe(consensus.model || 'model neconfigurat')}${consensus.latencyMs != null ? ` · ${safe(consensus.latencyMs)}ms` : ''}${decision ? ` · confidence ${safe(decision.confidence)}` : ''}</div>${decision ? `<p>${safe(decision.thesis)}</p><div><b>Dovezi AI:</b> ${safe((decision.evidence || []).join(' · '))}</div><div><b>Riscuri AI:</b> ${safe((decision.risks || []).join(' · '))}</div>` : `<p>${safe(consensus.error || 'Gemini live este obligatoriu pentru ENTER. Configurează GEMINI_API_KEY.')}</p>`}</div>`;
+}
+
 function decisionCard(symbol, prediction) {
   const enter = prediction.action === 'ENTER' && ['UP', 'DOWN'].includes(prediction.direction);
   const visual = enter ? prediction.direction : 'WAIT';
@@ -144,7 +152,7 @@ function decisionCard(symbol, prediction) {
   const reasons = (prediction.reasonCodes || []).slice(0, 5).map((reason) => `<span class="reason">${safe(reason)}</span>`).join('');
   const frameRows = (prediction.frameBiases || []).map((frame) => `<span class="frame-chip ${safe(directionClass(frame.dominant))}">${safe(frame.timeframe)} ${safe(frame.state)} · ${safe(frame.up)}:${safe(frame.down)}</span>`).join('');
   const learning = prediction.learningGuard;
-  return `<article class="decision-card ${safe(visual)}"><div class="decision-top"><div><span class="symbol-label">${safe(symbol)}</span><h3>${safe(prediction.horizonMin)} minute</h3></div><span class="quality-ring">${safe(prediction.quality)}<small>/100</small></span></div><div class="decision-verdict ${safe(visual)}">${safe(title)}</div><p class="protocol">${safe(prediction.protocol)}</p><div class="frame-row">${frameRows}</div><div class="reason-codes">${reasons}</div><div class="decision-facts"><span>Bias <b class="${safe(directionClass(prediction.bias))}">${safe(prediction.bias)}</b></span><span>UP ${safe(formatNumber(prediction.directionScores && prediction.directionScores.up))} / DOWN ${safe(formatNumber(prediction.directionScores && prediction.directionScores.down))}</span><span>Trigger: ${safe(trigger)}</span><span>${safe(probabilityText(prediction))}</span>${learning ? `<span>Learning guard: N=${safe(learning.sample)} · ${learning.blocked ? 'BLOCAT' : 'nu blochează'}</span>` : ''}</div><details class="audit"><summary>Audit complet al deciziei</summary><div class="audit-grid"><b>Execuție</b><span>${safe((prediction.executionTimeframes || []).join(' + '))}</span><b>Context</b><span>${safe((prediction.contextTimeframes || []).join(' + '))}</span><b>Confirmări</b><span>${safe((prediction.confirmations || []).join(', ') || '—')}</span><b>Dovezi</b><span>${compactList(prediction.evidence)}</span><b>Conflicte</b><span>${compactList(prediction.conflicts, 'niciun conflict explicit')}</span><b>Invalidare</b><span>${safe(prediction.invalidation)}</span><b>Entry</b><span>${safe(formatTime(prediction.entryBoundaryOpenTime))}</span><b>Expiry</b><span>${safe(formatTime(prediction.expiryEstimateCloseTime))}</span><b>Porți</b><span>${gatesTable(prediction.gateChecks)}</span><b>Signal key</b><span>${safe(prediction.signalKey || '—')}</span></div></details></article>`;
+  return `<article class="decision-card ${safe(visual)}"><div class="decision-top"><div><span class="symbol-label">${safe(symbol)}</span><h3>${safe(prediction.horizonMin)} minute</h3></div><span class="quality-ring">${safe(prediction.quality)}<small>/100</small></span></div><div class="decision-verdict ${safe(visual)}">${safe(title)}</div><p class="protocol">${safe(prediction.protocol)}</p><div class="frame-row">${frameRows}</div><div class="reason-codes">${reasons}</div><div class="decision-facts"><span>Bias <b class="${safe(directionClass(prediction.bias))}">${safe(prediction.bias)}</b></span><span>UP ${safe(formatNumber(prediction.directionScores && prediction.directionScores.up))} / DOWN ${safe(formatNumber(prediction.directionScores && prediction.directionScores.down))}</span><span>Trigger: ${safe(trigger)}</span><span>${safe(probabilityText(prediction))}</span>${learning ? `<span>Learning guard: N=${safe(learning.sample)} · ${learning.blocked ? 'BLOCAT' : 'nu blochează'}</span>` : ''}</div>${aiConsensusBlock(prediction.aiConsensus)}<details class="audit"><summary>Audit complet al deciziei</summary><div class="audit-grid"><b>Execuție</b><span>${safe((prediction.executionTimeframes || []).join(' + '))}</span><b>Context</b><span>${safe((prediction.contextTimeframes || []).join(' + '))}</span><b>Confirmări</b><span>${safe((prediction.confirmations || []).join(', ') || '—')}</span><b>Dovezi</b><span>${compactList(prediction.evidence)}</span><b>Conflicte</b><span>${compactList(prediction.conflicts, 'niciun conflict explicit')}</span><b>Invalidare</b><span>${safe(prediction.invalidation)}</span><b>Entry</b><span>${safe(formatTime(prediction.entryBoundaryOpenTime))}</span><b>Expiry</b><span>${safe(formatTime(prediction.expiryEstimateCloseTime))}</span><b>Porți</b><span>${gatesTable(prediction.gateChecks)}</span><b>Signal key</b><span>${safe(prediction.signalKey || '—')}</span></div></details></article>`;
 }
 
 function renderDecisions() {
@@ -196,11 +204,24 @@ function fillConfig(config, force = false) {
   byId('btSymbol').innerHTML = (config.symbols || []).map((symbol) => `<option value="${safe(symbol)}">${safe(symbol)}</option>`).join('');
 }
 
-function renderAiStatus(ai) {
-  byId('aiStatus').textContent = ai && ai.enabled
-    ? `${ai.model} · ${ai.inFlight ? 'analizează loss…' : 'post-loss activ'}`
-    : 'Gemini post-loss oprit · setează GEMINI_API_KEY';
-  byId('aiStatus').className = `ai-status ${ai && ai.enabled ? 'enabled' : ''}`;
+function renderAiStatus(strategist, reviewer) {
+  const brain = byId('brainBadge');
+  const configured = Boolean(strategist && strategist.enabled);
+  const healthy = Boolean(configured && strategist.lastSuccessfulAt && !strategist.lastError);
+  const waiting = Boolean(configured && !strategist.lastSuccessfulAt && !strategist.lastError);
+  brain.textContent = !configured ? 'Creier AI oprit'
+    : strategist.inFlight ? `${strategist.model} · gândește…`
+      : healthy ? `${strategist.model} · sănătos`
+        : waiting ? `${strategist.model} · așteaptă prima analiză`
+          : `${strategist.model} · eroare`;
+  brain.className = `badge ${healthy || strategist && strategist.inFlight ? 'badge-on' : 'badge-off'}`;
+  const reviewerEnabled = Boolean(reviewer && reviewer.enabled);
+  byId('aiStatus').textContent = !configured
+    ? 'Gemini live obligatoriu pentru ENTER · setează GEMINI_API_KEY'
+    : strategist.lastError
+      ? `Strateg live configurat, dar ultima analiză a eșuat: ${strategist.lastError}`
+      : `Strateg live ${strategist.model} · ${strategist.totalRequests || 0} analize · loss review ${reviewerEnabled ? 'activ cu prioritate secundară' : 'oprit'}`;
+  byId('aiStatus').className = `ai-status ${healthy ? 'enabled' : ''}`;
 }
 
 function renderState(state) {
@@ -213,14 +234,17 @@ function renderState(state) {
   renderJournal(state.journal);
   renderAlerts(state.alerts);
   renderErrors();
-  renderAiStatus(state.aiReviewer);
+  renderAiStatus(state.aiStrategist, state.aiReviewer);
   const clock = state.status && state.status.scanClock;
   byId('clockBadge').textContent = clock ? (clock.failClosed ? 'Analiză blocată' : `Analiză ${formatAge(Date.now() - (clock.publishedAtCorrected || clock.asOf))}`) : 'Analiză —';
   byId('clockBadge').className = `badge ${clock && clock.failClosed ? 'badge-off' : ''}`;
   const newestTicker = Object.values(currentTickers).sort((a, b) => b.receivedAt - a.receivedAt)[0];
   byId('liveBadge').textContent = newestTicker ? `Preț live ${formatAge(Date.now() - newestTicker.receivedAt)}` : 'Preț live —';
   byId('liveBadge').className = `badge ${newestTicker && Date.now() - newestTicker.receivedAt <= 3_000 ? 'badge-on' : 'badge-off'}`;
-  byId('sourceLine').textContent = `Build ${state.build || '—'} · preț MEXC Spot refresh 1s · analiză closed-candle ${state.config && state.config.scanIntervalSec || '—'}s${clock ? ` · clock RTT ${clock.roundTripMs}ms · skew ${clock.localSkewMs}ms` : ''}`;
+  const aiSource = !state.aiStrategist || !state.aiStrategist.enabled ? 'oprit (ENTER blocat)'
+    : state.aiStrategist.lastError ? `eroare (ENTER blocat)`
+      : state.aiStrategist.lastSuccessfulAt ? `${state.aiStrategist.model} sănătos` : `${state.aiStrategist.model} așteaptă`;
+  byId('sourceLine').textContent = `Build ${state.build || '—'} · preț MEXC Spot refresh 1s · analiză closed-candle ${state.config && state.config.scanIntervalSec || '—'}s · AI ${aiSource}${clock ? ` · clock RTT ${clock.roundTripMs}ms · skew ${clock.localSkewMs}ms` : ''}`;
   const progress = state.status && state.status.backtestProgress;
   if (progress) byId('btStatus').textContent = `${progress.phase}: ${progress.percent}%`;
 }
@@ -332,7 +356,7 @@ stream.addEventListener('price-tick', (event) => {
 stream.addEventListener('learning-update', (event) => {
   const update = JSON.parse(event.data);
   if (currentState && update.journal) { currentState.journal = update.journal; renderJournal(update.journal); }
-  renderAiStatus(update.aiReviewer);
+  renderAiStatus(currentState && currentState.aiStrategist, update.aiReviewer || currentState && currentState.aiReviewer);
 });
 stream.addEventListener('config', (event) => fillConfig(JSON.parse(event.data)));
 stream.addEventListener('backtest-progress', (event) => { const progress = JSON.parse(event.data); byId('btStatus').textContent = `${progress.phase}: ${progress.percent}%`; });

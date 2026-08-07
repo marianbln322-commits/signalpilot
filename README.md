@@ -156,16 +156,20 @@ Live și replay folosesc aceeași fereastră de exact 300 candles pe fiecare tim
 
 Fiecare rezultat rezolvat primește review determinist: mișcare semnată, MFE, MAE și tag-uri de eșec. Învățarea este limitată intenționat: poate bloca un ENTER numai după minimum 30 de rezultate comparabile și numai dacă limita superioară Wilson95 este sub break-even-ul payout-ului. Nu poate crea un ENTER, schimba UP în DOWN sau modifica singură codul/pragurile. Jurnalul și calibrarea sunt izolate prin versiunea motorului.
 
-Gemini este opțional și rulează numai ca auditor post-loss cu răspuns JSON structurat; nu participă la semnalul live. Cheia rămâne doar server-side:
+Gemini este opțional ca serviciu, dar **obligatoriu pentru ca varianta Expert să afișeze ENTER**. Strategul live rulează cel mult o dată pentru fiecare simbol la fiecare lumânare 1m nou închisă, primește atât seriile numerice OHLCV compacte, cât și o imagine PNG multi-timeframe generată local, plus memoria rezultatelor deja rezolvate. El decide independent UP/DOWN/WAIT pentru 10m și 30m. Codul afișează ENTER numai când verdictul Gemini este identic cu direcția motorului determinist după learning guard; lipsa cheii, timeout-ul, JSON invalid, WAIT sau dezacordul produc WAIT. Aplicația nu execută ordine.
+
+Cheia rămâne numai server-side. Modelul live poate fi ales separat prin `GEMINI_LIVE_MODEL`; implicit este `gemini-3.6-flash`. `GEMINI_MODEL` rămâne fallback comun și model pentru review-ul post-loss:
 
 ```bash
 # Linux/macOS
-GEMINI_API_KEY="cheia-ta" GEMINI_MODEL="gemini-3-pro-preview" npm run start:3013
+GEMINI_API_KEY="cheia-ta" GEMINI_LIVE_MODEL="gemini-3.6-flash" npm run start:3013
 
 # Windows CMD
 set GEMINI_API_KEY=cheia-ta
-set GEMINI_MODEL=gemini-3-pro-preview
+set GEMINI_LIVE_MODEL=gemini-3.6-flash
 start-3013.bat
 ```
+
+La două simboluri, cadența maximă proiectată este de două analize Gemini live pe minut. Scannerul acceptă 15–300 secunde; pragul minim de 15 secunde rezervă între scanări o fereastră de maximum 10 secunde pentru câte un review post-loss, fără să concureze cu analiza live. Cache-ul deduplică scanările repetate ale aceleiași lumânări 1m, inclusiv erorile, ca să evite apelurile repetate. Costul și limitele de utilizare depind de contul/modelul Gemini ales.
 
 Pentru UP/DOWN, UI afișează o probabilitate istorică estimată numai din bucket-ul comparabil `horizon + direction + quality band`, cu win-rate, N și Wilson95: forward la N≥30 (preferat), altfel Binance proxy/in-sample la N≥50. La eșantion insuficient arată „necalibrat”, iar pentru WAIT nu estimează probabilitate. **`quality/confluence` nu este probabilitate.** MEXC Spot este proxy pentru grafic; settlement-ul Event Futures poate diferi. Niciun procent istoric nu prezice sigur semnalul curent și nu există promisiune de precizie sau profit.

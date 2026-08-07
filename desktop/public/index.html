@@ -10,11 +10,11 @@
 <body>
   <header>
     <div class="brand"><span class="logo">SP</span><div><h1>Event Futures Expert</h1><p>BTCUSDT + ETHUSDT · MEXC Spot live · decizii 10m / 30m auditate</p></div></div>
-    <div class="badges"><span id="liveBadge" class="badge badge-off">Preț live —</span><span id="clockBadge" class="badge">Analiză —</span><span id="connBadge" class="badge badge-off">Conectare…</span></div>
+    <div class="badges"><span id="liveBadge" class="badge badge-off">Preț live —</span><span id="brainBadge" class="badge badge-off">Creier AI —</span><span id="clockBadge" class="badge">Analiză —</span><span id="connBadge" class="badge badge-off">Conectare…</span></div>
   </header>
 
   <main>
-    <aside class="notice"><b>WAIT este o decizie profesională, nu o eroare.</b> Pentru 10 minute motorul cere acord dominant 1m + 5m și folosește 15m drept context/veto. Pentru 30 minute cere obligatoriu 5m + 15m și folosește 30m + 60m drept context/veto. Prețul live este observat la fiecare secundă; deciziile se calculează numai din lumânări închise și validate. MEXC Spot este proxy pentru grafic, iar regulile/prețul de settlement Event Futures pot diferi. Nu există promisiune de precizie sau profit.</aside>
+    <aside class="notice"><b>WAIT este o decizie profesională, nu o eroare.</b> Creierul Gemini analizează independent datele OHLCV și imaginea multi-timeframe la fiecare lumânare 1m nou închisă. Un ENTER este afișat numai când Gemini și toate porțile verificabile indică exact aceeași direcție. Pentru 10 minute sunt obligatorii 1m + 5m, cu 15m context/veto; pentru 30 minute sunt obligatorii 5m + 15m, cu 30m + 60m context/veto. Recomandarea este pentru intrare manuală, nu execută ordine. MEXC Spot este proxy pentru grafic, iar settlement-ul Event Futures poate diferi. Nu există promisiune de precizie sau profit.</aside>
 
     <section class="panel market-panel">
       <div class="panel-head"><div><h2>Piață live</h2><p id="sourceLine" class="muted">Aștept primul preț și primul snapshot valid…</p></div><label class="toggle"><input id="soundToggle" type="checkbox" checked> sunet doar la ENTER</label></div>
@@ -23,12 +23,12 @@
     </section>
 
     <section class="panel">
-      <div class="panel-head"><div><h2>Radar oportunități 10m / 30m</h2><p class="muted">Direcția apare numai când toate porțile, alinierea timeframe-urilor și protecția anti-overextension trec.</p></div></div>
+      <div class="panel-head"><div><h2>Radar oportunități 10m / 30m</h2><p class="muted">Direcția apare numai după consens Gemini live + motor determinist + learning guard. Lipsa cheii, timeout-ul, dezacordul sau orice răspuns invalid înseamnă WAIT.</p></div></div>
       <div id="decisions" class="decision-board"><p class="muted">Aștept analiza pe lumânări închise…</p></div>
     </section>
 
     <section class="panel">
-      <div class="panel-head"><div><h2>Învățare controlată și review automat</h2><p class="muted">Fiecare pierdere primește MFE/MAE și cauze candidate. Sistemul poate doar bloca un setup demonstrat slab după N≥30; nu poate inventa sau inversa semnale.</p></div><span id="aiStatus" class="ai-status">Gemini —</span></div>
+      <div class="panel-head"><div><h2>Memorie auditată și review automat</h2><p class="muted">Gemini live primește numai rezultate deja rezolvate, plus MFE/MAE și cauze. Memoria oferă context, dar nu poate ocoli porțile sau transforma singură WAIT în ENTER.</p></div><span id="aiStatus" class="ai-status">Gemini —</span></div>
       <div id="journalStats" class="stats"></div>
       <div id="learningSummary" class="learning-summary"></div>
       <div id="journalRows" class="journal"></div>
@@ -43,7 +43,7 @@
       <summary>Configurație și praguri</summary>
       <div class="form-grid">
         <label>Piețe expert fixe<input id="cfgSymbols" type="text" value="BTCUSDT, ETHUSDT" readonly></label>
-        <label>Analiză closed-candle (sec)<input id="cfgScan" type="number" min="5" max="300"></label>
+        <label>Analiză closed-candle (sec)<input id="cfgScan" type="number" min="15" max="300"></label>
         <label>Settle delay (ms)<input id="cfgSettle" type="number" min="0" max="30000"></label>
         <label>Confluență minimă 10m<input id="cfgQ10" type="number" min="0" max="100"></label>
         <label>Confluență minimă 30m<input id="cfgQ30" type="number" min="0" max="100"></label>

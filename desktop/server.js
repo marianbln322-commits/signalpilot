@@ -9,6 +9,7 @@ const expertEngine = require('./lib/expert-engine');
 const { buildChartData } = require('./lib/chart-state');
 const { Journal, atomicWriteJson } = require('./lib/journal');
 const { GeminiLossReviewer } = require('./lib/gemini-reviewer');
+const { GeminiLiveStrategist, applyAiConsensus } = require('./lib/gemini-live-strategist');
 const { chooseEstimate } = require('./lib/calibration');
 
 const HOST = '127.0.0.1';
@@ -45,7 +46,7 @@ function validateConfig(input) {
   }
   return {
     symbols: [...EXPERT_SYMBOLS],
-    scanIntervalSec: Math.round(finiteInRange(input.scanIntervalSec, 'scanIntervalSec', 5, 300)),
+    scanIntervalSec: Math.round(finiteInRange(input.scanIntervalSec, 'scanIntervalSec', 15, 300)),
     settleDelayMs: Math.round(finiteInRange(input.settleDelayMs, 'settleDelayMs', 0, 30_000)),
     minQuality10: Math.round(finiteInRange(input.minQuality10, 'minQuality10', 0, 100)),
     minQuality30: Math.round(finiteInRange(input.minQuality30, 'minQuality30', 0, 100)),
@@ -66,6 +67,7 @@ function loadConfig() {
 let config = loadConfig();
 const journal = new Journal(JOURNAL_FILE, expertEngine.ENGINE_VERSION);
 const geminiReviewer = new GeminiLossReviewer();
+const geminiStrategist = new GeminiLiveStrategist();
 const state = {
   startedAt: Date.now(), scanning: false, lastScanStartedAt: null, lastScanCompletedAt: null,
   scanClock: null, latest: {}, errors: {}, alerts: [], backtests: {}, backtestProgress: null,
@@ -74,6 +76,7 @@ const state = {
 const clients = new Set();
 let stopped = false;
 let schedulerTimer = null;
+let nextScanDueAt = null;
 let tickerTimer = null;
 let tickerPromise = null;
 let aiReviewChain = Promise.resolve();
@@ -138,9 +141,9 @@ function publicState() {
       scanClock: state.scanClock, errors: state.errors, backtestProgress: state.backtestProgress,
     },
     latest, tickers: state.tickers, tickerErrors: state.tickerErrors,
-    liveFeed: state.liveFeed, aiReviewer: geminiReviewer.status(),
+    liveFeed: state.liveFeed, aiStrategist: geminiStrategist.status(), aiReviewer: geminiReviewer.status(),
     alerts: state.alerts, journal: journalState, backtests: state.backtests,
-    warning: 'Prețul live este observat din MEXC Spot la 1 secundă; deciziile folosesc exclusiv lumânări închise. Event Futures poate avea reguli/preț de settlement diferite. Învățarea poate doar bloca setup-uri slabe după N suficient, niciodată crea sau inversa un semnal. Nu există promisiune de precizie sau profit.',
+    warning: 'Prețul live este observat din MEXC Spot la 1 secundă; deciziile folosesc exclusiv lumânări închise. ENTER este doar o recomandare manuală și cere acord exact între porțile deterministe și strategul Gemini live. Event Futures poate avea reguli/preț de settlement diferite. Nu există promisiune de precizie sau profit.',
   };
 }
 
@@ -194,7 +197,7 @@ function scheduleLiveTicker(delayMs = 0) {
   }, delayMs);
 }
 
-function eligibleAiBacklog(limit = 3, now = Date.now()) {
+function eligibleAiBacklog(limit = 1, now = Date.now()) {
   return journal.lossesNeedingAiReview(5_000)
     .filter((entry) => !queuedAiSignalKeys.has(entry.signalKey))
     .filter((entry) => {
@@ -218,7 +221,7 @@ function scheduleAiBacklog(delayMs = 0) {
   aiRetryTimer = setTimeout(() => {
     aiRetryTimer = null;
     aiBacklogDueAt = null;
-    const eligible = eligibleAiBacklog(3);
+    const eligible = eligibleAiBacklog(1);
     if (eligible.length) {
       queueAiLossReviews(eligible);
       return;
@@ -228,15 +231,21 @@ function scheduleAiBacklog(delayMs = 0) {
   }, Math.max(0, delayMs));
 }
 
-function queueAiLossReviews(entries = eligibleAiBacklog(3)) {
+function queueAiLossReviews(entries = eligibleAiBacklog(1)) {
   if (!geminiReviewer.status().enabled) return;
+  const liveRequestPending = state.scanning || geminiStrategist.status().inFlight > 0
+    || (Number.isFinite(nextScanDueAt) && nextScanDueAt - Date.now() <= 12_000);
+  if (liveRequestPending) {
+    scheduleAiBacklog(500);
+    return;
+  }
   for (const entry of (entries || []).filter((item) => item.win === false
-    && item.review && item.review.complete !== false && !item.review.ai)) {
+    && item.review && item.review.complete !== false && !item.review.ai).slice(0, 1)) {
     const retry = aiRetryState.get(entry.signalKey);
     if (queuedAiSignalKeys.has(entry.signalKey) || (retry && retry.nextEligibleAt > Date.now())) continue;
     queuedAiSignalKeys.add(entry.signalKey);
     aiReviewChain = aiReviewChain.then(async () => {
-      const review = await geminiReviewer.review(entry);
+      const review = await geminiReviewer.review(entry, { timeoutMs: 10_000 });
       if (review && journal.attachAiReview(entry.signalKey, review)) {
         aiRetryState.delete(entry.signalKey);
         broadcast('learning-update', {
@@ -263,14 +272,29 @@ function pruneUnconfiguredState() {
   for (const symbol of Object.keys(state.tickerErrors)) if (!config.symbols.includes(symbol)) delete state.tickerErrors[symbol];
 }
 
-function publishSnapshot(symbol, rawSnapshot, clock, generatedAt, analysisConfig) {
-  const snapshot = market.revalidateSnapshot(rawSnapshot, generatedAt);
+function prepareSnapshot(symbol, rawSnapshot, clock, analyzedAt, analysisConfig) {
+  const snapshot = market.revalidateSnapshot(rawSnapshot, analyzedAt);
   snapshot.clockSource = clock.source;
   const result = expertEngine.analyzeSnapshot(snapshot, analysisConfig);
   result.predictions = Object.fromEntries(Object.entries(result.predictions).map(([key, prediction]) => {
     const payout = prediction.horizonMin === 10 ? analysisConfig.payout10 : analysisConfig.payout30;
     return [key, journal.applyLearningGuard(prediction, payout)];
   }));
+  return { symbol, snapshot, result };
+}
+
+function analysesFromResult(result) {
+  return Object.values(result.predictions || {}).reduce((all, prediction) => ({
+    ...all,
+    ...(prediction.timeframeAnalyses || {}),
+  }), {});
+}
+
+function finalizeSnapshot(prepared, strategy, clock, availableAt) {
+  const { symbol, snapshot, result } = prepared;
+  result.predictions = Object.fromEntries(Object.entries(result.predictions)
+    .map(([key, prediction]) => [key, applyAiConsensus(prediction, strategy, availableAt)]));
+  result.generatedAt = availableAt;
   result.chartData = buildChartData(snapshot, result);
   result.clockSource = clock.source;
   result.clockFallback = clock.fallback;
@@ -284,6 +308,8 @@ function publishSnapshot(symbol, rawSnapshot, clock, generatedAt, analysisConfig
 async function scanOnce() {
   if (scanPromise) return scanPromise;
   scanPromise = (async () => {
+    const reviewCancelled = geminiReviewer.cancel('live scan started');
+    if (reviewCancelled) await aiReviewChain.catch(() => {});
     const scanRevision = configRevision;
     const scanConfig = { ...config, symbols: [...config.symbols] };
     state.scanning = true;
@@ -342,13 +368,52 @@ async function scanOnce() {
       return;
     }
 
-    // All symbols are published in one batch. This clock is captured after network acquisition,
-    // so freshness gates and contract entry boundaries reflect when the scan can actually be shown.
-    const generatedAt = market.correctedNow(clock);
-    const alerts = [];
+    // Resolve outcomes before building AI memory so the strategist sees every result that is
+    // already knowable from the current closed 1m candles, without future leakage.
+    const resolvedEntries = journal.resolveFromClosedCandles(oneMinuteBySymbol);
+
+    // Deterministic analysis is captured after acquisition. Gemini receives the complete compact
+    // numerical snapshot plus a locally rendered multi-timeframe chart, once per new 1m candle.
+    const analyzedAt = market.correctedNow(clock);
+    const preparedResults = [];
     for (const [symbol, snapshot] of Object.entries(snapshots)) {
       try {
-        const result = publishSnapshot(symbol, snapshot, clock, generatedAt, scanConfig);
+        preparedResults.push(prepareSnapshot(symbol, snapshot, clock, analyzedAt, scanConfig));
+      } catch (error) {
+        state.errors[symbol] = { at: Date.now(), message: error.message, staleResultRemoved: true };
+        delete state.latest[symbol];
+      }
+    }
+    const strategyPairs = await Promise.all(preparedResults.map(async (prepared) => [
+      prepared.symbol,
+      await geminiStrategist.analyze({
+        symbol: prepared.symbol,
+        snapshot: prepared.snapshot,
+        analyses: analysesFromResult(prepared.result),
+        memory: journal.strategistMemory(prepared.symbol,
+          prepared.snapshot.candles['1m'][prepared.snapshot.candles['1m'].length - 1].closeTime),
+        analyzedAt,
+      }),
+    ]));
+    const strategies = Object.fromEntries(strategyPairs);
+
+    if (scanRevision !== configRevision) {
+      pruneUnconfiguredState();
+      state.lastScanCompletedAt = Date.now();
+      state.scanClock = { ...clock, discarded: true, discardReason: 'CONFIG_CHANGED_DURING_AI_ANALYSIS' };
+      state.scanning = false;
+      queueAiLossReviews(resolvedEntries);
+      broadcast('scan-complete', { ...publicState(), newAlerts: [] });
+      return;
+    }
+
+    // Entry boundaries start strictly after the AI answer is available, never before it.
+    const availableAt = market.correctedNow(clock);
+    const alerts = [];
+    for (const prepared of preparedResults) {
+      const { symbol } = prepared;
+      try {
+        const result = finalizeSnapshot(prepared, strategies[symbol], clock, availableAt);
         for (const prediction of Object.values(result.predictions)) {
           const entry = journal.record(prediction);
           if (!entry) continue;
@@ -357,6 +422,7 @@ async function scanOnce() {
             action: prediction.action, direction: prediction.direction, verdict: prediction.verdict,
             quality: prediction.quality, trigger: prediction.trigger,
             generatedAt: prediction.generatedAt,
+            aiConsensus: prediction.aiConsensus,
           };
           state.alerts.unshift(alert);
           alerts.push(alert);
@@ -368,12 +434,12 @@ async function scanOnce() {
     }
     state.alerts.length = Math.min(state.alerts.length, 100);
 
-    const resolvedEntries = journal.resolveFromClosedCandles(oneMinuteBySymbol);
     queueAiLossReviews(resolvedEntries);
     state.lastScanCompletedAt = Date.now();
     state.scanClock = {
       ...clock,
-      publishedAtCorrected: generatedAt,
+      analyzedAtCorrected: analyzedAt,
+      publishedAtCorrected: availableAt,
       completedAtLocal: state.lastScanCompletedAt,
     };
     state.scanning = false;
@@ -387,7 +453,9 @@ async function scanOnce() {
 
 function scheduleNext(delayMs = 0) {
   clearTimeout(schedulerTimer);
+  nextScanDueAt = Date.now() + Math.max(0, delayMs);
   schedulerTimer = setTimeout(async () => {
+    nextScanDueAt = null;
     try {
       await scanOnce();
     } catch (error) {
@@ -515,8 +583,8 @@ const server = app.listen(PORT, HOST);
 server.once('listening', () => {
   console.log(`SignalPilot Expert listening only on http://${HOST}:${PORT} (localhost alias accepted)`);
   scheduleLiveTicker(0);
-  scheduleAiBacklog(0);
   scheduleNext(0);
+  scheduleAiBacklog(1_000);
 });
 server.once('error', (error) => {
   if (error.code === 'EADDRINUSE') console.error(`SignalPilot Expert cannot start: ${HOST}:${PORT} is already occupied. No fallback port is used.`);
@@ -544,5 +612,6 @@ process.once('SIGTERM', shutdown);
 
 module.exports = {
   app, server, scanOnce, validateConfig, publicState, probabilityEstimate,
-  buildChartData, scheduleLiveTicker, queueAiLossReviews, scheduleAiBacklog, shutdown, EXPERT_SYMBOLS,
+  buildChartData, prepareSnapshot, applyAiConsensus, finalizeSnapshot,
+  scheduleLiveTicker, queueAiLossReviews, scheduleAiBacklog, shutdown, EXPERT_SYMBOLS,
 };

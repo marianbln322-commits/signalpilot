@@ -187,6 +187,17 @@ class Journal {
         frameBiases: signal.frameBiases,
         qualityComponents: signal.qualityComponents,
         analyses: compactAnalyses(signal),
+        aiConsensus: signal.aiConsensus ? {
+          available: signal.aiConsensus.available,
+          agreed: signal.aiConsensus.agreed,
+          model: signal.aiConsensus.model,
+          strategistVersion: signal.aiConsensus.strategistVersion,
+          verdict: signal.aiConsensus.decision && signal.aiConsensus.decision.verdict,
+          confidence: signal.aiConsensus.decision && signal.aiConsensus.decision.confidence,
+          thesis: signal.aiConsensus.decision && signal.aiConsensus.decision.thesis,
+          candleCloseTime: signal.aiConsensus.candleCloseTime,
+          latencyMs: signal.aiConsensus.latencyMs,
+        } : null,
       },
       signalCloseTime: signal.latestClosedCandleTime,
       generatedAt,
@@ -292,6 +303,60 @@ class Journal {
       lossTagCounts: tagCounts,
       reviewedLosses: resolved.filter((entry) => entry.win === false && entry.review).length,
       aiReviewedLosses: resolved.filter((entry) => entry.win === false && entry.review && entry.review.ai).length,
+    };
+  }
+
+  strategistMemory(symbol, knowledgeCutoff) {
+    if (!Number.isSafeInteger(knowledgeCutoff)) throw new Error('strategist memory knowledgeCutoff must be a safe integer timestamp');
+    const resolved = this.currentEntries()
+      .filter((entry) => entry.status === 'resolved' && entry.symbol === symbol
+        && Number.isFinite(Number(entry.targetCloseTime)) && Number(entry.targetCloseTime) <= knowledgeCutoff)
+      .sort((a, b) => Number(b.targetCloseTime) - Number(a.targetCloseTime));
+    const knowableReview = (entry) => entry.review && Number.isFinite(Number(entry.review.reviewedAt))
+      && Number(entry.review.reviewedAt) <= knowledgeCutoff ? entry.review : null;
+    const setupPerformance = groupedPerformance(resolved, setupKey);
+    const lossTagCounts = {};
+    for (const entry of resolved.filter((item) => item.win === false)) {
+      const review = knowableReview(entry);
+      for (const tag of review && review.tags || []) lossTagCounts[tag] = (lossTagCounts[tag] || 0) + 1;
+    }
+    return {
+      memoryVersion: 'audited-forward-v1',
+      engineVersion: this.engineVersion,
+      symbol,
+      knowledgeCutoff,
+      policy: 'Folosește numai rezultate cu targetCloseTime <= knowledgeCutoff. Memoria este context, nu permisiune de a ignora datele curente.',
+      overall: aggregate(resolved),
+      byHorizon: {
+        '10m': aggregate(resolved.filter((entry) => entry.horizonMin === 10)),
+        '30m': aggregate(resolved.filter((entry) => entry.horizonMin === 30)),
+      },
+      byDirection: {
+        UP: aggregate(resolved.filter((entry) => entry.direction === 'UP')),
+        DOWN: aggregate(resolved.filter((entry) => entry.direction === 'DOWN')),
+      },
+      bySetup: Object.fromEntries(Object.entries(setupPerformance)
+        .sort(([, a], [, b]) => b.n - a.n).slice(0, 20)),
+      lossTagCounts,
+      recentResolved: resolved.slice(0, 20).map((entry) => {
+        const review = knowableReview(entry);
+        const aiReview = review && review.ai && Number.isFinite(Number(review.ai.attachedAt))
+          && Number(review.ai.attachedAt) <= knowledgeCutoff ? review.ai : null;
+        return {
+          signalKey: entry.signalKey,
+          horizonMin: entry.horizonMin,
+          direction: entry.direction,
+          quality: entry.quality,
+          trigger: entry.trigger ? { type: entry.trigger.type, timeframe: entry.trigger.timeframe } : null,
+          targetCloseTime: entry.targetCloseTime,
+          outcome: entry.win ? 'WIN' : 'LOSS',
+          signedMovePct: review && review.signedMovePct,
+          maximumFavorableExcursionPct: review && review.maximumFavorableExcursionPct,
+          maximumAdverseExcursionPct: review && review.maximumAdverseExcursionPct,
+          tags: review && review.tags || [],
+          aiDiagnosis: aiReview && aiReview.diagnosis || null,
+        };
+      }),
     };
   }
 

@@ -1,6 +1,6 @@
 'use strict';
 
-const DEFAULT_MODEL = 'gemini-3-pro-preview';
+const DEFAULT_MODEL = 'gemini-3.6-flash';
 const BASE_URL = 'https://generativelanguage.googleapis.com/v1beta';
 
 function safeEntryPayload(entry) {
@@ -47,11 +47,13 @@ function validateStructuredReview(value) {
 }
 
 class GeminiLossReviewer {
-  constructor({ apiKey = process.env.GEMINI_API_KEY, model = process.env.GEMINI_MODEL || DEFAULT_MODEL, fetchImpl = fetch } = {}) {
+  constructor({ apiKey = process.env.GEMINI_API_KEY, model = process.env.GEMINI_REVIEW_MODEL || process.env.GEMINI_MODEL || DEFAULT_MODEL, fetchImpl = fetch } = {}) {
     this.apiKey = apiKey || null;
     this.model = model;
     this.fetchImpl = fetchImpl;
     this.inFlight = false;
+    this.controller = null;
+    this.cancelReason = null;
     this.lastError = null;
     this.lastReviewedAt = null;
   }
@@ -67,12 +69,21 @@ class GeminiLossReviewer {
     };
   }
 
+  cancel(reason = 'live strategist priority') {
+    if (!this.inFlight || !this.controller) return false;
+    this.cancelReason = reason;
+    this.controller.abort();
+    return true;
+  }
+
   async review(entry, { timeoutMs = 30_000 } = {}) {
     if (!this.apiKey) return null;
     if (!entry || entry.status !== 'resolved' || entry.win !== false || !entry.review || entry.review.complete === false) return null;
     if (this.inFlight) throw new Error('Gemini reviewer already has a request in flight');
     this.inFlight = true;
     const controller = new AbortController();
+    this.controller = controller;
+    this.cancelReason = null;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const prompt = [
@@ -119,10 +130,14 @@ class GeminiLossReviewer {
       this.lastReviewedAt = Date.now();
       return result;
     } catch (error) {
-      this.lastError = error.name === 'AbortError' ? `timeout after ${timeoutMs}ms` : error.message;
+      this.lastError = error.name === 'AbortError'
+        ? this.cancelReason ? `cancelled: ${this.cancelReason}` : `timeout after ${timeoutMs}ms`
+        : error.message;
       throw new Error(this.lastError);
     } finally {
       clearTimeout(timer);
+      if (this.controller === controller) this.controller = null;
+      this.cancelReason = null;
       this.inFlight = false;
     }
   }
