@@ -10,11 +10,13 @@ const { buildChartData } = require('./lib/chart-state');
 const { Journal, atomicWriteJson } = require('./lib/journal');
 const { LocalAdaptiveLearner } = require('./lib/local-adaptive-learner');
 const { chooseEstimate } = require('./lib/calibration');
+const { resolveExpertInstance } = require('./lib/instance-config');
 
-const HOST = '127.0.0.1';
-const PORT = 3013;
+const INSTANCE = resolveExpertInstance(require.main && require.main.filename);
+const HOST = INSTANCE.host;
+const PORT = INSTANCE.port;
 const APP_BUILD = expertEngine.ENGINE_VERSION;
-const DATA_DIR = path.join(__dirname, 'data');
+const DATA_DIR = path.join(__dirname, INSTANCE.dataDirectoryName);
 const CONFIG_FILE = path.join(DATA_DIR, 'config.json');
 const JOURNAL_FILE = path.join(DATA_DIR, 'journal.json');
 const LOCAL_LEARNING_FILE = path.join(DATA_DIR, 'local-learning.json');
@@ -66,7 +68,7 @@ function loadConfig() {
 
 let config = loadConfig();
 const journal = new Journal(JOURNAL_FILE, expertEngine.ENGINE_VERSION);
-const localLearner = new LocalAdaptiveLearner(LOCAL_LEARNING_FILE);
+const localLearner = new LocalAdaptiveLearner(LOCAL_LEARNING_FILE, { adaptiveProtection: INSTANCE.adaptiveProtection });
 const state = {
   startedAt: Date.now(), scanning: false, lastScanStartedAt: null, lastScanCompletedAt: null,
   scanClock: null, latest: {}, errors: {}, alerts: [], backtests: {}, backtestProgress: null,
@@ -126,7 +128,7 @@ function publicState() {
     }])),
   }]));
   return {
-    app: 'SignalPilot Expert', build: APP_BUILD,
+    app: INSTANCE.adaptiveProtection ? 'SignalPilot Expert Adaptive' : 'SignalPilot Expert', build: APP_BUILD,
     endpoint: `http://${HOST}:${PORT}`, aliases: [...ALLOWED_ORIGINS], config,
     status: {
       startedAt: state.startedAt, scanning: state.scanning,
@@ -134,9 +136,11 @@ function publicState() {
       scanClock: state.scanClock, errors: state.errors, backtestProgress: state.backtestProgress,
     },
     latest, tickers: state.tickers, tickerErrors: state.tickerErrors,
-    liveFeed: state.liveFeed, localLearning: localLearner.snapshot(config.symbols),
+    liveFeed: state.liveFeed, localLearning: localLearner.snapshot(config.symbols, payoutByHorizon),
     alerts: state.alerts, journal: journalState, backtests: state.backtests,
-    warning: 'Prețul live este observat din MEXC Spot la 1 secundă; deciziile folosesc exclusiv lumânări închise. ENTER este doar o recomandare manuală și cere toate porțile deterministe; după warm-up, learnerul local poate doar să blocheze intrări sub pragul payout-ului. Event Futures poate avea reguli/preț de settlement diferite. Nu există promisiune de precizie sau profit.',
+    warning: INSTANCE.adaptiveProtection
+      ? 'Instanța 3014: prețul live este observat din MEXC Spot la 1 secundă; deciziile folosesc exclusiv lumânări închise. ENTER este doar o recomandare manuală și cere toate porțile deterministe. Learnerul local poate bloca rapid după trei loss consecutive, poate suprima setup-uri statistic slabe și, după calificare, poate filtra sub pragul payout-ului. Event Futures poate avea reguli/preț de settlement diferite. Nu există promisiune de precizie sau profit.'
+      : 'Instanța 3013 păstrează learnerul logistic anterior, fără circuitul adaptiv nou. Prețul live este MEXC Spot, iar deciziile folosesc exclusiv lumânări închise. Nu există promisiune de precizie sau profit.',
   };
 }
 

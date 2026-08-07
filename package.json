@@ -6,6 +6,7 @@
   "scripts": {
     "start": "node server.js",
     "start:3013": "node desktop/server.js",
+    "start:3014": "node desktop/server-3014.js",
     "build:mobile-core": "node scripts/build-mobile-core.js",
     "android:prepare": "npm run build:mobile-core",
     "android:build": "node scripts/build-android.js"

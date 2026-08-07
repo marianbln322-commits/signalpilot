@@ -17,6 +17,9 @@ const SAFETY_MARGIN = 0.03;
 const LEARNING_RATE = 0.04;
 const L2_PENALTY = 0.0005;
 const MAX_ABS_WEIGHT = 6;
+const LOSS_STREAK_LIMIT = 3;
+const RECOVERY_WINDOW = 5;
+const SETUP_GUARD_SAMPLE = 12;
 const EPSILON = 1e-6;
 
 const FEATURE_NAMES = Object.freeze([
@@ -57,6 +60,63 @@ function sigmoid(value) {
 function logLoss(probability, label) {
   const safeProbability = clip(probability, EPSILON, 1 - EPSILON);
   return -(label * Math.log(safeProbability) + (1 - label) * Math.log(1 - safeProbability));
+}
+
+function wilsonUpperProbability(wins, sample) {
+  if (!sample) return null;
+  const z = 1.959963984540054;
+  const probability = wins / sample;
+  const denominator = 1 + (z * z) / sample;
+  const center = (probability + (z * z) / (2 * sample)) / denominator;
+  const margin = z * Math.sqrt((probability * (1 - probability) + (z * z) / (4 * sample)) / sample) / denominator;
+  return Math.min(1, center + margin);
+}
+
+function requiredRecoveryWinsForThreshold(threshold) {
+  if (!Number.isFinite(threshold)) return RECOVERY_WINDOW;
+  return Math.max(1, Math.ceil(threshold * RECOVERY_WINDOW));
+}
+
+function freshCircuit() {
+  return {
+    open: false,
+    openedAt: null,
+    triggerObservationId: null,
+    recoveryLabels: [],
+    recoveryEvaluated: 0,
+    lastClosedAt: null,
+    lastRecovery: null,
+  };
+}
+
+function normalizeBucket(bucket) {
+  if (!Number.isInteger(bucket.allowedLossStreak) || bucket.allowedLossStreak < 0) bucket.allowedLossStreak = 0;
+  if (!bucket.circuit || typeof bucket.circuit !== 'object' || Array.isArray(bucket.circuit)) bucket.circuit = freshCircuit();
+  bucket.circuit = { ...freshCircuit(), ...bucket.circuit };
+  if (!Array.isArray(bucket.circuit.recoveryLabels)) bucket.circuit.recoveryLabels = [];
+  bucket.circuit.recoveryLabels = bucket.circuit.recoveryLabels.filter((label) => label === 0 || label === 1).slice(-RECOVERY_WINDOW);
+  return bucket;
+}
+
+function rebuildOperationalBucket(bucket, observations) {
+  normalizeBucket(bucket);
+  bucket.allowedLossStreak = 0;
+  bucket.circuit = freshCircuit();
+  const allowedResolved = observations
+    .filter((observation) => observation.bucketKey === bucket.key
+      && observation.status === 'resolved'
+      && observation.blockedAtObservation !== true
+      && (observation.label === 0 || observation.label === 1))
+    .sort((a, b) => Number(a.targetCloseTime) - Number(b.targetCloseTime));
+  for (const observation of allowedResolved) {
+    bucket.allowedLossStreak = observation.label === 0 ? bucket.allowedLossStreak + 1 : 0;
+  }
+  if (bucket.allowedLossStreak >= LOSS_STREAK_LIMIT) {
+    const trigger = allowedResolved[allowedResolved.length - 1];
+    bucket.circuit.open = true;
+    bucket.circuit.openedAt = trigger ? trigger.targetCloseTime : null;
+    bucket.circuit.triggerObservationId = trigger ? trigger.id : null;
+  }
 }
 
 function bucketKey(symbol, horizonMin) {
@@ -133,6 +193,8 @@ function freshBucket(symbol, horizonMin) {
     losses: 0,
     modelLogLossSum: 0,
     baselineLogLossSum: 0,
+    allowedLossStreak: 0,
+    circuit: freshCircuit(),
     lastTrainingTargetCloseTime: null,
     updatedAt: null,
   };
@@ -163,23 +225,37 @@ function validLoadedState(value) {
 }
 
 class LocalAdaptiveLearner {
-  constructor(filePath, { now = () => Date.now() } = {}) {
+  constructor(filePath, { now = () => Date.now(), adaptiveProtection = false } = {}) {
     this.filePath = filePath;
     this.now = now;
+    this.adaptiveProtection = adaptiveProtection === true;
     this.lastError = null;
     this.loadError = null;
     this.persistenceError = null;
+    this.operationalMigrationNeeded = false;
     this.available = true;
     this.state = this.load();
+    if (this.available && this.operationalMigrationNeeded) {
+      try {
+        this.persistState(this.state);
+      } catch {
+        // persistState marks the learner unavailable; candidate ENTER will fail closed.
+      }
+    }
   }
 
   load() {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
       if (!validLoadedState(parsed)) throw new Error('schema/version mismatch');
-      for (const bucket of Object.values(parsed.buckets)) {
+      const bucketsNeedingMigration = [];
+      for (const [key, bucket] of Object.entries(parsed.buckets)) {
         if (!Array.isArray(bucket.weights) || bucket.weights.length !== FEATURE_NAMES.length + 1
           || bucket.weights.some((weight) => !Number.isFinite(weight))) throw new Error(`invalid weights in ${bucket.key || 'bucket'}`);
+        const hasOperationalState = Number.isInteger(bucket.allowedLossStreak)
+          && bucket.circuit && typeof bucket.circuit === 'object' && !Array.isArray(bucket.circuit);
+        normalizeBucket(bucket);
+        if (this.adaptiveProtection && !hasOperationalState) bucketsNeedingMigration.push(key);
       }
       for (const observation of parsed.observations) {
         if (!observation || typeof observation !== 'object'
@@ -189,7 +265,18 @@ class LocalAdaptiveLearner {
           || !Number.isFinite(observation.baselineProbabilityAtObservation)) {
           throw new Error(`invalid observation ${observation && observation.id || 'unknown'}`);
         }
+        if (!Array.isArray(observation.blockReasonsAtObservation)) {
+          observation.modelBlockedAtObservation = observation.blockedAtObservation === true;
+          observation.lossCircuitBlockedAtObservation = false;
+          observation.setupBlockedAtObservation = false;
+          observation.blockReasonsAtObservation = observation.blockedAtObservation ? [{
+            code: 'LOCAL_MODEL_BELOW_PAYOUT_THRESHOLD',
+            detail: 'modelul local a blocat semnalul înaintea politicii adaptive v2',
+          }] : [];
+        }
       }
+      for (const key of bucketsNeedingMigration) rebuildOperationalBucket(parsed.buckets[key], parsed.observations);
+      this.operationalMigrationNeeded = bucketsNeedingMigration.length > 0;
       return parsed;
     } catch (error) {
       if (error.code === 'ENOENT') return freshState();
@@ -268,6 +355,80 @@ class LocalAdaptiveLearner {
     };
   }
 
+  setupGuard(bucketKeyValue, setupFingerprint, threshold) {
+    const comparable = !setupFingerprint ? [] : this.state.observations
+      .filter((observation) => observation.bucketKey === bucketKeyValue
+        && observation.setupFingerprint === setupFingerprint
+        && observation.status === 'resolved'
+        && observation.trainingEligible === true)
+      .sort((a, b) => Number(b.targetCloseTime) - Number(a.targetCloseTime))
+      .slice(0, SETUP_GUARD_SAMPLE);
+    const wins = comparable.filter((observation) => observation.label === 1).length;
+    const upper = wilsonUpperProbability(wins, comparable.length);
+    const blocked = comparable.length >= SETUP_GUARD_SAMPLE && Number.isFinite(threshold)
+      && Number.isFinite(upper) && upper < threshold;
+    return {
+      setupFingerprint: setupFingerprint || null,
+      sample: comparable.length,
+      minimumSample: SETUP_GUARD_SAMPLE,
+      wins,
+      losses: comparable.length - wins,
+      winRate: comparable.length ? round(wins / comparable.length) : null,
+      wilson95Upper: round(upper),
+      threshold: round(threshold),
+      blocked,
+    };
+  }
+
+  updateOperationalGuard(bucket, observation) {
+    if (!this.adaptiveProtection) return;
+    normalizeBucket(bucket);
+    const circuit = bucket.circuit;
+    if (circuit.open) {
+      if (observation.lossCircuitBlockedAtObservation === true && observation.trainingEligible === true) {
+        circuit.recoveryLabels.push(Number(observation.label));
+        circuit.recoveryLabels = circuit.recoveryLabels.slice(-RECOVERY_WINDOW);
+        circuit.recoveryEvaluated += 1;
+        const threshold = Number(observation.thresholdAtObservation);
+        const requiredWins = requiredRecoveryWinsForThreshold(threshold);
+        const recoveryPossible = requiredWins <= RECOVERY_WINDOW;
+        const recoveryWins = circuit.recoveryLabels.reduce((total, label) => total + label, 0);
+        const recovered = recoveryPossible && circuit.recoveryLabels.length === RECOVERY_WINDOW && recoveryWins >= requiredWins;
+        observation.circuitRecovery = {
+          sample: circuit.recoveryLabels.length,
+          wins: recoveryWins,
+          requiredSample: RECOVERY_WINDOW,
+          requiredWins,
+          recoveryPossible,
+          recovered,
+        };
+        if (recovered) {
+          circuit.open = false;
+          circuit.lastClosedAt = observation.targetCloseTime;
+          circuit.lastRecovery = { ...observation.circuitRecovery, closedByObservationId: observation.id };
+          circuit.openedAt = null;
+          circuit.triggerObservationId = null;
+          circuit.recoveryLabels = [];
+          circuit.recoveryEvaluated = 0;
+          bucket.allowedLossStreak = 0;
+        }
+      }
+      return;
+    }
+
+    if (observation.blockedAtObservation === true) return;
+    bucket.allowedLossStreak = observation.label === 0 ? bucket.allowedLossStreak + 1 : 0;
+    observation.allowedLossStreakAfterOutcome = bucket.allowedLossStreak;
+    if (bucket.allowedLossStreak >= LOSS_STREAK_LIMIT) {
+      circuit.open = true;
+      circuit.openedAt = observation.targetCloseTime;
+      circuit.triggerObservationId = observation.id;
+      circuit.recoveryLabels = [];
+      circuit.recoveryEvaluated = 0;
+      observation.openedLossCircuit = true;
+    }
+  }
+
   overlapsTrainingObservation(key, timing) {
     return this.state.observations.some((observation) => observation.bucketKey === key
       && observation.trainingEligible === true
@@ -287,7 +448,7 @@ class LocalAdaptiveLearner {
     if (signal.action !== 'ENTER' || !signal.signalKey || !['UP', 'DOWN'].includes(signal.direction)) {
       return {
         ...withTiming(availableAt, currentTiming),
-        localLearning: { considered: false, phase: 'NOT_A_CANDIDATE', blocked: false },
+        localLearning: { considered: false, adaptiveProtection: this.adaptiveProtection, phase: 'NOT_A_CANDIDATE', blocked: false },
       };
     }
 
@@ -303,6 +464,7 @@ class LocalAdaptiveLearner {
         signalKey: null,
         localLearning: {
           considered: true,
+          adaptiveProtection: this.adaptiveProtection,
           bucketKey: key,
           phase: 'ERROR',
           active: false,
@@ -326,7 +488,28 @@ class LocalAdaptiveLearner {
       const numericPayout = Number(payout);
       const breakEvenProbability = Number.isFinite(numericPayout) && numericPayout > 0 ? 1 / (1 + numericPayout) : null;
       const threshold = Number.isFinite(breakEvenProbability) ? breakEvenProbability + SAFETY_MARGIN : null;
-      const blocked = qualification.active && Number.isFinite(threshold) && probability < threshold;
+      const modelBlocked = qualification.active && Number.isFinite(threshold) && probability < threshold;
+      const circuitBlocked = this.adaptiveProtection && bucket.circuit.open === true;
+      const setupGuard = this.setupGuard(key, signal.setupFingerprint, threshold);
+      if (!this.adaptiveProtection) setupGuard.blocked = false;
+      const requiredRecoveryWins = requiredRecoveryWinsForThreshold(threshold);
+      const recoveryPossible = requiredRecoveryWins <= RECOVERY_WINDOW;
+      const blockReasons = [];
+      if (circuitBlocked) blockReasons.push({
+        code: 'LOCAL_LOSS_STREAK_CIRCUIT_OPEN',
+        detail: recoveryPossible
+          ? `circuit de siguranță deschis după ${LOSS_STREAK_LIMIT} pierderi consecutive; așteaptă ${RECOVERY_WINDOW} rezultate shadow eligibile și minimum ${requiredRecoveryWins} WIN`
+          : `circuit de siguranță deschis după ${LOSS_STREAK_LIMIT} pierderi consecutive; pragul payout-ului cere ${requiredRecoveryWins} WIN din ${RECOVERY_WINDOW}, deci recovery nu este posibil până când payout-ul crește`,
+      });
+      if (setupGuard.blocked) blockReasons.push({
+        code: 'LOCAL_SETUP_UNRELIABLE',
+        detail: `setup ${setupGuard.setupFingerprint}: ${setupGuard.wins}W/${setupGuard.losses}L din ${setupGuard.sample}, Wilson95 upper ${round(setupGuard.wilson95Upper * 100, 2)}% sub prag ${round(threshold * 100, 2)}%`,
+      });
+      if (modelBlocked) blockReasons.push({
+        code: 'LOCAL_MODEL_BELOW_PAYOUT_THRESHOLD',
+        detail: `probabilitate locală ${round(probability * 100, 2)}% sub pragul fix ${round(threshold * 100, 2)}%`,
+      });
+      const blocked = blockReasons.length > 0;
       const lastTarget = Number(bucket.lastTrainingTargetCloseTime);
       const previousWindowComplete = !Number.isFinite(lastTarget) || currentTiming.entryOpenTime > lastTarget;
       const trainingEligible = previousWindowComplete && !this.overlapsTrainingObservation(key, currentTiming);
@@ -367,7 +550,19 @@ class LocalAdaptiveLearner {
         thresholdAtObservation: round(threshold),
         phaseAtObservation: qualification.phase,
         modelActiveAtObservation: qualification.active,
+        modelBlockedAtObservation: modelBlocked,
+        lossCircuitBlockedAtObservation: circuitBlocked,
+        setupBlockedAtObservation: setupGuard.blocked,
         blockedAtObservation: blocked,
+        blockReasonsAtObservation: blockReasons,
+        setupGuardAtObservation: setupGuard,
+        allowedLossStreakAtObservation: bucket.allowedLossStreak,
+        lossCircuitAtObservation: {
+          open: bucket.circuit.open,
+          openedAt: bucket.circuit.openedAt,
+          recoverySample: bucket.circuit.recoveryLabels.length,
+          recoveryWins: bucket.circuit.recoveryLabels.reduce((total, label) => total + label, 0),
+        },
         effectiveSamplesAtObservation: bucket.effectiveSamples,
         winsAtObservation: bucket.wins,
         lossesAtObservation: bucket.losses,
@@ -391,6 +586,7 @@ class LocalAdaptiveLearner {
     const blocked = observation.blockedAtObservation === true;
     const localLearning = {
       considered: true,
+      adaptiveProtection: this.adaptiveProtection,
       observationId,
       bucketKey: key,
       phase: observation.phaseAtObservation,
@@ -406,11 +602,20 @@ class LocalAdaptiveLearner {
       beatsBaseline: observation.beatsBaselineAtObservation === true,
       trainingEligible: observation.trainingEligible,
       exclusionReason: observation.exclusionReason,
-      rule: 'poate doar păstra ENTER sau transforma ENTER în WAIT; nu creează și nu inversează semnale',
+      blockReasons: observation.blockReasonsAtObservation || [],
+      setupGuard: observation.setupGuardAtObservation || null,
+      allowedLossStreak: observation.allowedLossStreakAtObservation || 0,
+      lossCircuit: observation.lossCircuitAtObservation || { open: false, recoverySample: 0, recoveryWins: 0 },
+      rule: this.adaptiveProtection
+        ? `protecție în 3 trepte: circuit după ${LOSS_STREAK_LIMIT} loss, guard setup la N=${SETUP_GUARD_SAMPLE}, apoi model complet; poate doar ENTER→WAIT`
+        : 'instanța 3013 păstrează learnerul logistic anterior; protecția rapidă în 3 trepte este izolată pe 3014',
     };
     const retimed = withTiming(observation.observedAt, timing);
     if (!blocked) return { ...retimed, localLearning };
-    const detail = `probabilitate locală ${round(probability * 100, 2)}% sub pragul fix ${round(threshold * 100, 2)}%`;
+    const blockReasons = localLearning.blockReasons.length ? localLearning.blockReasons : [{
+      code: 'LOCAL_ADAPTIVE_GUARD_BLOCKED',
+      detail: 'learnerul local a blocat intrarea fără un motiv serializat',
+    }];
     return {
       ...retimed,
       intendedDirection: observation.direction,
@@ -419,9 +624,13 @@ class LocalAdaptiveLearner {
       verdict: 'WAIT',
       signalKey: null,
       localLearning,
-      reasonCodes: [...new Set([...(signal.reasonCodes || []), 'LOCAL_MODEL_BELOW_PAYOUT_THRESHOLD'])],
-      gateChecks: [...(signal.gateChecks || []), { code: 'LOCAL_MODEL_BELOW_PAYOUT_THRESHOLD', pass: false, detail }],
-      conflicts: [...(signal.conflicts || []), detail],
+      reasonCodes: [...new Set([...(signal.reasonCodes || []), ...blockReasons.map((reason) => reason.code)])],
+      gateChecks: [...(signal.gateChecks || []), ...blockReasons.map((reason) => ({
+        code: reason.code,
+        pass: false,
+        detail: reason.detail,
+      }))],
+      conflicts: [...(signal.conflicts || []), ...blockReasons.map((reason) => reason.detail)],
     };
   }
 
@@ -494,8 +703,10 @@ class LocalAdaptiveLearner {
             * (observation.direction === 'UP' ? 1 : -1), 6) : null;
         observation.status = 'resolved';
         observation.resolvedAt = this.now();
+        const bucket = this.ensureBucket(observation.symbol, observation.horizonMin);
+        this.updateOperationalGuard(bucket, observation);
         if (observation.trainingEligible && !observation.trainedAt) {
-          this.train(this.ensureBucket(observation.symbol, observation.horizonMin), observation);
+          this.train(bucket, observation);
         }
         changed = true;
         resolved.push(observation);
@@ -508,19 +719,30 @@ class LocalAdaptiveLearner {
     }
   }
 
-  snapshot(symbols = ['BTCUSDT', 'ETHUSDT'], horizons = [10, 30]) {
-    for (const symbol of symbols) for (const horizon of horizons) this.ensureBucket(symbol, horizon);
+  snapshot(symbols = ['BTCUSDT', 'ETHUSDT'], payoutByHorizon = {}) {
+    for (const symbol of symbols) for (const horizon of [10, 30]) this.ensureBucket(symbol, horizon);
     const byBucket = {};
     for (const [key, bucket] of Object.entries(this.state.buckets)) {
+      normalizeBucket(bucket);
       const observations = this.state.observations.filter((item) => item.bucketKey === key);
       const qualification = this.qualification(bucket);
       const reportedQualification = this.available ? qualification : { ...qualification, phase: 'ERROR', active: false };
+      const payout = Number(payoutByHorizon[bucket.horizonMin]);
+      const threshold = Number.isFinite(payout) && payout > 0 ? 1 / (1 + payout) + SAFETY_MARGIN : null;
+      const setupFingerprints = [...new Set(observations.map((item) => item.setupFingerprint).filter(Boolean))];
+      const weakSetups = this.adaptiveProtection ? setupFingerprints.map((fingerprint) => this.setupGuard(key, fingerprint, threshold))
+        .filter((setup) => setup.blocked)
+        .sort((a, b) => a.wilson95Upper - b.wilson95Upper) : [];
+      const recoveryWins = bucket.circuit.recoveryLabels.reduce((total, label) => total + label, 0);
+      const recoveryRequiredWins = requiredRecoveryWinsForThreshold(threshold);
+      const recoveryPossible = recoveryRequiredWins <= RECOVERY_WINDOW;
       byBucket[key] = {
         key,
         symbol: bucket.symbol,
         horizonMin: bucket.horizonMin,
         phase: reportedQualification.phase,
         active: reportedQualification.active,
+        adaptiveProtection: this.adaptiveProtection,
         effectiveSamples: bucket.effectiveSamples,
         minimumEffectiveSamples: MINIMUM_EFFECTIVE_SAMPLE,
         wins: bucket.wins,
@@ -532,12 +754,28 @@ class LocalAdaptiveLearner {
         modelLogLoss: qualification.modelLogLoss,
         baselineLogLoss: qualification.baselineLogLoss,
         beatsBaseline: qualification.beatsBaseline,
+        allowedLossStreak: bucket.allowedLossStreak,
+        lossStreakLimit: LOSS_STREAK_LIMIT,
+        circuit: {
+          open: bucket.circuit.open,
+          openedAt: bucket.circuit.openedAt,
+          recoverySample: bucket.circuit.recoveryLabels.length,
+          recoveryWins,
+          recoveryRequiredSample: RECOVERY_WINDOW,
+          recoveryRequiredWins,
+          recoveryPossible,
+          recoveryEvaluated: bucket.circuit.recoveryEvaluated,
+          lastClosedAt: bucket.circuit.lastClosedAt,
+          lastRecovery: bucket.circuit.lastRecovery,
+        },
+        weakSetups,
         lastTrainingTargetCloseTime: bucket.lastTrainingTargetCloseTime,
       };
     }
     return {
       enabled: true,
       available: this.available,
+      adaptiveProtection: this.adaptiveProtection,
       externalApi: false,
       estimatedApiCost: 0,
       policyVersion: POLICY_VERSION,
@@ -545,10 +783,15 @@ class LocalAdaptiveLearner {
       featureSchemaVersion: FEATURE_SCHEMA_VERSION,
       featureCount: FEATURE_NAMES.length,
       labelPolicy: LABEL_POLICY,
-      policy: 'shadow walk-forward; numai observații ne-suprapuse antrenează; modelul poate doar bloca un ENTER determinist',
+      policy: this.adaptiveProtection
+        ? `protecție locală în 3 trepte: pauză după ${LOSS_STREAK_LIMIT} loss consecutive, setup guard la N=${SETUP_GUARD_SAMPLE}, model logistic complet la N=${MINIMUM_EFFECTIVE_SAMPLE}`
+        : `learner logistic v4 original pe 3013; protecția adaptivă în 3 trepte rulează numai în instanța 3014`,
       retention: 'append-only; observațiile nu sunt trunchiate automat',
-      recovery: this.loadError ? 'Șterge sau repară desktop/data/local-learning.json, apoi repornește aplicația.' : null,
+      recovery: this.loadError ? 'Șterge sau repară fișierul local-learning.json al instanței, apoi repornește aplicația.' : null,
       activation: {
+        lossStreakLimit: LOSS_STREAK_LIMIT,
+        recoveryWindow: RECOVERY_WINDOW,
+        setupGuardMinimumSample: SETUP_GUARD_SAMPLE,
         minimumEffectiveSamples: MINIMUM_EFFECTIVE_SAMPLE,
         minimumWins: MINIMUM_CLASS_SAMPLE,
         minimumLosses: MINIMUM_CLASS_SAMPLE,

@@ -138,15 +138,22 @@ function gatesTable(gates) {
 
 function localLearningBlock(learning) {
   if (!learning || !learning.considered) {
-    return '<div class="learner-box neutral"><b>Learner local:</b> motorul determinist este WAIT; modelul nu poate crea o intrare.</div>';
+    return '<div class="learner-box neutral"><b>Learner local:</b> motorul determinist este WAIT; learnerul nu poate crea o intrare.</div>';
   }
   const phase = learning.phase || 'WARMUP';
   const stateClass = learning.blocked ? 'blocked' : learning.active ? 'active' : 'neutral';
   const probability = learning.active && learning.probability != null
     ? ` · probabilitate model ${formatNumber(learning.probability * 100, 2)}% · prag ${formatNumber(learning.threshold * 100, 2)}%`
-    : ' · probabilitatea nu este folosită înainte de calificare';
+    : ' · modelul logistic complet nu este încă folosit';
   const eligibility = learning.trainingEligible ? 'eligibil pentru training' : `audit-only: ${learning.exclusionReason || 'overlap'}`;
-  return `<div class="learner-box ${safe(stateClass)}"><div class="learner-head"><b>Learner local · ${safe(phase)}</b><span>${safe(learning.blocked ? 'ENTER BLOCAT' : learning.active ? 'ENTER PĂSTRAT' : 'DOAR MONITORIZARE')}</span></div><div>${safe(learning.bucketKey)} · N efectiv ${safe(learning.effectiveSamples)}/${safe(learning.minimumEffectiveSamples)} · W/L ${safe(learning.wins)}/${safe(learning.losses)}${safe(probability)}</div><p>${safe(eligibility)} · modelul nu poate crea sau inversa semnale.</p></div>`;
+  const circuit = learning.lossCircuit || {};
+  const protection = learning.adaptiveProtection !== true
+    ? 'instanța 3013: circuitul rapid este dezactivat; folosește 3014 pentru protecția în 3 trepte'
+    : circuit.open
+      ? `CIRCUIT DESCHIS · recovery shadow ${circuit.recoveryWins || 0}/${circuit.recoverySample || 0}`
+      : `loss consecutive permise observate: ${learning.allowedLossStreak || 0}/3`;
+  const reasons = (learning.blockReasons || []).map((reason) => `${reason.code}: ${reason.detail}`);
+  return `<div class="learner-box ${safe(stateClass)}"><div class="learner-head"><b>Learner local · ${safe(phase)}</b><span>${safe(learning.blocked ? 'ENTER BLOCAT' : learning.active ? 'ENTER PĂSTRAT' : learning.adaptiveProtection ? 'PROTECȚIE RAPIDĂ ACTIVĂ' : 'LEARNER 3013')}</span></div><div>${safe(learning.bucketKey)} · N efectiv ${safe(learning.effectiveSamples)}/${safe(learning.minimumEffectiveSamples)} · W/L ${safe(learning.wins)}/${safe(learning.losses)}${safe(probability)}</div><div><b>Protecție:</b> ${safe(protection)}</div>${reasons.length ? `<div><b>Ce a corectat:</b>${compactList(reasons)}</div>` : ''}<p>${safe(eligibility)} · learnerul poate doar bloca, niciodată crea sau inversa semnale.</p></div>`;
 }
 
 function decisionCard(symbol, prediction) {
@@ -177,7 +184,7 @@ function renderJournal(journal) {
     const result = entry.status === 'resolved' ? (entry.win ? 'WIN' : 'LOSS') : entry.status === 'invalid' ? `INVALID · ${entry.invalidReason}` : 'PENDING';
     const review = entry.review;
     const local = entry.features && entry.features.localLearning;
-    return `<article class="journal-row ${entry.win === false ? 'loss-row' : ''}"><div><b>${safe(entry.symbol)}</b> · ${safe(entry.horizonMin)}m · <span class="${safe(directionClass(entry.direction))}">${safe(entry.direction)}</span> · quality ${safe(entry.quality)}<div class="muted">${safe(formatTime(entry.entryOpenTime))} ${safe(formatPrice(entry.entryPrice))} → ${safe(formatTime(entry.targetCloseTime))} ${safe(formatPrice(entry.exitPrice))}</div>${review ? `<div class="review"><b>Review determinist:</b> ${safe(review.summary)}<br>MFE ${safe(formatNumber(review.maximumFavorableExcursionPct, 4))}% · MAE ${safe(formatNumber(review.maximumAdverseExcursionPct, 4))}% · ${safe((review.tags || []).join(', ') || 'fără tag')}</div>` : ''}${local ? `<div class="review"><b>Learner la emitere:</b> ${safe(local.bucketKey)} · ${safe(local.phase)} · N=${safe(local.effectiveSamples)}${local.active ? ` · p=${safe(formatNumber(local.probability * 100, 2))}% · prag=${safe(formatNumber(local.threshold * 100, 2))}%` : ''} · ${local.trainingEligible ? 'training eligibil' : 'audit-only overlap'}</div>` : ''}</div><strong class="${entry.win ? 'fresh' : entry.win === false ? 'stale' : ''}">${safe(result)}</strong></article>`;
+    return `<article class="journal-row ${entry.win === false ? 'loss-row' : ''}"><div><b>${safe(entry.symbol)}</b> · ${safe(entry.horizonMin)}m · <span class="${safe(directionClass(entry.direction))}">${safe(entry.direction)}</span> · quality ${safe(entry.quality)}<div class="muted">${safe(formatTime(entry.entryOpenTime))} ${safe(formatPrice(entry.entryPrice))} → ${safe(formatTime(entry.targetCloseTime))} ${safe(formatPrice(entry.exitPrice))}</div>${review ? `<div class="review"><b>Review determinist:</b> ${safe(review.summary)}<br>MFE ${safe(formatNumber(review.maximumFavorableExcursionPct, 4))}% · MAE ${safe(formatNumber(review.maximumAdverseExcursionPct, 4))}% · ${safe((review.tags || []).join(', ') || 'fără tag')}</div>` : ''}${local ? `<div class="review"><b>Learner la emitere:</b> ${safe(local.bucketKey)} · ${safe(local.phase)} · N=${safe(local.effectiveSamples)}${local.active ? ` · p=${safe(formatNumber(local.probability * 100, 2))}% · prag=${safe(formatNumber(local.threshold * 100, 2))}%` : ''} · ${local.trainingEligible ? 'training eligibil' : 'audit-only overlap'}<br><b>Protecție la emitere:</b> ${local.lossCircuit && local.lossCircuit.open ? 'circuit deschis' : `loss streak ${safe(local.allowedLossStreak || 0)}/3`} · setup sample ${safe(local.setupGuard && local.setupGuard.sample || 0)}</div>` : ''}</div><strong class="${entry.win ? 'fresh' : entry.win === false ? 'stale' : ''}">${safe(result)}</strong></article>`;
   }).join('');
   byId('journalRows').innerHTML = rows || '<p class="muted">Niciun ENTER înregistrat pentru motorul curent.</p>';
 }
@@ -214,21 +221,33 @@ function renderLocalLearning(learner) {
   const status = byId('learnerStatus');
   const buckets = Object.values(learner && learner.byBucket || {}).sort((a, b) => a.symbol.localeCompare(b.symbol) || a.horizonMin - b.horizonMin);
   const unavailable = Boolean(learner && learner.available === false);
+  const adaptiveProtection = Boolean(learner && learner.adaptiveProtection);
+  const pausedCount = adaptiveProtection ? buckets.filter((bucket) => bucket.circuit && bucket.circuit.open).length : 0;
   const activeCount = buckets.filter((bucket) => bucket.active).length;
   const monitoringCount = buckets.filter((bucket) => bucket.phase === 'MONITORING').length;
-  const globalPhase = unavailable ? 'ERROR' : activeCount ? `ACTIVE ${activeCount}/4` : monitoringCount ? `MONITORING ${monitoringCount}/4` : 'WARMUP';
+  const globalPhase = unavailable ? 'ERROR' : pausedCount ? `PAUZĂ ${pausedCount}/4` : activeCount ? `ACTIVE ${activeCount}/4` : monitoringCount ? `MONITORING ${monitoringCount}/4` : 'WARMUP';
   badge.textContent = `Learner local · ${globalPhase}`;
-  badge.className = `badge ${unavailable ? 'badge-off' : activeCount ? 'badge-on' : ''}`;
+  badge.className = `badge ${unavailable ? 'badge-off' : pausedCount ? '' : activeCount ? 'badge-on' : ''}`;
   status.textContent = unavailable
     ? `ERROR · ENTER blocat · ${learner.lastError || 'starea locală nu este disponibilă'}${learner.recovery ? ` · ${learner.recovery}` : ''}`
     : learner && learner.externalApi === false
-      ? `${globalPhase} · cost API 0 · N efectiv ${learner.totals && learner.totals.effectiveSamples || 0}`
+      ? adaptiveProtection
+        ? `${globalPhase} · cost API 0 · N efectiv ${learner.totals && learner.totals.effectiveSamples || 0} · protecție după ${learner.activation && learner.activation.lossStreakLimit || 3} loss`
+        : `${globalPhase} · instanța 3013 · pentru circuit adaptiv pornește 3014`
       : 'Learner local indisponibil';
-  status.className = `learner-status ${activeCount && !unavailable ? 'enabled' : unavailable ? 'error' : ''}`;
+  status.className = `learner-status ${activeCount && !unavailable && !pausedCount ? 'enabled' : unavailable ? 'error' : ''}`;
   byId('localLearningSummary').innerHTML = buckets.length ? buckets.map((bucket) => {
-    const phaseClass = bucket.phase === 'ERROR' ? 'error' : bucket.active ? 'active' : bucket.phase === 'MONITORING' ? 'monitoring' : 'warmup';
-    const losses = bucket.modelLogLoss == null ? 'așteaptă rezultate' : `log-loss model ${formatNumber(bucket.modelLogLoss, 4)} / baseline ${formatNumber(bucket.baselineLogLoss, 4)} · ${bucket.beatsBaseline ? 'model mai bun' : 'încă nu bate baseline-ul'}`;
-    return `<article class="learner-bucket ${safe(phaseClass)}"><div><b>${safe(bucket.symbol)} · ${safe(bucket.horizonMin)}m</b><span>${safe(bucket.phase)}</span></div><strong>N ${safe(bucket.effectiveSamples)}/${safe(bucket.minimumEffectiveSamples)}</strong><p>W/L ${safe(bucket.wins)}/${safe(bucket.losses)} · pending ${safe(bucket.pending)} · overlap exclus ${safe(bucket.excludedOverlap)} · invalid ${safe(bucket.invalid)}</p><small>${safe(losses)}</small></article>`;
+    const circuit = bucket.circuit || {};
+    const phaseClass = bucket.phase === 'ERROR' ? 'error' : circuit.open ? 'paused' : bucket.active ? 'active' : bucket.phase === 'MONITORING' ? 'monitoring' : 'warmup';
+    const losses = bucket.modelLogLoss == null ? 'model mare: așteaptă rezultate' : `log-loss model ${formatNumber(bucket.modelLogLoss, 4)} / baseline ${formatNumber(bucket.baselineLogLoss, 4)} · ${bucket.beatsBaseline ? 'model mai bun' : 'încă nu bate baseline-ul'}`;
+    const protection = !bucket.adaptiveProtection
+      ? '3013: protecția rapidă este dezactivată; datele rămân separate de 3014'
+      : circuit.open
+        ? circuit.recoveryPossible === false
+          ? `CIRCUIT DESCHIS · recovery imposibil la payout-ul curent: pragul cere ${safe(circuit.recoveryRequiredWins)}W din ${safe(circuit.recoveryRequiredSample)}`
+          : `CIRCUIT DESCHIS · recovery ${safe(circuit.recoveryWins)}/${safe(circuit.recoverySample)}; necesar ${safe(circuit.recoveryRequiredWins)}W din ${safe(circuit.recoveryRequiredSample)}`
+        : `streak ${safe(bucket.allowedLossStreak)}/${safe(bucket.lossStreakLimit)} · setup-uri blocate ${safe((bucket.weakSetups || []).length)}`;
+    return `<article class="learner-bucket ${safe(phaseClass)}"><div><b>${safe(bucket.symbol)} · ${safe(bucket.horizonMin)}m</b><span>${safe(circuit.open ? 'PAUZĂ ADAPTIVĂ' : bucket.phase)}</span></div><strong>N ${safe(bucket.effectiveSamples)}/${safe(bucket.minimumEffectiveSamples)}</strong><p>W/L ${safe(bucket.wins)}/${safe(bucket.losses)} · pending ${safe(bucket.pending)} · overlap exclus ${safe(bucket.excludedOverlap)} · invalid ${safe(bucket.invalid)}</p><p><b>Protecție:</b> ${protection}</p><small>${safe(losses)}</small></article>`;
   }).join('') : '<p class="muted">Aștept inițializarea celor patru bucket-uri locale.</p>';
 }
 
@@ -249,7 +268,7 @@ function renderState(state) {
   const newestTicker = Object.values(currentTickers).sort((a, b) => b.receivedAt - a.receivedAt)[0];
   byId('liveBadge').textContent = newestTicker ? `Preț live ${formatAge(Date.now() - newestTicker.receivedAt)}` : 'Preț live —';
   byId('liveBadge').className = `badge ${newestTicker && Date.now() - newestTicker.receivedAt <= 3_000 ? 'badge-on' : 'badge-off'}`;
-  byId('sourceLine').textContent = `Build ${state.build || '—'} · preț MEXC Spot refresh 1s · analiză closed-candle ${state.config && state.config.scanIntervalSec || '—'}s · learner local ${state.localLearning && state.localLearning.available !== false ? 'persistent, API 0' : 'ERROR, ENTER blocat'}${clock ? ` · clock RTT ${clock.roundTripMs}ms · skew ${clock.localSkewMs}ms` : ''}`;
+  byId('sourceLine').textContent = `${state.endpoint || 'instanță locală'} · Build ${state.build || '—'} · preț MEXC Spot refresh 1s · analiză closed-candle ${state.config && state.config.scanIntervalSec || '—'}s · learner local ${state.localLearning && state.localLearning.available !== false ? 'persistent, API 0' : 'ERROR, ENTER blocat'}${clock ? ` · clock RTT ${clock.roundTripMs}ms · skew ${clock.localSkewMs}ms` : ''}`;
   const progress = state.status && state.status.backtestProgress;
   if (progress) byId('btStatus').textContent = `${progress.phase}: ${progress.percent}%`;
 }
