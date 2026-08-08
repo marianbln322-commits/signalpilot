@@ -152,6 +152,30 @@ Direcția se deduce singură: la câștig coincide cu sensul mișcării, la pier
 
 Coloana `payout` e opțională, dar **fără ea defalcarea pe niveluri de payout e imposibilă** — payout-ul se poate deduce din P&L doar la pozițiile câștigătoare, fiindcă o pierdere e mereu −100% din miză indiferent ce payout ți se oferea. Unealta detectează situația și refuză tabelul, în loc să afișeze 100% pe fiecare nivel. Iar aceea e întrebarea care decide totul: **payout-ul mare apare în momentele mai greu de prezis, sau nu?** Dacă da, „intru doar la 85%" te selectează în cele mai grele momente și avantajul aparent dispare.
 
+### Ce a arătat auditul pe 506 poziții reale
+
+Istoricul real de tranzacționare MEXC al utilizatorului (16.07–08.08.2026, 506 poziții decontate, validat contra totalurilor exportate) a fost trecut prin `tools/analyze-positions.js`. Rezultatul e păstrat aici pentru că e singura măsurătoare din acest proiect care nu e o estimare:
+
+```
+win-rate realizat      : 51.59%  (259/502, egalitățile excluse)
+interval încredere 95% : 47.23% – 55.94%
+payout mediu (ponderat): 77%   ->  break-even 56.50%
+EV                     : -8.67% pe tranzacție
+vs. monedă (50%)       : p = 0.24  — nedistinct de hazard
+P&L                    : -102.70 USDT pe 8.018 USDT rulaj
+```
+
+Defalcat pe payout, win-rate-ul **nu** crește cu payout-ul: 70% → 52.0% (n=102), 80% → 52.1% (n=213), 85% → 49.7% (n=157). Deci nu există nici selecție adversă, nici avantaj — la niciun nivel nu se atinge break-even-ul.
+
+Alte lucruri pe care auditul le-a stabilit, și care au produs modificări în cod:
+
+- **Egalitatea e rambursare.** Pe fiecare egalitate exactă, payout-ul returnat era egal cu miza. Codul o trata ca pierdere, ceea ce subestima win-rate-ul și contamina calibrarea.
+- **17.3% din poziții s-au decis pe o mișcare sub 0.02%.** La marginea aceea, diferența dintre spot și index price poate inversa rezultatul — de aici trecerea decontării pe index.
+- **Payout-ul e per simbol.** Observat în aceeași secundă: BTCUSDT la 10%, ETHUSDT la 70%. Un singur număr global în config era greșit din construcție.
+- **Orele „bune" nu există.** Din 21 de bucket-uri orare, 3 aveau p < 0.05 naiv (așteptat din hazard: 1.1) și **zero** au trecut corecția Bonferroni.
+
+Concluzia, spusă direct: **nu există un avantaj demonstrabil în semnalele acestei aplicații.** Rolul corect al porții EV pe aceste date e să refuze. O versiune anterioară a acestui README revendica „ETH Sniper 55.6%, a rezistat out-of-sample" — cifra a fost retrasă, iar auditul confirmă de ce conta: cineva a tranzacționat pe baza ei.
+
 ### Două populații care nu se amestecă niciodată
 
 Jurnalul conține două feluri de intrări, și distincția e esențială:
