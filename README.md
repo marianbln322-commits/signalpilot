@@ -132,6 +132,26 @@ POST /api/calibrate    { "days": 30 }
 
 Rezultatul se salvează în `calibration.json` și e folosit live până când jurnalul tău propriu are destule rezultate rezolvate, moment în care are prioritate (datele tale reale bat istoricul).
 
+### Pornire din istoricul tău real de poziții
+
+Un backtest pe date proxy estimează un edge. Pozițiile tale închise din MEXC nu estimează nimic — sunt rezultate decontate de MEXC, pe regulile lui, la payout-urile pe care le-ai primit efectiv. E cea mai bună dovadă disponibilă și scurtcircuitează cold-start-ul.
+
+```bash
+node tools/analyze-positions.js pozitii.csv
+node tools/analyze-positions.js pozitii.csv --seed-calibration
+```
+
+CSV minim — numele coloanelor sunt tolerante (RO sau EN):
+
+```
+symbol,interval,stake,entry,settle,pnl,payout
+ETHUSDT,10,5,1919.88,1921.40,3.50,70
+```
+
+Direcția se deduce singură: la câștig coincide cu sensul mișcării, la pierdere e opusă.
+
+Coloana `payout` e opțională, dar **fără ea defalcarea pe niveluri de payout e imposibilă** — payout-ul se poate deduce din P&L doar la pozițiile câștigătoare, fiindcă o pierdere e mereu −100% din miză indiferent ce payout ți se oferea. Unealta detectează situația și refuză tabelul, în loc să afișeze 100% pe fiecare nivel. Iar aceea e întrebarea care decide totul: **payout-ul mare apare în momentele mai greu de prezis, sau nu?** Dacă da, „intru doar la 85%" te selectează în cele mai grele momente și avantajul aparent dispare.
+
 ### Două populații care nu se amestecă niciodată
 
 Jurnalul conține două feluri de intrări, și distincția e esențială:
