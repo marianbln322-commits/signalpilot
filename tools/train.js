@@ -280,6 +280,40 @@ function report(oos, horizonBars, label) {
   return { label };
 }
 
+// Empirical reliability: for each confidence band, what the model ACTUALLY got
+// right out-of-sample. This is the bridge between a model output and a number the
+// EV gate is allowed to trust. Counted on a stride-H subsample so overlapping
+// outcome windows do not shrink the intervals.
+const CONF_BANDS = [
+  [0.500, 0.520], [0.520, 0.550], [0.550, 0.580],
+  [0.580, 0.600], [0.600, 0.650], [0.650, 1.001],
+];
+
+function reliabilityTable(oos, horizonBars) {
+  return CONF_BANDS.map(([lo, hi]) => {
+    let lastIdx = -1e9;
+    let n = 0;
+    let correct = 0;
+    for (const o of oos) {
+      const conf = Math.max(o.p, 1 - o.p);
+      if (conf < lo || conf >= hi) continue;
+      if (o.i - lastIdx < horizonBars) continue; // independence
+      lastIdx = o.i;
+      n++;
+      if ((o.p > 0.5) === !!o.y) correct++;
+    }
+    const w = n > 10 ? cal.wilson(correct, n) : null;
+    const w90 = n > 10 ? cal.wilson(correct, n, 1.2816) : null;
+    return {
+      lo, hi, n, correct,
+      accuracy: n ? +((correct / n) * 100).toFixed(2) : null,
+      ciLow: w ? w.low : null,
+      ciHigh: w ? w.high : null,
+      ciLow90: w90 ? w90.low : null,
+    };
+  });
+}
+
 // ---- Main ------------------------------------------------------------------
 (async () => {
   const horizonMin = Number(arg('horizon', 10));
@@ -336,19 +370,43 @@ function report(oos, horizonBars, label) {
   report(oos, horizonBars, source);
 
   if (has('save')) {
-    const m = model.fit(samples.map((s) => s.x), samples.map((s) => s.y), { l2, epochs, seed: 11 });
+    const finalL2 = l2 != null ? l2 : (perFold.length
+      ? perFold.map((f) => f.l2).sort((a, b) => perFold.filter((x) => x.l2 === a).length - perFold.filter((x) => x.l2 === b).length).pop()
+      : 1);
+    const m = model.fit(samples.map((s) => s.x), samples.map((s) => s.y), { l2: finalL2, epochs, seed: 11 });
     const out = {
-      version: 1,
+      version: 2,
       kind: 'logistic',
       symbol: has('synthetic') ? 'SYNTHETIC' : symbol,
       horizonMin,
+      horizonBars,
       names,
       ...m,
+      l2: finalL2,
+      // The raw logistic output is NOT what the gate may act on. A model can say
+      // 0.58 while predictions in that band were right 50% of the time
+      // out-of-sample. This table records what each confidence band ACTUALLY
+      // achieved on data the model never saw, measured on a stride-H subsample so
+      // the intervals are not inflated by overlapping labels. The live path looks
+      // the model's output up in here and hands the gate the measured figure.
+      reliability: reliabilityTable(oos, horizonBars),
       fittedAt: Date.now(),
     };
-    const p = path.join(__dirname, '..', `model-${out.symbol}-${horizonMin}m.json`);
+    const dir = path.join(__dirname, '..', 'models');
+    fs.mkdirSync(dir, { recursive: true });
+    const p = path.join(dir, `${out.symbol}-${horizonMin}m.json`);
     fs.writeFileSync(p, JSON.stringify(out, null, 2));
     console.log(`\n  model salvat: ${p}`);
+    console.log('\n  Fiabilitate măsurată out-of-sample (ce foloseste poarta):');
+    console.log('    bandă încredere      n   acuratețe reală   CI low 90%');
+    for (const r of out.reliability) {
+      if (!r.n) continue;
+      console.log(
+        `    ${r.lo.toFixed(2)}–${r.hi >= 1 ? '1.00' : r.hi.toFixed(2)}` +
+        String(r.n).padStart(9) + `${r.accuracy}%`.padStart(16) +
+        `${r.ciLow90 != null ? r.ciLow90 + '%' : '—'}`.padStart(14)
+      );
+    }
     console.log('\n  Ponderi dominante (pe features standardizate):');
     for (const t of model.topWeights(m, names, 15)) {
       console.log(`    ${t.weight >= 0 ? '+' : ''}${t.weight}  ${t.name}`);

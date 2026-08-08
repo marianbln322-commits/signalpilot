@@ -120,7 +120,7 @@ npm install
 npm start
 ```
 
-Apoi deschide **http://localhost:3011** (schimbi portul cu variabila `PORT`, ex. `PORT=3011 npm start`). Pe Windows, dublu-click pe `start.bat`.
+Apoi deschide **http://localhost:3015** (schimbi portul cu variabila `PORT`, ex. `PORT=3020 npm start`). Pe Windows, dublu-click pe `start.bat`.
 
 ### Pasul obligatoriu: calibrarea
 
@@ -151,6 +151,30 @@ ETHUSDT,10,5,1919.88,1921.40,3.50,70
 Direcția se deduce singură: la câștig coincide cu sensul mișcării, la pierdere e opusă.
 
 Coloana `payout` e opțională, dar **fără ea defalcarea pe niveluri de payout e imposibilă** — payout-ul se poate deduce din P&L doar la pozițiile câștigătoare, fiindcă o pierdere e mereu −100% din miză indiferent ce payout ți se oferea. Unealta detectează situația și refuză tabelul, în loc să afișeze 100% pe fiecare nivel. Iar aceea e întrebarea care decide totul: **payout-ul mare apare în momentele mai greu de prezis, sau nu?** Dacă da, „intru doar la 85%" te selectează în cele mai grele momente și avantajul aparent dispare.
+
+## Modelul antrenat, conectat în aplicație
+
+`lib/predictor.js` e piesa care leagă un model antrenat de semnalul live. Fără ea, `train.js` producea un fișier pe care nimic nu-l citea, iar motorul scora în continuare cu constantele scrise de mână.
+
+**Decizia importantă de design:** ieșirea brută a modelului nu ajunge niciodată la poarta EV. Un model poate scoate `0.58` în timp ce predicțiile din banda aceea au ieșit corecte în 50% din cazuri pe date nevăzute. A acționa pe `0.58` ar însemna a acționa pe un număr pe care nu l-a verificat nimeni.
+
+De aceea fiecare model salvat poartă un **tabel de fiabilitate** construit în timpul validării walk-forward: pentru fiecare bandă de încredere, cât de des a fost efectiv corectă out-of-sample, cu interval de încredere calculat pe eșantioane independente. Calea live ia ieșirea modelului, îi găsește banda, și întoarce acuratețea *măsurată* împreună cu limita ei inferioară.
+
+```
+predicție live: raw=0.5301  dir=UP
+probabilitate folosită: 50.04%   (CI low 90%: 48.81%)
+sursă: model SYNTHETIC 10min · bandă 0.52–0.55 · 2710 rezultate out-of-sample
+poarta: REFUZĂ — 48.81% < 55.5% necesar la payout 85%
+```
+
+Modelul propune, măsurătoarea decide. Dacă o bandă a fost măsurată la 50%, poarta refuză oricât de sigur ar suna modelul. Verificat și invers: cu o bandă la 62% aceeași poartă acceptă — deci refuzul vine din date, nu dintr-un blocaj.
+
+Protecții: dacă nu există model, aplicația spune ce lipsește și refuză. Dacă setul de features s-a schimbat de la antrenare, refuză și cere reantrenare, în loc să scoreze un vector nepotrivit.
+
+```
+GET  /api/models          ce modele sunt încărcate
+POST /api/models/reload   reîncarcă models/ fără repornire
+```
 
 ## Ponderi învățate, nu inventate
 

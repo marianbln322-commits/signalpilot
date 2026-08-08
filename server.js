@@ -36,12 +36,14 @@ const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
 const cal = require('./lib/calibration');
+const predictor = require('./lib/predictor');
 const sizing = require('./lib/sizing');
 const { PriceTape } = require('./lib/priceTape');
 
-// Port 3011 by default so it runs alongside PinPilot (3004) and older
-// SignalPilot versions (3001/3002/3005). Override with the PORT env var if needed.
-const PORT = process.env.PORT || 3011;
+// Port 3015 by default so it runs alongside PinPilot (3004) and every older
+// SignalPilot version (3001/3002/3005/3011). Override with the PORT env var.
+// If 3015 is taken the server steps up to the next free port rather than crashing.
+const PORT = process.env.PORT || 3015;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const CALIBRATION_PATH = path.join(__dirname, 'calibration.json');
 const DEFAULT_CONFIG = {
@@ -129,6 +131,9 @@ const CONF_RANK = { Scăzut: 1, Mediu: 2, Ridicat: 3 };
 
 let config = loadConfig();
 let calModel = loadCalibration();
+// Trained models, keyed SYMBOL|horizon. Empty is a valid state: the app then has
+// no verified probability and the gate declines, which is the correct behaviour.
+let liveModels = predictor.loadAll();
 const latest = {};          // symbol -> last verdict
 const alerts = [];          // recent alert feed
 const sseClients = new Set();
@@ -188,8 +193,26 @@ function saveCalibration(model) {
 // resolved journal once it is large enough, and falling back to the calibration
 // fitted from historical backtest. If neither has enough data, we report that
 // honestly instead of printing an invented number.
-function buildLivePrediction(verdict) {
+function buildLivePrediction(verdict, mtfClosed) {
   const ctx = { setup: verdict.setup, interval: verdict.interval, score: verdict.score };
+
+  // PREFERRED SOURCE: a model fitted on the full candle history, whose confidence
+  // bands were measured out-of-sample. It is preferred over the journal because it
+  // rests on ~100k labelled outcomes rather than a few dozen, and over the
+  // hand-written confluence weights because those were never verified at all.
+  //
+  // What comes back is the MEASURED accuracy of the band the model landed in — not
+  // the model's own claim. If that band was 50%, the gate refuses.
+  if (mtfClosed && Object.keys(liveModels).length) {
+    const horizonMin = verdict.interval === '10 minute' ? 10 : 30;
+    const mp = predictor.predict(liveModels, verdict.symbol, horizonMin, mtfClosed, {
+      minSample: config.calibrationMinSample,
+    });
+    verdict.modelRaw = mp.raw;
+    verdict.modelDirection = mp.direction;
+    verdict.modelSource = mp.source;
+    if (mp.ready) return { ...mp, origin: 'model antrenat (fiabilitate out-of-sample)' };
+  }
   // Real alerts ONLY. Background bar samples are ~60x more numerous and describe
   // the unconditional base rate (~50%), so including them drags every estimate to
   // a coin flip with a tight interval — the gate would then never open, no matter
@@ -267,7 +290,7 @@ async function scanSymbol(symbol) {
       return iv === '10 minute' ? config.payout10 : config.payout30;
     };
 
-    const prediction = buildLivePrediction(verdict);
+    const prediction = buildLivePrediction(verdict, mtf);
     verdict.prediction = prediction;
 
     const gate = cal.decide(prediction, payoutFor(verdict.interval), { marginPct: config.evMarginPct });
@@ -275,7 +298,7 @@ async function scanSymbol(symbol) {
 
     // Compare both windows explicitly so the trader can see the trade-off.
     const alt = verdict.interval === '10 minute' ? '30 minute' : '10 minute';
-    const altPrediction = buildLivePrediction({ ...verdict, interval: alt });
+    const altPrediction = buildLivePrediction({ ...verdict, interval: alt }, mtf);
     const altGate = cal.decide(altPrediction, payoutFor(alt), { marginPct: config.evMarginPct });
 
     verdict.ev = {
@@ -704,6 +727,19 @@ app.get('/api/state', (req, res) => {
 
 app.get('/api/journal', (req, res) => {
   res.json({ stats: journal.stats(), recent: journal.recent(100) });
+});
+
+// What models are loaded, and whether any band is strong enough to ever trade.
+app.get('/api/models', (req, res) => {
+  res.json({ ...predictor.summary(liveModels), dir: predictor.MODELS_DIR });
+});
+
+// Re-read models/ without restarting, so a fresh training run takes effect live.
+app.post('/api/models/reload', (req, res) => {
+  liveModels = predictor.loadAll();
+  const s = predictor.summary(liveModels);
+  console.log(`Models reloaded: ${s.count}`);
+  res.json(s);
 });
 
 app.get('/api/learning', (req, res) => {
