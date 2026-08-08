@@ -60,8 +60,31 @@ const DEFAULT_CONFIG = {
   // adaptiveInterval (optional, OFF by default) only nudges 10 -> 30 when the
   // 10-min payout is too poor. Payout/EV is always shown as info either way.
   adaptiveInterval: false,
-  payout10: 65,          // current MEXC payout % for 10-min contracts (user updates)
-  payout30: 82,          // current MEXC payout % for 30-min contracts
+  payout10: 65,          // fallback payout % for 10-min contracts (user updates)
+  payout30: 82,          // fallback payout % for 30-min contracts
+  // Payout is quoted PER SYMBOL and moves constantly. Observed live on the same
+  // second: BTCUSDT at 10% while ETHUSDT was at 70%. A single global number is
+  // therefore wrong by construction — with payout10=65 the gate would compute a
+  // break-even of 60.6% for BTC while the true break-even was 90.9%.
+  // Shape: { ETHUSDT: { '10': 70, '30': 85 } }
+  payoutBySymbol: {},
+  // Hard floor, below which the app refuses regardless of what the model thinks.
+  //
+  // Justified by forward EV arithmetic, NOT by a backtest — and the distinction is
+  // stated explicitly because the previous README made exactly the opposite
+  // mistake. On the 506-position audit a floor of 80% would have made P&L *worse*
+  // (-141.10 vs -102.70), because the low-payout trades happened to win more often
+  // in that sample. That is noise, not an argument for taking 40% payouts.
+  //
+  // What the floor actually buys: it removes bets whose required accuracy is not
+  // defensible under any circumstances — 40% payout needs 71.4%, 25% needs 80%,
+  // 10% needs 90.9%. Against a measured 51.6% (95% CI 47.2-55.9) none of those is
+  // a decision, it is a donation. No floor makes a 51.6% win-rate profitable; the
+  // floor only limits the size of the mistake.
+  minPayout: 80,
+  // Settle against the INDEX price (what the contract references) instead of this
+  // venue's spot last price. Falls back to spot automatically.
+  useIndexPrice: true,
   // Event-futures EV gate. A signal is only actionable when its CALIBRATED
   // probability clears the break-even imposed by the payout, with a cushion.
   // Break-even = 1/(1+payout): 65% payout needs 60.6%, 82% payout needs 54.9%.
@@ -167,9 +190,11 @@ function saveCalibration(model) {
 // honestly instead of printing an invented number.
 function buildLivePrediction(verdict) {
   const ctx = { setup: verdict.setup, interval: verdict.interval, score: verdict.score };
-  const journalSamples = journal.all()
-    .filter((e) => e.status === 'resolved' && e.setup && e.interval)
-    .map((e) => ({ setup: e.setup, interval: e.interval, score: e.score, win: e.win }));
+  // Real alerts ONLY. Background bar samples are ~60x more numerous and describe
+  // the unconditional base rate (~50%), so including them drags every estimate to
+  // a coin flip with a tight interval — the gate would then never open, no matter
+  // how strong the real edge is. journal.samples() enforces the distinction.
+  const journalSamples = journal.samples();
 
   if (journalSamples.length >= (config.calibrationMinSample || 30)) {
     const live = cal.fit(journalSamples, { minSample: config.calibrationMinSample });
@@ -233,7 +258,14 @@ async function scanSymbol(symbol) {
   // from that assumption. That is a fabricated number driving a money decision,
   // so it is gone. If there is no calibration data, the app now says so.
   if (verdict.directie !== 'NEUTRU') {
-    const payoutFor = (iv) => (iv === '10 minute' ? config.payout10 : config.payout30);
+    // Per-symbol payout when configured, global fallback otherwise.
+    const payoutFor = (iv, sym = symbol) => {
+      const key = iv === '10 minute' ? '10' : '30';
+      const per = config.payoutBySymbol && config.payoutBySymbol[sym];
+      const v = per && per[key] != null ? Number(per[key]) : null;
+      if (Number.isFinite(v) && v > 0) return v;
+      return iv === '10 minute' ? config.payout10 : config.payout30;
+    };
 
     const prediction = buildLivePrediction(verdict);
     verdict.prediction = prediction;
@@ -249,8 +281,15 @@ async function scanSymbol(symbol) {
     verdict.ev = {
       payout10: config.payout10,
       payout30: config.payout30,
-      breakEven10: cal.breakEvenWinRate(config.payout10),
-      breakEven30: cal.breakEvenWinRate(config.payout30),
+      breakEven10: cal.breakEvenWinRate(payoutFor('10 minute')),
+      breakEven30: cal.breakEvenWinRate(payoutFor('30 minute')),
+      // What payout this signal would need to be worth taking. Read the live
+      // figure off MEXC and compare — this is the robust direction of the test.
+      requiredPayout: cal.requiredPayout(
+        prediction.ciLow90 != null ? prediction.ciLow90 : prediction.ciLow,
+        config.evMarginPct
+      ),
+      minPayout: config.minPayout,
       chosen: verdict.interval,
       probability: prediction.probability,
       probabilitySource: prediction.origin,
@@ -351,14 +390,16 @@ async function scanSymbol(symbol) {
     });
   }
 
-  // Continuous learning: log one observation per 5m candle per symbol (even when
-  // no alert fires) so the software keeps learning about ETH/BTC 24/7. These are
-  // resolved automatically and feed the learning layer, but stay out of the
-  // trade journal display.
+  // Continuous observation: log one sample per closed bar per symbol (even when
+  // no alert fires) so the app keeps watching ETH/BTC 24/7. These describe the
+  // UNCONDITIONAL population — every bar with a direction — so they are marked
+  // `background` and are excluded from calibration, sizing, learning and the
+  // trade journal. They exist to answer "is the filtered setup better than just
+  // taking every bar?", which requires keeping the two populations apart.
   if (config.useLearning && verdict.directie !== 'NEUTRU') {
     try {
       journal.record({
-        observation: true,
+        background: true,
         candleOpen: verdict.barOpenTime,
         symbol,
         directie: verdict.directie,
@@ -395,6 +436,22 @@ async function scanSymbol(symbol) {
     shouldAlert = verdict.directie !== 'NEUTRU' &&
       CONF_RANK[verdict.incredere] >= CONF_RANK[config.alertMinConfidence] &&
       !alreadyActed;
+  }
+
+  // Hard payout floor, before anything else.
+  //
+  // This is not a refinement of the EV gate — it is a statement about what is
+  // reachable. At payout 70% the break-even is 58.8%; measured over 506 real
+  // settled positions the win-rate was 51.6% (95% CI 47.2–55.9%). No signal in
+  // this codebase has ever demonstrated 58.8%, so a 70% payout is not a trade
+  // that needs evaluating, it is a trade that needs declining.
+  if (shouldAlert && config.minPayout > 0) {
+    const pay = payoutFor(verdict.interval);
+    if (!(pay >= config.minPayout)) {
+      shouldAlert = false;
+      verdict.suppressed = `payout ${pay}% sub pragul de ${config.minPayout}% ` +
+        `(ar cere ${cal.breakEvenWinRate(pay)}% acuratețe)`;
+    }
   }
 
   // EV gate: for a binary contract, direction is not enough — the calibrated
@@ -482,7 +539,13 @@ async function scanSymbol(symbol) {
       price: verdict.price,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
+      // Shown for observation only (model not yet calibrated) — but still a real
+      // alert, so it is journalled and counted. `background` is explicitly false:
+      // these must reach the calibration layer, otherwise observation mode can
+      // never gather the evidence that would let it end.
       observation: !!verdict.observation,
+      uncalibrated: !!verdict.observation,
+      background: false,
       ofState: verdict.orderflow ? verdict.orderflow.state : null,
       ofAgree: verdict.ofAgree || null,
       barCloseTime: verdict.barCloseTime,
@@ -511,7 +574,7 @@ async function scanSymbol(symbol) {
 async function settlePrice(symbol, resolveTs) {
   const windowMs = config.settlementTwapSec * 1000;
   const t = tape.twap(symbol, resolveTs - windowMs, resolveTs);
-  if (t && Number.isFinite(t.price)) return t;
+  if (t && Number.isFinite(t.price)) return { ...t, source: priceSource[symbol] || 'unknown' };
   try {
     const p = await mexc.fetchPrice(symbol);
     return { price: p, method: 'last-price-fallback', samples: 1 };
@@ -522,12 +585,30 @@ async function settlePrice(symbol, resolveTs) {
 
 // Independent price sampler feeding the tape. Kept separate from the scan loop
 // so settlement resolution does not depend on scan cadence or on scans succeeding.
+// Prefers the INDEX price, which is what the contract settles against, and only
+// falls back to spot when the index is unavailable. The source actually used is
+// recorded so the journal never silently mixes two different scoreboards.
+const priceSource = {};
 async function samplePrices() {
   await Promise.all(config.symbols.map(async (sym) => {
-    try {
-      const p = await mexc.fetchPrice(sym);
-      tape.push(sym, p);
-    } catch { /* transient; next tick */ }
+    let price = null;
+    let source = null;
+    if (config.useIndexPrice) {
+      try {
+        price = await mexc.fetchIndexPrice(sym);
+        source = 'index';
+      } catch { /* fall through to spot */ }
+    }
+    if (price == null) {
+      try {
+        price = await mexc.fetchPrice(sym);
+        source = 'spot-fallback';
+      } catch { /* transient; next tick */ }
+    }
+    if (price != null) {
+      tape.push(sym, price);
+      priceSource[sym] = source;
+    }
   }));
 }
 
@@ -700,6 +781,25 @@ app.post('/api/config', (req, res) => {
   if (typeof body.useOrderFlow === 'boolean') config.useOrderFlow = body.useOrderFlow;
   if (typeof body.requireOfAgree === 'boolean') config.requireOfAgree = body.requireOfAgree;
   if (typeof body.useLearning === 'boolean') config.useLearning = body.useLearning;
+  if (body.minPayout != null) {
+    const v = Number(body.minPayout);
+    if (v >= 0 && v <= 200) config.minPayout = v;
+  }
+  if (typeof body.useIndexPrice === 'boolean') config.useIndexPrice = body.useIndexPrice;
+  if (body.payoutBySymbol && typeof body.payoutBySymbol === 'object') {
+    const clean = {};
+    for (const [sym, v] of Object.entries(body.payoutBySymbol)) {
+      if (!v || typeof v !== 'object') continue;
+      const key = String(sym).toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const e = {};
+      for (const k of ['10', '30']) {
+        const n = Number(v[k]);
+        if (Number.isFinite(n) && n > 0 && n <= 500) e[k] = n;
+      }
+      if (Object.keys(e).length) clean[key] = e;
+    }
+    config.payoutBySymbol = clean;
+  }
   if (body.learningSuppressBelow != null) {
     const v = Number(body.learningSuppressBelow);
     if (v >= 30 && v <= 55) config.learningSuppressBelow = v;

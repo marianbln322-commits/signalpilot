@@ -4,3 +4,5 @@ journal.json
 calibration.json
 *.log
 .DS_Store
+data/
+model-*.json

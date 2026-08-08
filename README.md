@@ -132,6 +132,104 @@ POST /api/calibrate    { "days": 30 }
 
 Rezultatul se salvează în `calibration.json` și e folosit live până când jurnalul tău propriu are destule rezultate rezolvate, moment în care are prioritate (datele tale reale bat istoricul).
 
+### Pornire din istoricul tău real de poziții
+
+Un backtest pe date proxy estimează un edge. Pozițiile tale închise din MEXC nu estimează nimic — sunt rezultate decontate de MEXC, pe regulile lui, la payout-urile pe care le-ai primit efectiv. E cea mai bună dovadă disponibilă și scurtcircuitează cold-start-ul.
+
+```bash
+node tools/analyze-positions.js pozitii.csv
+node tools/analyze-positions.js pozitii.csv --seed-calibration
+```
+
+CSV minim — numele coloanelor sunt tolerante (RO sau EN):
+
+```
+symbol,interval,stake,entry,settle,pnl,payout
+ETHUSDT,10,5,1919.88,1921.40,3.50,70
+```
+
+Direcția se deduce singură: la câștig coincide cu sensul mișcării, la pierdere e opusă.
+
+Coloana `payout` e opțională, dar **fără ea defalcarea pe niveluri de payout e imposibilă** — payout-ul se poate deduce din P&L doar la pozițiile câștigătoare, fiindcă o pierdere e mereu −100% din miză indiferent ce payout ți se oferea. Unealta detectează situația și refuză tabelul, în loc să afișeze 100% pe fiecare nivel. Iar aceea e întrebarea care decide totul: **payout-ul mare apare în momentele mai greu de prezis, sau nu?** Dacă da, „intru doar la 85%" te selectează în cele mai grele momente și avantajul aparent dispare.
+
+## Ponderi învățate, nu inventate
+
+Până acum motorul scora setup-urile cu constante scrise de mână:
+
+```js
+if (sweep)                       w = 3 + Math.min(1.5, sweep.strength);
+if (structure.mss === 'bullish') add('up', 2.2, ...);
+if (structure.trend === 'up')    add('up', 1.5, ...);
+```
+
+Nimic nu a verificat vreodată dacă un sweep merită 3.0 și un trend 1.5, dacă ordinea nu ar trebui inversată, sau dacă vreuna dintre ele conteaza. Sunt întrebări empirice la care s-a răspuns prin afirmație. Asta e diferența dintre a aplica reguli dintr-o carte și a fi tranzacționat efectiv: cineva cu un milion de execuții are ponderile calibrate de rezultate.
+
+„Un milion de tranzacții de experiență" e o dimensiune de dataset, nu o metaforă. Un an de bare de 5 minute ≈ 105.000 de bare per simbol; fiecare devine un exemplu etichetat, la fiecare orizont. Două simboluri și două orizonturi trec de 400.000 de rezultate măsurate.
+
+```bash
+# o singură dată, pe mașina ta (are nevoie de rețea)
+node tools/collect.js --symbol ETHUSDT --days 365
+node tools/collect.js --symbol BTCUSDT --days 365
+
+# antrenare + validare walk-forward
+node tools/train.js --file data/ETHUSDT-5m-365d.json --horizon 10
+node tools/train.js --file data/ETHUSDT-5m-365d.json --horizon 30 --save
+
+# testul de nul, fără rețea: pe random walk TREBUIE să iasă ~50%
+node tools/train.js --synthetic --days 120
+```
+
+`lib/features.js` produce ~100 de features normalizate (momentum în unități de ATR, oscilatoare centrate, formă de lumânare, regim de volatilitate, distanțe la swing-uri, evenimentele SMC, aliniere între timeframe-uri, ora ca sin/cos). `lib/model.js` e regresie logistică cu L2, fără dependențe.
+
+### Ce face numărul demn de încredere
+
+- **Purjare.** Un eșantion la bara `i` e etichetat de bara `i+H`, deci eșantioanele `i..i+H-1` împart fereastra de rezultat. La fiecare graniță train/test se aruncă `H` bare.
+- **Interval de încredere onest.** Etichetele vecine se suprapun, deci `n` eșantioane consecutive conțin ~`n/H` observații independente. Se raportează ambele: intervalul naiv și cel calculat pe un sub-eșantion cu pas `H`.
+- **L2 ales înăuntrul fold-ului.** Coada blocului de antrenare devine validare, grila se scorează pe ea, iar câștigătorul se refitează pe tot blocul. Alegerea L2 uitându-te la fold-urile de test e scurgere de informație — și e exact modul în care un model mediocru capătă o cifră flatantă.
+- **Test de nul.** `--synthetic` înlocuiește piața cu un random walk fără drift. Rezultat: acuratețe out-of-sample **49.96%**, Brier **0.25128**, log loss **0.69573** — practic la limita lipsei de informație, iar poarta refuză. Dacă harness-ul ar produce edge din zgomot, nimic din el nu ar avea valoare.
+
+Un detaliu care ilustrează de ce contează intervalul onest: pe random walk, un fold individual a raportat **55.6%** acuratețe. Aceeași cifră pe care o revendica o versiune anterioară a acestui README ca „edge validat out-of-sample".
+
+### Ce a arătat auditul pe 506 poziții reale
+
+Istoricul real de tranzacționare MEXC al utilizatorului (16.07–08.08.2026, 506 poziții decontate, validat contra totalurilor exportate) a fost trecut prin `tools/analyze-positions.js`. Rezultatul e păstrat aici pentru că e singura măsurătoare din acest proiect care nu e o estimare:
+
+```
+win-rate realizat      : 51.59%  (259/502, egalitățile excluse)
+interval încredere 95% : 47.23% – 55.94%
+payout mediu (ponderat): 77%   ->  break-even 56.50%
+EV                     : -8.67% pe tranzacție
+vs. monedă (50%)       : p = 0.24  — nedistinct de hazard
+P&L                    : -102.70 USDT pe 8.018 USDT rulaj
+```
+
+Defalcat pe payout, win-rate-ul **nu** crește cu payout-ul: 70% → 52.0% (n=102), 80% → 52.1% (n=213), 85% → 49.7% (n=157). Deci nu există nici selecție adversă, nici avantaj — la niciun nivel nu se atinge break-even-ul.
+
+Alte lucruri pe care auditul le-a stabilit, și care au produs modificări în cod:
+
+- **Egalitatea e rambursare.** Pe fiecare egalitate exactă, payout-ul returnat era egal cu miza. Codul o trata ca pierdere, ceea ce subestima win-rate-ul și contamina calibrarea.
+- **17.3% din poziții s-au decis pe o mișcare sub 0.02%.** La marginea aceea, diferența dintre spot și index price poate inversa rezultatul — de aici trecerea decontării pe index.
+- **Payout-ul e per simbol.** Observat în aceeași secundă: BTCUSDT la 10%, ETHUSDT la 70%. Un singur număr global în config era greșit din construcție.
+- **Orele „bune" nu există.** Din 21 de bucket-uri orare, 3 aveau p < 0.05 naiv (așteptat din hazard: 1.1) și **zero** au trecut corecția Bonferroni.
+
+Concluzia, spusă direct: **nu există un avantaj demonstrabil în semnalele acestei aplicații.** Rolul corect al porții EV pe aceste date e să refuze. O versiune anterioară a acestui README revendica „ETH Sniper 55.6%, a rezistat out-of-sample" — cifra a fost retrasă, iar auditul confirmă de ce conta: cineva a tranzacționat pe baza ei.
+
+### Două populații care nu se amestecă niciodată
+
+Jurnalul conține două feluri de intrări, și distincția e esențială:
+
+| | ce e | intră în calibrare/miză/învățare? |
+|---|---|---|
+| `background` | o mostră per bară închisă, înregistrată chiar dacă nu s-a dat nicio alertă | **nu** |
+| alertă | semnal care a trecut filtrele — populația care se tranzacționează | **da** |
+| alertă `uncalibrated` | alertă reală apărută în observation mode (afișată, nu recomandată) | **da** |
+
+Mostrele de fundal se acumulează de ~60 de ori mai repede decât alertele. Orice medie peste amestecul celor două converge la rata de bază necondiționată — adică ~50% pe un orizont de tip monedă — și o face cu un interval de încredere tot mai **îngust**. Nu e doar imprecis: e ferm greșit, și devine tot mai încrezător în răspunsul greșit pe măsură ce aplicația rulează. Cu poarta EV care cere `CI low ≥ break-even + marjă`, efectul practic e că poarta nu s-ar deschide niciodată, oricât de real ar fi edge-ul.
+
+De aceea `journal.samples()` e singura sursă permisă pentru calibrare, iar `learning.analyze()` exclude fundalul implicit. Alertele `uncalibrated` sunt incluse deliberat: dacă nu ar fi numărate, observation mode nu ar putea strânge niciodată dovezile care i-ar permite să se încheie.
+
+Fundalul rămâne util, dar ca **reper**: răspunde la întrebarea „setup-ul filtrat e mai bun decât a lua pur și simplu fiecare bară?". Se raportează separat, în `stats().background` și `learning.summary().baseline`.
+
 ---
 
 ## Cum e gândit
