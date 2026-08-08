@@ -86,6 +86,19 @@ function synthetic(nBars, seed = 1, startPrice = 3000, sigma1m = 0.0011) {
 // ---- Dataset ---------------------------------------------------------------
 const WINDOW = 200;
 
+// Progress reporting exists because the two heavy phases are otherwise silent for
+// several minutes on a year of 5-minute bars, and a silent terminal is
+// indistinguishable from a hung one.
+function progress(label, done, total, t0) {
+  const pct = (done / total) * 100;
+  const el = (Date.now() - t0) / 1000;
+  const eta = done > 0 ? (el / done) * (total - done) : 0;
+  process.stdout.write(
+    `\r  ${label}: ${done}/${total} (${pct.toFixed(1)}%)  ` +
+    `scurs ${el.toFixed(0)}s  rămas ~${eta.toFixed(0)}s      `
+  );
+}
+
 function buildDataset(tf5, horizonBars) {
   // 15m and 60m are derived from the 5m series rather than fetched separately, so
   // boundaries line up exactly and no timeframe can be accidentally ahead of
@@ -95,7 +108,14 @@ function buildDataset(tf5, horizonBars) {
 
   const samples = [];
   let names = null;
+  const total = tf5.length - horizonBars - WINDOW;
+  const t0 = Date.now();
+  let lastPrint = 0;
   for (let i = WINDOW; i < tf5.length - horizonBars; i++) {
+    if (Date.now() - lastPrint > 500) {
+      lastPrint = Date.now();
+      progress('features', i - WINDOW, total, t0);
+    }
     const ct = tf5[i].closeTime;
     const w5 = tf5.slice(Math.max(0, i - WINDOW), i + 1);
     const w15 = candles.upTo(tf15, ct).slice(-WINDOW);
@@ -116,6 +136,8 @@ function buildDataset(tf5, horizonBars) {
       y: exit > entry,
     });
   }
+  progress('features', total, total, t0);
+  process.stdout.write('\n');
   return { samples, names };
 }
 
@@ -127,13 +149,14 @@ function buildDataset(tf5, horizonBars) {
 // the winner refitted on the full training block and applied to the test block.
 const L2_GRID = [0.05, 0.2, 1, 5, 20];
 
-function selectL2(tr, epochs, seed) {
+function selectL2(tr, epochs, seed, onStep) {
   const cut = Math.floor(tr.length * 0.8);
   const a = tr.slice(0, cut);
   const b = tr.slice(cut + 1); // +1 keeps a small purge between fit and validation
   if (b.length < 100) return { l2: 1, note: 'prea puține date de validare' };
   let best = null;
   for (const l2 of L2_GRID) {
+    if (onStep) onStep(l2);
     const m = model.fit(a.map((s) => s.x), a.map((s) => s.y), { l2, epochs, seed });
     const p = model.predict(m, b.map((s) => s.x));
     const ll = model.logLoss(p, b.map((s) => s.y));
@@ -148,7 +171,9 @@ function walkForward(samples, names, horizonBars, opts = {}) {
   const blockSize = Math.floor((samples.length - minTrain) / folds);
   const oos = [];
   const perFold = [];
+  const t0 = Date.now();
 
+  console.log(`\n  Antrenare: ${folds} fold-uri x (${L2_GRID.length} candidați L2 + 1 fit final)`);
   for (let k = 0; k < folds; k++) {
     const trainEnd = minTrain + k * blockSize;
     // Purge: drop `horizonBars` samples so no training label overlaps a test one.
@@ -158,7 +183,18 @@ function walkForward(samples, names, horizonBars, opts = {}) {
 
     const tr = samples.slice(0, trainEnd);
     const te = samples.slice(testStart, testEnd);
-    const chosen = opts.l2 != null ? { l2: opts.l2 } : selectL2(tr, opts.epochs, 7 + k);
+    const chosen = opts.l2 != null
+      ? { l2: opts.l2 }
+      : selectL2(tr, opts.epochs, 7 + k, (l2) => {
+        process.stdout.write(
+          `\r    fold ${k + 1}/${folds}  train ${tr.length}  caut L2=${l2}...` +
+          `   scurs ${((Date.now() - t0) / 1000).toFixed(0)}s      `
+        );
+      });
+    process.stdout.write(
+      `\r    fold ${k + 1}/${folds}  train ${tr.length}  L2=${chosen.l2}  fit final...` +
+      `   scurs ${((Date.now() - t0) / 1000).toFixed(0)}s      `
+    );
     const m = model.fit(tr.map((s) => s.x), tr.map((s) => s.y), {
       l2: chosen.l2, epochs: opts.epochs, seed: 7 + k,
     });
@@ -175,6 +211,7 @@ function walkForward(samples, names, horizonBars, opts = {}) {
     });
     for (let j = 0; j < te.length; j++) oos.push({ p: p[j], y: y[j], i: te[j].i });
   }
+  process.stdout.write(`\r  Antrenare gata în ${((Date.now() - t0) / 1000).toFixed(0)}s` + ' '.repeat(40) + '\n');
   return { oos, perFold };
 }
 
