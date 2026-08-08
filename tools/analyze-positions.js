@@ -166,12 +166,19 @@ function load(file) {
       else if (pnl != null && stake > 0) payout = (pnl / stake) * 100;
     }
 
+    // O egalitate perfectă e RAMBURSARE pe MEXC: miza se întoarce integral, deci
+    // rezultatul e nul, nu o pierdere. Confirmat pe istoric real: payout-ul
+    // returnat era exact egal cu miza. Numărarea ei ca pierdere ar subestima
+    // sistematic win-rate-ul.
+    const tie = settle === entry || (pnl != null && pnl === 0);
+
     rows.push({
       time: get('time') || null,
       symbol: (get('symbol') || 'necunoscut').toUpperCase().replace(/[^A-Z0-9]/g, ''),
       interval: parseInterval(get('interval')) || 'necunoscut',
-      stake, entry, settle, directie, win,
-      tie: settle === entry,
+      stake, entry, settle, directie,
+      win: tie ? null : win,
+      tie,
       payout: payout != null ? +payout.toFixed(1) : null,
       pnl: pnl != null ? pnl : (win && payout != null ? stake * (payout / 100) : (win ? null : -stake)),
       movePct: entry ? ((settle - entry) / entry) * 100 : null,
@@ -276,29 +283,33 @@ function main() {
     console.error('\nCSV minim:  symbol,interval,stake,entry,settle,pnl');
     process.exit(1);
   }
-  const { rows, problems, header } = load(path.resolve(file));
+  const { rows: allRows, problems, header } = load(path.resolve(file));
+  // Egalitățile sunt rambursate, deci nu intră în niciun win-rate. Rămân însă în
+  // rulaj și în P&L (cu 0), ca să nu dispară din contabilitate.
+  const rows = allRows.filter((r) => !r.tie);
 
   console.log('='.repeat(74));
   console.log('  ISTORIC REAL DE POZIȚII MEXC — rezultate decontate, nu backtest');
   console.log('='.repeat(74));
   console.log(`  fișier   : ${file}`);
   console.log(`  coloane  : ${header.join(' | ')}`);
-  console.log(`  poziții  : ${rows.length}`);
+  console.log(`  poziții  : ${allRows.length}`);
   if (problems.length) {
     console.log(`  ignorate : ${problems.length}`);
     problems.slice(0, 5).forEach((p) => console.log(`    - ${p}`));
   }
   if (!rows.length) process.exit(1);
 
-  const ties = rows.filter((r) => r.tie);
+  const ties = allRows.filter((r) => r.tie);
   if (ties.length) {
-    console.log(`  egalități: ${ties.length} (preț identic la intrare și expirare)`);
+    console.log(`  egalități: ${ties.length} — rambursate (miza înapoi), deci excluse din win-rate`);
+    console.log(`  evaluate : ${rows.length}`);
   }
 
   const overall = agg(rows);
   const bp = blendedPayout(rows);
-  const totalStake = rows.reduce((s, r) => s + r.stake, 0);
-  const knownPnl = rows.filter((r) => r.pnl != null);
+  const totalStake = allRows.reduce((s, r) => s + r.stake, 0);
+  const knownPnl = allRows.filter((r) => r.pnl != null);
   const netPnl = knownPnl.reduce((s, r) => s + r.pnl, 0);
 
   console.log('\n' + '='.repeat(74));
@@ -349,7 +360,7 @@ function main() {
   }
 
   // ---- Stake-weighted: win-rate poate fi pozitiv iar P&L negativ -----------
-  if (knownPnl.length === rows.length && rows.some((r) => r.stake !== rows[0].stake)) {
+  if (knownPnl.length === allRows.length && rows.some((r) => r.stake !== rows[0].stake)) {
     const wonStake = rows.filter((r) => r.win).reduce((s, r) => s + r.stake, 0);
     const lostStake = rows.filter((r) => !r.win).reduce((s, r) => s + r.stake, 0);
     const avgWin = wonStake / Math.max(1, rows.filter((r) => r.win).length);
