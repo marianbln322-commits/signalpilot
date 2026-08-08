@@ -20,6 +20,7 @@ const MAX_ABS_WEIGHT = 6;
 const LOSS_STREAK_LIMIT = 3;
 const RECOVERY_WINDOW = 5;
 const SETUP_GUARD_SAMPLE = 12;
+const CONTEXT_LESSON_RECOVERY_WINS = 1;
 const EPSILON = 1e-6;
 
 const FEATURE_NAMES = Object.freeze([
@@ -141,6 +142,82 @@ function contextAnalyses(signal) {
     .filter(Boolean);
 }
 
+function compactTechnicalContext(signal) {
+  const frames = Object.fromEntries(Object.entries(signal.timeframeAnalyses || {}).map(([timeframe, analysis]) => [timeframe, {
+    timeframe,
+    trend: analysis.trend,
+    trendState: analysis.trendProfile && analysis.trendProfile.state || null,
+    trendPersistence: analysis.trendProfile && analysis.trendProfile.persistence,
+    trendEfficiency: analysis.trendProfile && analysis.trendProfile.efficiency,
+    ema20SlopeAtr: analysis.trendProfile && analysis.trendProfile.ema20SlopeAtr,
+    structure: analysis.structure,
+    structurePersistence: analysis.structurePersistence,
+    momentum: analysis.momentum,
+    volume: analysis.volume,
+    regime: analysis.regime,
+    distanceFromEma20Atr: analysis.distanceFromEma20Atr,
+    atrPct: analysis.atrPct,
+  }]));
+  return {
+    contextFingerprint: signal.contextFingerprint || null,
+    multiTimeframeTrend: signal.multiTimeframeTrend || null,
+    executionTimeframes: [...(signal.executionTimeframes || [])],
+    contextTimeframes: [...(signal.contextTimeframes || [])],
+    triggerAgeRatio: Number.isFinite(Number(signal.triggerAgeMs)) && Number(signal.triggerWindowMs) > 0
+      ? round(Number(signal.triggerAgeMs) / Number(signal.triggerWindowMs), 4) : null,
+    frames,
+  };
+}
+
+function diagnoseLoss(observation, candles) {
+  const technical = observation.technicalContextAtObservation || {};
+  const frames = technical.frames || {};
+  const execution = (technical.executionTimeframes || []).map((timeframe) => frames[timeframe]).filter(Boolean);
+  const context = (technical.contextTimeframes || []).map((timeframe) => frames[timeframe]).filter(Boolean);
+  const codes = [];
+  if (observation.trigger && ['BREAKOUT', 'BREAKOUT_RETEST'].includes(observation.trigger.type)) codes.push('BREAKOUT_FAILED_AT_EXPIRY');
+  if (Number(technical.triggerAgeRatio) > 0.5) codes.push('TRIGGER_LATE_IN_WINDOW');
+  if (execution.some((frame) => Number(frame.trendEfficiency) < 0.28)) codes.push('TREND_EFFICIENCY_WEAK');
+  if (execution.some((frame) => frame.trendState !== 'ESTABLISHED')) codes.push('TREND_PERSISTENCE_BROKE');
+  if (execution.some((frame) => {
+    const distance = Number(frame.distanceFromEma20Atr);
+    const signed = observation.direction === 'UP' ? distance : -distance;
+    return Number.isFinite(signed) && signed > 1.5;
+  })) codes.push('ENTRY_EXTENDED_FROM_EMA20');
+  const opposite = observation.direction === 'UP' ? 'DOWN' : 'UP';
+  if (context.some((frame) => frame.trend === opposite && ['ESTABLISHED', 'DEVELOPING'].includes(frame.trendState))) {
+    codes.push('HIGHER_TIMEFRAME_OPPOSITION');
+  }
+  const window = (candles || []).filter((candle) => candle.openTime >= observation.entryOpenTime
+    && candle.closeTime <= observation.targetCloseTime);
+  const entryPrice = Number(observation.entryPrice);
+  if (entryPrice > 0 && window.length) {
+    const high = Math.max(...window.map((candle) => Number(candle.high)).filter(Number.isFinite));
+    const low = Math.min(...window.map((candle) => Number(candle.low)).filter(Number.isFinite));
+    const favorable = observation.direction === 'UP' ? high - entryPrice : entryPrice - low;
+    const adverse = observation.direction === 'UP' ? entryPrice - low : high - entryPrice;
+    if (Number.isFinite(adverse) && Number.isFinite(favorable) && adverse > Math.max(entryPrice * 0.0001, favorable * 1.5)) {
+      codes.push('RAPID_ADVERSE_MOVE');
+    }
+  }
+  if (!codes.length) codes.push('ADVERSE_VARIANCE_NO_SINGLE_CAUSE');
+  const solutionCode = codes.includes('HIGHER_TIMEFRAME_OPPOSITION') ? 'REQUIRE_HIGHER_TIMEFRAME_REALIGNMENT'
+    : codes.includes('TREND_EFFICIENCY_WEAK') || codes.includes('TREND_PERSISTENCE_BROKE') ? 'REQUIRE_PERSISTENT_EFFICIENT_TREND'
+      : codes.includes('TRIGGER_LATE_IN_WINDOW') ? 'REQUIRE_NEW_FRESH_TRIGGER'
+        : codes.includes('ENTRY_EXTENDED_FROM_EMA20') ? 'REQUIRE_PULLBACK_BEFORE_REENTRY'
+          : codes.includes('BREAKOUT_FAILED_AT_EXPIRY') ? 'REQUIRE_FRESH_BREAKOUT_RETEST'
+            : 'REQUIRE_NEW_CONFIRMATION_AFTER_COOLDOWN';
+  const solutionDetail = {
+    REQUIRE_HIGHER_TIMEFRAME_REALIGNMENT: 'blochează același context până când higher-TF nu mai este opus și apare o observație shadow favorabilă',
+    REQUIRE_PERSISTENT_EFFICIENT_TREND: 'blochează același context și cere din nou trend established, pantă și efficiency pe TF-urile de execuție',
+    REQUIRE_NEW_FRESH_TRIGGER: 'nu reutilizează triggerul vechi; cere un trigger nou și mai proaspăt în același tip de context',
+    REQUIRE_PULLBACK_BEFORE_REENTRY: 'evită repetarea intrării extinse și așteaptă revenirea către EMA20 plus confirmare nouă',
+    REQUIRE_FRESH_BREAKOUT_RETEST: 'tratează breakout-ul nereușit ca risc și cere un breakout/retest nou validat',
+    REQUIRE_NEW_CONFIRMATION_AFTER_COOLDOWN: 'aplică o pauză context-specifică și cere o observație shadow favorabilă înainte de reutilizare',
+  }[solutionCode];
+  return { codes: [...new Set(codes)], solutionCode, solutionDetail };
+}
+
 function extractFeatures(signal) {
   if (!signal || signal.action !== 'ENTER' || !['UP', 'DOWN'].includes(signal.direction) || !signal.trigger) {
     throw new Error('local learner features require a deterministic ENTER with direction and trigger');
@@ -210,6 +287,7 @@ function freshState() {
     createdAt: Date.now(),
     updatedAt: Date.now(),
     buckets: {},
+    contextLessons: {},
     observations: [],
   };
 }
@@ -248,6 +326,24 @@ class LocalAdaptiveLearner {
     try {
       const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf8'));
       if (!validLoadedState(parsed)) throw new Error('schema/version mismatch');
+      let contextLessonsMigrationNeeded = false;
+      if (!parsed.contextLessons || typeof parsed.contextLessons !== 'object' || Array.isArray(parsed.contextLessons)) {
+        parsed.contextLessons = {};
+        contextLessonsMigrationNeeded = true;
+      }
+      for (const [fingerprint, lesson] of Object.entries(parsed.contextLessons)) {
+        if (!lesson || typeof lesson !== 'object' || Array.isArray(lesson)) {
+          delete parsed.contextLessons[fingerprint];
+          contextLessonsMigrationNeeded = true;
+          continue;
+        }
+        lesson.contextFingerprint = fingerprint;
+        lesson.active = lesson.active === true;
+        lesson.shadowEvaluated = Math.max(0, Number(lesson.shadowEvaluated) || 0);
+        lesson.shadowWins = Math.max(0, Number(lesson.shadowWins) || 0);
+        lesson.shadowLosses = Math.max(0, Number(lesson.shadowLosses) || 0);
+        lesson.blockedCount = Math.max(0, Number(lesson.blockedCount) || 0);
+      }
       const bucketsNeedingMigration = [];
       for (const [key, bucket] of Object.entries(parsed.buckets)) {
         if (!Array.isArray(bucket.weights) || bucket.weights.length !== FEATURE_NAMES.length + 1
@@ -276,7 +372,7 @@ class LocalAdaptiveLearner {
         }
       }
       for (const key of bucketsNeedingMigration) rebuildOperationalBucket(parsed.buckets[key], parsed.observations);
-      this.operationalMigrationNeeded = bucketsNeedingMigration.length > 0;
+      this.operationalMigrationNeeded = contextLessonsMigrationNeeded || bucketsNeedingMigration.length > 0;
       return parsed;
     } catch (error) {
       if (error.code === 'ENOENT') return freshState();
@@ -378,6 +474,97 @@ class LocalAdaptiveLearner {
       threshold: round(threshold),
       blocked,
     };
+  }
+
+  contextLessonGuard(contextFingerprint, symbol, horizonMin) {
+    const lesson = contextFingerprint && this.state.contextLessons && this.state.contextLessons[contextFingerprint];
+    const scopeMatches = lesson && String(lesson.symbol || '').toUpperCase() === String(symbol || '').toUpperCase()
+      && Number(lesson.horizonMin) === Number(horizonMin);
+    if (!this.adaptiveProtection || !lesson || !scopeMatches) {
+      return {
+        contextFingerprint: contextFingerprint || null,
+        active: false,
+        causeCodes: [],
+        solutionCode: null,
+        solutionDetail: null,
+        shadowEvaluated: 0,
+        shadowWins: 0,
+        shadowLosses: 0,
+      };
+    }
+    return {
+      contextFingerprint,
+      active: lesson.active === true,
+      activatedAt: lesson.activatedAt || null,
+      causeCodes: lesson.causeCodes || [],
+      solutionCode: lesson.solutionCode || null,
+      solutionDetail: lesson.solutionDetail || null,
+      triggerObservationId: lesson.triggerObservationId || null,
+      shadowEvaluated: Number(lesson.shadowEvaluated) || 0,
+      shadowWins: Number(lesson.shadowWins) || 0,
+      shadowLosses: Number(lesson.shadowLosses) || 0,
+      blockedCount: Number(lesson.blockedCount) || 0,
+      recoveredAt: lesson.recoveredAt || null,
+    };
+  }
+
+  updateContextLesson(observation, candles) {
+    if (!this.adaptiveProtection || !observation.contextFingerprint || ![0, 1].includes(Number(observation.label))) return;
+    if (!this.state.contextLessons || typeof this.state.contextLessons !== 'object') this.state.contextLessons = {};
+    const fingerprint = observation.contextFingerprint;
+    let lesson = this.state.contextLessons[fingerprint];
+    if (observation.contextLessonBlockedAtObservation === true) {
+      if (!observation.trainingEligible || !lesson) return;
+      lesson.shadowEvaluated = (Number(lesson.shadowEvaluated) || 0) + 1;
+      lesson.lastShadowOutcomeAt = observation.targetCloseTime;
+      if (observation.label === 1) {
+        lesson.shadowWins = (Number(lesson.shadowWins) || 0) + 1;
+        lesson.active = false;
+        lesson.recoveredAt = observation.targetCloseTime;
+        lesson.recoveredByObservationId = observation.id;
+        observation.contextLessonRecovery = {
+          recovered: true,
+          requiredWins: CONTEXT_LESSON_RECOVERY_WINS,
+          observationId: observation.id,
+        };
+      } else {
+        lesson.shadowLosses = (Number(lesson.shadowLosses) || 0) + 1;
+        const diagnosis = diagnoseLoss(observation, candles);
+        lesson.active = true;
+        lesson.causeCodes = diagnosis.codes;
+        lesson.solutionCode = diagnosis.solutionCode;
+        lesson.solutionDetail = diagnosis.solutionDetail;
+        lesson.lastFailedShadowObservationId = observation.id;
+        lesson.lastLossAt = observation.targetCloseTime;
+        observation.lossDiagnosis = diagnosis;
+        observation.contextLessonRecovery = { recovered: false, requiredWins: CONTEXT_LESSON_RECOVERY_WINS };
+      }
+      return;
+    }
+    if (observation.label !== 0 || observation.blockedAtObservation === true) return;
+    const diagnosis = diagnoseLoss(observation, candles);
+    lesson = lesson || {
+      contextFingerprint: fingerprint,
+      activationCount: 0,
+      blockedCount: 0,
+      shadowEvaluated: 0,
+      shadowWins: 0,
+      shadowLosses: 0,
+    };
+    lesson.active = true;
+    lesson.symbol = observation.symbol;
+    lesson.horizonMin = observation.horizonMin;
+    lesson.direction = observation.direction;
+    lesson.activationCount = (Number(lesson.activationCount) || 0) + 1;
+    lesson.activatedAt = observation.targetCloseTime;
+    lesson.lastLossAt = observation.targetCloseTime;
+    lesson.triggerObservationId = observation.id;
+    lesson.causeCodes = diagnosis.codes;
+    lesson.solutionCode = diagnosis.solutionCode;
+    lesson.solutionDetail = diagnosis.solutionDetail;
+    this.state.contextLessons[fingerprint] = lesson;
+    observation.lossDiagnosis = diagnosis;
+    observation.activatedContextLesson = true;
   }
 
   updateOperationalGuard(bucket, observation) {
@@ -492,6 +679,8 @@ class LocalAdaptiveLearner {
       const circuitBlocked = this.adaptiveProtection && bucket.circuit.open === true;
       const setupGuard = this.setupGuard(key, signal.setupFingerprint, threshold);
       if (!this.adaptiveProtection) setupGuard.blocked = false;
+      const contextLesson = this.contextLessonGuard(signal.contextFingerprint, signal.symbol, signal.horizonMin);
+      const contextLessonBlocked = this.adaptiveProtection && contextLesson.active === true;
       const requiredRecoveryWins = requiredRecoveryWinsForThreshold(threshold);
       const recoveryPossible = requiredRecoveryWins <= RECOVERY_WINDOW;
       const blockReasons = [];
@@ -504,6 +693,10 @@ class LocalAdaptiveLearner {
       if (setupGuard.blocked) blockReasons.push({
         code: 'LOCAL_SETUP_UNRELIABLE',
         detail: `setup ${setupGuard.setupFingerprint}: ${setupGuard.wins}W/${setupGuard.losses}L din ${setupGuard.sample}, Wilson95 upper ${round(setupGuard.wilson95Upper * 100, 2)}% sub prag ${round(threshold * 100, 2)}%`,
+      });
+      if (contextLessonBlocked) blockReasons.push({
+        code: 'LOCAL_SIMILAR_CONTEXT_LESSON_ACTIVE',
+        detail: `context tehnic similar cu un LOSS anterior: ${(contextLesson.causeCodes || []).join(', ') || 'cauză fără etichetă unică'}; soluție activă: ${contextLesson.solutionDetail || contextLesson.solutionCode || 'cere confirmare shadow favorabilă'}`,
       });
       if (modelBlocked) blockReasons.push({
         code: 'LOCAL_MODEL_BELOW_PAYOUT_THRESHOLD',
@@ -525,6 +718,8 @@ class LocalAdaptiveLearner {
         features,
         quality: signal.quality,
         setupFingerprint: signal.setupFingerprint,
+        contextFingerprint: signal.contextFingerprint || null,
+        technicalContextAtObservation: compactTechnicalContext(signal),
         trigger: signal.trigger ? {
           type: signal.trigger.type,
           timeframe: signal.trigger.timeframe,
@@ -553,9 +748,11 @@ class LocalAdaptiveLearner {
         modelBlockedAtObservation: modelBlocked,
         lossCircuitBlockedAtObservation: circuitBlocked,
         setupBlockedAtObservation: setupGuard.blocked,
+        contextLessonBlockedAtObservation: contextLessonBlocked,
         blockedAtObservation: blocked,
         blockReasonsAtObservation: blockReasons,
         setupGuardAtObservation: setupGuard,
+        contextLessonAtObservation: contextLesson,
         allowedLossStreakAtObservation: bucket.allowedLossStreak,
         lossCircuitAtObservation: {
           open: bucket.circuit.open,
@@ -569,8 +766,21 @@ class LocalAdaptiveLearner {
         beatsBaselineAtObservation: qualification.beatsBaseline,
         trainedAt: null,
       };
+      const nextContextLessons = { ...(this.state.contextLessons || {}) };
+      if (contextLessonBlocked && signal.contextFingerprint && nextContextLessons[signal.contextFingerprint]) {
+        nextContextLessons[signal.contextFingerprint] = {
+          ...nextContextLessons[signal.contextFingerprint],
+          blockedCount: (Number(nextContextLessons[signal.contextFingerprint].blockedCount) || 0) + 1,
+          lastBlockedObservationId: observation.id,
+        };
+        observation.contextLessonAtObservation = {
+          ...observation.contextLessonAtObservation,
+          blockedCount: nextContextLessons[signal.contextFingerprint].blockedCount,
+        };
+      }
       const nextState = {
         ...this.state,
+        contextLessons: nextContextLessons,
         observations: [...this.state.observations, observation],
       };
       this.persistState(nextState);
@@ -604,11 +814,12 @@ class LocalAdaptiveLearner {
       exclusionReason: observation.exclusionReason,
       blockReasons: observation.blockReasonsAtObservation || [],
       setupGuard: observation.setupGuardAtObservation || null,
+      contextLesson: observation.contextLessonAtObservation || null,
       allowedLossStreak: observation.allowedLossStreakAtObservation || 0,
       lossCircuit: observation.lossCircuitAtObservation || { open: false, recoverySample: 0, recoveryWins: 0 },
       rule: this.adaptiveProtection
-        ? `protecție în 3 trepte: circuit după ${LOSS_STREAK_LIMIT} loss, guard setup la N=${SETUP_GUARD_SAMPLE}, apoi model complet; poate doar ENTER→WAIT`
-        : 'instanța 3013 păstrează learnerul logistic anterior; protecția rapidă în 3 trepte este izolată pe 3014',
+        ? `protecție în 4 trepte: lecție imediată pe context similar după LOSS, circuit după ${LOSS_STREAK_LIMIT} loss, guard setup la N=${SETUP_GUARD_SAMPLE}, apoi model complet; poate doar ENTER→WAIT`
+        : 'instanța 3013 păstrează learnerul logistic anterior; lecțiile contextuale și protecția rapidă sunt izolate pe 3014',
     };
     const retimed = withTiming(observation.observedAt, timing);
     if (!blocked) return { ...retimed, localLearning };
@@ -704,6 +915,7 @@ class LocalAdaptiveLearner {
         observation.status = 'resolved';
         observation.resolvedAt = this.now();
         const bucket = this.ensureBucket(observation.symbol, observation.horizonMin);
+        this.updateContextLesson(observation, candles);
         this.updateOperationalGuard(bucket, observation);
         if (observation.trainingEligible && !observation.trainedAt) {
           this.train(bucket, observation);
@@ -721,6 +933,7 @@ class LocalAdaptiveLearner {
 
   snapshot(symbols = ['BTCUSDT', 'ETHUSDT'], payoutByHorizon = {}) {
     for (const symbol of symbols) for (const horizon of [10, 30]) this.ensureBucket(symbol, horizon);
+    const contextLessons = Object.values(this.state.contextLessons || {});
     const byBucket = {};
     for (const [key, bucket] of Object.entries(this.state.buckets)) {
       normalizeBucket(bucket);
@@ -769,6 +982,18 @@ class LocalAdaptiveLearner {
           lastRecovery: bucket.circuit.lastRecovery,
         },
         weakSetups,
+        activeContextLessons: contextLessons.filter((lesson) => lesson.active === true
+          && lesson.symbol === bucket.symbol && Number(lesson.horizonMin) === Number(bucket.horizonMin)).map((lesson) => ({
+          direction: lesson.direction,
+          causeCodes: lesson.causeCodes || [],
+          solutionCode: lesson.solutionCode,
+          solutionDetail: lesson.solutionDetail,
+          activatedAt: lesson.activatedAt,
+          blockedCount: Number(lesson.blockedCount) || 0,
+          shadowEvaluated: Number(lesson.shadowEvaluated) || 0,
+          shadowWins: Number(lesson.shadowWins) || 0,
+          shadowLosses: Number(lesson.shadowLosses) || 0,
+        })),
         lastTrainingTargetCloseTime: bucket.lastTrainingTargetCloseTime,
       };
     }
@@ -784,11 +1009,12 @@ class LocalAdaptiveLearner {
       featureCount: FEATURE_NAMES.length,
       labelPolicy: LABEL_POLICY,
       policy: this.adaptiveProtection
-        ? `protecție locală în 3 trepte: pauză după ${LOSS_STREAK_LIMIT} loss consecutive, setup guard la N=${SETUP_GUARD_SAMPLE}, model logistic complet la N=${MINIMUM_EFFECTIVE_SAMPLE}`
-        : `learner logistic v4 original pe 3013; protecția adaptivă în 3 trepte rulează numai în instanța 3014`,
+        ? `protecție locală în 4 trepte: lecție imediată după LOSS pentru context similar, pauză bucket după ${LOSS_STREAK_LIMIT} loss consecutive, setup guard la N=${SETUP_GUARD_SAMPLE}, model logistic complet la N=${MINIMUM_EFFECTIVE_SAMPLE}`
+        : `learner logistic v4 original pe 3013; lecțiile contextuale și protecția adaptivă rulează numai în instanța 3014`,
       retention: 'append-only; observațiile nu sunt trunchiate automat',
       recovery: this.loadError ? 'Șterge sau repară fișierul local-learning.json al instanței, apoi repornește aplicația.' : null,
       activation: {
+        contextLessonRecoveryWins: CONTEXT_LESSON_RECOVERY_WINS,
         lossStreakLimit: LOSS_STREAK_LIMIT,
         recoveryWindow: RECOVERY_WINDOW,
         setupGuardMinimumSample: SETUP_GUARD_SAMPLE,
@@ -800,6 +1026,8 @@ class LocalAdaptiveLearner {
       },
       totals: {
         observations: this.state.observations.length,
+        activeContextLessons: contextLessons.filter((lesson) => lesson.active === true).length,
+        learnedContexts: contextLessons.length,
         pending: this.state.observations.filter((item) => item.status === 'pending').length,
         resolved: this.state.observations.filter((item) => item.status === 'resolved').length,
         invalid: this.state.observations.filter((item) => item.status === 'invalid').length,
@@ -823,8 +1051,11 @@ module.exports = {
   MINIMUM_EFFECTIVE_SAMPLE,
   MINIMUM_CLASS_SAMPLE,
   SAFETY_MARGIN,
+  CONTEXT_LESSON_RECOVERY_WINS,
   bucketKey,
   extractFeatures,
+  compactTechnicalContext,
+  diagnoseLoss,
   sigmoid,
   logLoss,
 };

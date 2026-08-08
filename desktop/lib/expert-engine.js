@@ -3,24 +3,33 @@
 const { contractBoundaries } = require('./contract-timing');
 
 const ANALYSIS_CANDLE_COUNT = 300;
-const ENGINE_VERSION = 'event-futures-expert-v4-local-learning';
+const ENGINE_VERSION = 'event-futures-expert-v5-mtf-regime';
+const TREND_PERSISTENCE_LOOKBACK = 8;
+const TREND_EFFICIENCY_LOOKBACK = 14;
+const MIN_TREND_PERSISTENCE = 0.625;
+const MIN_TREND_EFFICIENCY = 0.2;
+const MIN_EMA20_SLOPE_ATR = 0.12;
 
 const HORIZONS = Object.freeze({
   10: {
     minutes: 10,
     execution: ['1m', '5m'],
-    context: ['15m'],
+    context: ['15m', '30m', '60m'],
+    primaryContext: ['15m'],
+    macroContext: ['30m', '60m'],
     triggerFrames: ['1m', '5m'],
     triggerMaxAgeMs: 10 * 60_000,
-    protocol: '1m timing + 5m structură; ambele trebuie să confirme, 15m este context/veto',
+    protocol: '1m timing + 5m structură; ambele cer trend persistent, 15m confirmă, iar 30m/60m aplică macro-veto',
   },
   30: {
     minutes: 30,
     execution: ['5m', '15m'],
     context: ['30m', '60m'],
+    primaryContext: ['30m', '60m'],
+    macroContext: ['60m'],
     triggerFrames: ['5m', '15m'],
     triggerMaxAgeMs: 30 * 60_000,
-    protocol: '5m timing + 15m structură; ambele trebuie să confirme, 30m/60m sunt context/veto',
+    protocol: '5m timing + 15m structură; ambele cer trend persistent, iar 30m/60m confirmă regimul și aplică veto',
   },
 });
 
@@ -102,9 +111,81 @@ function directionLabel(value, deadZone = 0) {
   return 'NEUTRAL';
 }
 
+function efficiencyRatio(values, lookback = TREND_EFFICIENCY_LOOKBACK) {
+  const window = values.slice(-(lookback + 1));
+  if (window.length < 2) return 0;
+  const path = window.slice(1).reduce((total, value, index) => total + Math.abs(value - window[index]), 0);
+  return path > Number.EPSILON ? Math.abs(last(window) - window[0]) / path : 0;
+}
+
+function emaStackDirectionAt(fast, medium, slow, index, deadZone) {
+  if (![fast[index], medium[index], slow[index]].every(Number.isFinite)) return 'NEUTRAL';
+  if (fast[index] > medium[index] && medium[index] > slow[index] && fast[index] - slow[index] > deadZone) return 'UP';
+  if (fast[index] < medium[index] && medium[index] < slow[index] && slow[index] - fast[index] > deadZone) return 'DOWN';
+  return 'NEUTRAL';
+}
+
+function buildTrendProfile({ closes, ema9, ema20, ema50, currentAtr, price }) {
+  const index = closes.length - 1;
+  const deadZone = price * 0.00035;
+  const direction = emaStackDirectionAt(ema9, ema20, ema50, index, deadZone);
+  const firstIndex = Math.max(0, index - TREND_PERSISTENCE_LOOKBACK + 1);
+  const stackDirections = [];
+  let closesOnDirectionalSide = 0;
+  for (let cursor = firstIndex; cursor <= index; cursor += 1) {
+    stackDirections.push(emaStackDirectionAt(ema9, ema20, ema50, cursor, deadZone));
+    if (direction === 'UP' && closes[cursor] > ema20[cursor]) closesOnDirectionalSide += 1;
+    if (direction === 'DOWN' && closes[cursor] < ema20[cursor]) closesOnDirectionalSide += 1;
+  }
+  const observed = Math.max(1, stackDirections.length);
+  const persistence = direction === 'NEUTRAL' ? 0 : stackDirections.filter((value) => value === direction).length / observed;
+  const closeConsistency = direction === 'NEUTRAL' ? 0 : closesOnDirectionalSide / observed;
+  const slopeStartIndex = Math.max(0, index - TREND_PERSISTENCE_LOOKBACK + 1);
+  const ema20SlopeAtr = currentAtr > 0 && Number.isFinite(ema20[slopeStartIndex])
+    ? (ema20[index] - ema20[slopeStartIndex]) / currentAtr : 0;
+  const directionalSlopeAtr = direction === 'UP' ? ema20SlopeAtr : direction === 'DOWN' ? -ema20SlopeAtr : 0;
+  const efficiency = efficiencyRatio(closes);
+  const established = direction !== 'NEUTRAL'
+    && persistence >= MIN_TREND_PERSISTENCE
+    && closeConsistency >= MIN_TREND_PERSISTENCE
+    && directionalSlopeAtr >= MIN_EMA20_SLOPE_ATR
+    && efficiency >= MIN_TREND_EFFICIENCY;
+  const developing = direction !== 'NEUTRAL' && directionalSlopeAtr > 0
+    && persistence >= 0.5 && closeConsistency >= 0.5;
+  const state = established ? 'ESTABLISHED' : developing ? 'DEVELOPING'
+    : efficiency < MIN_TREND_EFFICIENCY ? 'CHOPPY' : 'NEUTRAL';
+  const strengthScore = Math.round(Math.min(100,
+    persistence * 35
+    + Math.min(1, efficiency / 0.5) * 25
+    + Math.min(1, Math.max(0, directionalSlopeAtr) / 0.6) * 25
+    + closeConsistency * 15));
+  return {
+    direction,
+    state,
+    established,
+    persistence: round(persistence, 3),
+    efficiency: round(efficiency, 3),
+    ema20SlopeAtr: round(ema20SlopeAtr, 3),
+    directionalSlopeAtr: round(directionalSlopeAtr, 3),
+    closeConsistency: round(closeConsistency, 3),
+    strengthScore,
+    lookbackCandles: TREND_PERSISTENCE_LOOKBACK,
+  };
+}
+
+function triggerDetectionMaxOffset(timeframe) {
+  const timeframeMinutes = Number.parseInt(String(timeframe), 10);
+  if (!Number.isFinite(timeframeMinutes) || timeframeMinutes <= 0) return 2;
+  const maximumWindowMs = Object.values(HORIZONS)
+    .filter((spec) => spec.triggerFrames.includes(timeframe))
+    .reduce((maximum, spec) => Math.max(maximum, spec.triggerMaxAgeMs), 0);
+  return maximumWindowMs > 0 ? Math.ceil(maximumWindowMs / (timeframeMinutes * 60_000)) : 2;
+}
+
 function detectTriggers(candles, atrSeries, timeframe) {
   const triggers = [];
-  for (let offset = 0; offset <= 2; offset += 1) {
+  const maximumOffset = triggerDetectionMaxOffset(timeframe);
+  for (let offset = 0; offset <= maximumOffset; offset += 1) {
     const index = candles.length - 1 - offset;
     if (index < 25) continue;
     const candle = candles[index];
@@ -120,12 +201,21 @@ function detectTriggers(candles, atrSeries, timeframe) {
     const volumeMean = average(history.map((item) => item.volume)) || 0;
     const volumeRatio = volumeMean > 0 ? candle.volume / volumeMean : 1;
     const recency = offset === 0 ? 3 : offset === 1 ? 2 : 1;
-    const push = (type, direction, strength, detail, level = null) => triggers.push({
-      type, direction, strength: strength + recency, timeframe,
-      openTime: candle.openTime, closeTime: candle.closeTime,
-      candle: { openTime: candle.openTime, closeTime: candle.closeTime, open: candle.open, high: candle.high, low: candle.low, close: candle.close },
-      level, priorRangeHigh: priorHigh, priorRangeLow: priorLow, detail,
-    });
+    const push = (type, direction, strength, detail, level = null) => {
+      const invalidationLevel = Number.isFinite(level) ? level : direction === 'UP' ? candle.low : candle.high;
+      const laterCandles = candles.slice(index + 1);
+      const invalidatingCandle = laterCandles.find((item) => direction === 'UP'
+        ? item.close < invalidationLevel : item.close > invalidationLevel);
+      triggers.push({
+        type, direction, strength: strength + recency, timeframe,
+        openTime: candle.openTime, closeTime: candle.closeTime,
+        candle: { openTime: candle.openTime, closeTime: candle.closeTime, open: candle.open, high: candle.high, low: candle.low, close: candle.close },
+        level, priorRangeHigh: priorHigh, priorRangeLow: priorLow, detail,
+        invalidationLevel: round(invalidationLevel, 8),
+        invalidated: Boolean(invalidatingCandle),
+        invalidatedAt: invalidatingCandle ? invalidatingCandle.closeTime : null,
+      });
+    };
 
     if (candle.close > priorHigh && body >= currentAtr * 0.45) push('BREAKOUT', 'UP', 4, `close peste range-ul ultimelor 20 lumânări; volum ${round(volumeRatio)}x`, priorHigh);
     if (candle.close < priorLow && body >= currentAtr * 0.45) push('BREAKOUT', 'DOWN', 4, `close sub range-ul ultimelor 20 lumânări; volum ${round(volumeRatio)}x`, priorLow);
@@ -142,16 +232,14 @@ function detectTriggers(candles, atrSeries, timeframe) {
     if (lowerWick >= body * 1.8 && lowerWick / candleRange >= 0.5 && candle.close > candle.open) push('REJECTION_WICK', 'UP', 3, 'wick inferior respins și close bullish');
     if (upperWick >= body * 1.8 && upperWick / candleRange >= 0.5 && candle.close < candle.open) push('REJECTION_WICK', 'DOWN', 3, 'wick superior respins și close bearish');
 
-    if (offset === 0) {
-      for (let lookback = 1; lookback <= 3; lookback += 1) {
-        const breakout = candles[index - lookback];
-        const breakoutHistory = candles.slice(index - lookback - 20, index - lookback);
-        if (breakoutHistory.length < 20) continue;
-        const levelHigh = Math.max(...breakoutHistory.map((item) => item.high));
-        const levelLow = Math.min(...breakoutHistory.map((item) => item.low));
-        if (breakout.close > levelHigh && candle.low <= levelHigh && candle.close > levelHigh) push('BREAKOUT_RETEST', 'UP', 5, 'breakout anterior și retest menținut peste nivel', levelHigh);
-        if (breakout.close < levelLow && candle.high >= levelLow && candle.close < levelLow) push('BREAKOUT_RETEST', 'DOWN', 5, 'breakdown anterior și retest menținut sub nivel', levelLow);
-      }
+    for (let lookback = 1; lookback <= 3; lookback += 1) {
+      const breakout = candles[index - lookback];
+      const breakoutHistory = candles.slice(index - lookback - 20, index - lookback);
+      if (breakoutHistory.length < 20) continue;
+      const levelHigh = Math.max(...breakoutHistory.map((item) => item.high));
+      const levelLow = Math.min(...breakoutHistory.map((item) => item.low));
+      if (breakout.close > levelHigh && candle.low <= levelHigh && candle.close > levelHigh) push('BREAKOUT_RETEST', 'UP', 5, 'breakout anterior și retest menținut peste nivel', levelHigh);
+      if (breakout.close < levelLow && candle.high >= levelLow && candle.close < levelLow) push('BREAKOUT_RETEST', 'DOWN', 5, 'breakdown anterior și retest menținut sub nivel', levelLow);
     }
   }
   return triggers.sort((a, b) => b.closeTime - a.closeTime || b.strength - a.strength);
@@ -187,8 +275,12 @@ function analyzeTimeframe(candles, timeframe) {
   const olderHigh = Math.max(...older.map((item) => item.high));
   const olderLow = Math.min(...older.map((item) => item.low));
   const structure = recentHigh > olderHigh && recentLow > olderLow ? 'UP' : recentHigh < olderHigh && recentLow < olderLow ? 'DOWN' : 'NEUTRAL';
-  const trendValue = (last(ema9) - last(ema20)) + (last(ema20) - last(ema50));
-  const trend = directionLabel(trendValue, candle.close * 0.00035);
+  const recentSteps = recent.slice(1).map((item, index) => Math.sign(item.close - recent[index].close));
+  const structurePersistence = structure === 'UP'
+    ? recentSteps.filter((value) => value > 0).length / Math.max(1, recentSteps.length)
+    : structure === 'DOWN' ? recentSteps.filter((value) => value < 0).length / Math.max(1, recentSteps.length) : 0;
+  const trendProfile = buildTrendProfile({ closes, ema9, ema20, ema50, currentAtr, price: candle.close });
+  const trend = trendProfile.direction;
   const macdDeadZone = Math.max(Number.EPSILON, candle.close * 1e-8);
   const histogramDelta = histogram - previousHistogram;
   const momentum = currentRsi >= 55 && histogram > macdDeadZone && histogramDelta >= -macdDeadZone ? 'UP'
@@ -203,13 +295,13 @@ function analyzeTimeframe(candles, timeframe) {
   const closeLocation = (candle.close - candle.low) / candleRange;
   const trendStrengthPct = Math.abs(last(ema9) - last(ema50)) / candle.close * 100;
   const regime = volatility === 'UNUSABLE' ? 'UNUSABLE'
-    : trend !== 'NEUTRAL' && trendStrengthPct >= 0.08 ? 'TRENDING'
-      : structure === 'NEUTRAL' ? 'RANGE' : 'TRANSITION';
+    : trendProfile.established && trendStrengthPct >= 0.08 ? 'TRENDING'
+      : trendProfile.state === 'CHOPPY' || structure === 'NEUTRAL' ? 'RANGE' : 'TRANSITION';
   return {
     timeframe, closeTime: candle.closeTime, price: candle.close, usedCandleCount: candles.length,
     ema: { fast: round(last(ema9), 8), medium: round(ema20Value, 8), slow: round(last(ema50), 8) },
     overlay: { rangeHigh: round(rangeHigh, 8), rangeLow: round(rangeLow, 8), lastClose: round(candle.close, 8) },
-    trend, trendStrengthPct: round(trendStrengthPct, 3), regime,
+    trend, trendStrengthPct: round(trendStrengthPct, 3), trendProfile, regime,
     distanceFromEma20Atr: round(distanceFromEma20Atr, 3), closeLocation: round(closeLocation, 3),
     rsi: round(currentRsi), macd: {
       histogram: round(histogram, 8), deadZone: round(macdDeadZone, 8),
@@ -217,7 +309,7 @@ function analyzeTimeframe(candles, timeframe) {
     },
     momentum, atr: round(currentAtr, 8), atrPct: round(volatilityPct * 100, 3), volatility,
     volumeRatio: round(volumeRatio), volume: volumeDirection,
-    rangePosition: round(rangePosition, 3), structure,
+    rangePosition: round(rangePosition, 3), structure, structurePersistence: round(structurePersistence, 3),
     triggers: detectTriggers(candles, atrSeries, timeframe),
   };
 }
@@ -252,7 +344,71 @@ function frameDirectionalBias(analysis) {
   const down = directionalComponents(analysis, 'DOWN');
   const dominant = up >= 2 && up > down ? 'UP' : down >= 2 && down > up ? 'DOWN' : 'NEUTRAL';
   const state = dominant !== 'NEUTRAL' ? dominant : up >= 2 && down >= 2 && up === down ? 'AMBIVALENT' : 'NEUTRAL';
-  return { timeframe: analysis.timeframe, up, down, dominant, state };
+  return {
+    timeframe: analysis.timeframe, up, down, dominant, state,
+    trendDirection: analysis.trendProfile && analysis.trendProfile.direction || analysis.trend,
+    trendState: analysis.trendProfile && analysis.trendProfile.state || 'UNKNOWN',
+    trendPersistence: analysis.trendProfile && analysis.trendProfile.persistence,
+    trendEfficiency: analysis.trendProfile && analysis.trendProfile.efficiency,
+    ema20SlopeAtr: analysis.trendProfile && analysis.trendProfile.ema20SlopeAtr,
+  };
+}
+
+function trendBucket(value, low, high) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 'NA';
+  return number < low ? 'LOW' : number < high ? 'MID' : 'HIGH';
+}
+
+function buildMultiTimeframeTrend(analyses) {
+  const ordered = ['1m', '5m', '15m', '30m', '60m'].map((timeframe) => analyses[timeframe]).filter(Boolean);
+  const frames = ordered.map((analysis) => ({
+    timeframe: analysis.timeframe,
+    direction: analysis.trendProfile.direction,
+    state: analysis.trendProfile.state,
+    persistence: analysis.trendProfile.persistence,
+    efficiency: analysis.trendProfile.efficiency,
+    ema20SlopeAtr: analysis.trendProfile.ema20SlopeAtr,
+    strengthScore: analysis.trendProfile.strengthScore,
+    structure: analysis.structure,
+    momentum: analysis.momentum,
+    volume: analysis.volume,
+    regime: analysis.regime,
+  }));
+  const establishedUp = frames.filter((frame) => frame.state === 'ESTABLISHED' && frame.direction === 'UP').length;
+  const establishedDown = frames.filter((frame) => frame.state === 'ESTABLISHED' && frame.direction === 'DOWN').length;
+  const consensus = establishedUp > establishedDown ? 'UP' : establishedDown > establishedUp ? 'DOWN' : 'NEUTRAL';
+  return {
+    policy: 'trend MTF pe lumânări închise: EMA stack + pantă EMA20/ATR + persistență + efficiency + structură/momentum/volum',
+    frames,
+    establishedUp,
+    establishedDown,
+    consensus,
+    analyzedTimeframes: frames.map((frame) => frame.timeframe),
+  };
+}
+
+function buildContextFingerprint({ symbol, horizon, candidate, bestTrigger, triggerAgeMs, triggerWindowMs, execution, context }) {
+  if (candidate === 'WAIT' || !bestTrigger) return null;
+  const frameToken = (analysis) => {
+    const profile = analysis.trendProfile || {};
+    return `${analysis.timeframe}:${profile.direction || analysis.trend}:${profile.state || analysis.regime}`
+      + `:P${trendBucket(profile.persistence, 0.625, 0.8)}`
+      + `:E${trendBucket(profile.efficiency, 0.2, 0.4)}`
+      + `:S${analysis.structure}:M${analysis.momentum}`;
+  };
+  const ageRatio = Math.max(0, Number(triggerAgeMs) || 0) / Math.max(1, Number(triggerWindowMs) || 1);
+  const ageBucket = ageRatio <= 0.34 ? 'FRESH' : ageRatio <= 0.67 ? 'MID' : 'OLD';
+  const triggerAnalysis = [...execution, ...context].find((analysis) => analysis.timeframe === bestTrigger.timeframe);
+  const rawExtension = triggerAnalysis ? Number(triggerAnalysis.distanceFromEma20Atr) : 0;
+  const signedExtension = candidate === 'UP' ? rawExtension : -rawExtension;
+  const extensionBucket = signedExtension <= 0.8 ? 'BASE' : signedExtension <= 1.5 ? 'EXTENDED' : 'LATE';
+  return [
+    'ctx-v2', String(symbol || 'UNKNOWN').trim().toUpperCase(), `${horizon}m`, candidate, `${bestTrigger.timeframe}:${bestTrigger.type}`,
+    `AGE:${ageBucket}`, `EXT:${extensionBucket}`,
+    `EXEC:${execution.map(frameToken).join(',')}`,
+    `CONTEXT:${context.map(frameToken).join(',')}`,
+  ].join('|');
 }
 
 function selectTriggerCandidate(recentTriggers) {
@@ -282,21 +438,37 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   });
   addGate(gateChecks, reasonCodes, 'DATA_STALE_OR_GAPPED', invalidFrames.length === 0, invalidFrames.length ? `TF invalide: ${invalidFrames.join(', ')}` : 'toate TF sunt closed, fresh și continue în întreaga fereastră analizată');
 
-  const recentTriggers = spec.triggerFrames
+  const inWindowTriggers = spec.triggerFrames
     .flatMap((timeframe) => analyses[timeframe].triggers)
     .filter((trigger) => trigger.closeTime <= asOf && asOf - trigger.closeTime <= spec.triggerMaxAgeMs)
     .sort((a, b) => b.closeTime - a.closeTime || b.strength - a.strength
       || a.timeframe.localeCompare(b.timeframe) || a.type.localeCompare(b.type));
+  const invalidatedTriggers = inWindowTriggers.filter((trigger) => trigger.invalidated === true);
+  const recentTriggers = inWindowTriggers.filter((trigger) => trigger.invalidated !== true);
   const triggerSelection = selectTriggerCandidate(recentTriggers);
   const bestTrigger = triggerSelection.selected;
   const representativeTrigger = bestTrigger || triggerSelection.top[0] || null;
   addGate(gateChecks, reasonCodes, 'TRIGGER_MISSING_OR_STALE', recentTriggers.length > 0, representativeTrigger
-    ? `${recentTriggers.length} trigger(e) eligibile; cel mai nou close ${representativeTrigger.closeTime}`
-    : `niciun trigger în ultimele ${spec.triggerMaxAgeMs / 60_000} minute`);
+    ? `${recentTriggers.length} trigger(e) valide; cel mai nou close ${representativeTrigger.closeTime}`
+    : invalidatedTriggers.length
+      ? `${invalidatedTriggers.length} trigger(e) din fereastră au fost invalidate ulterior pe close`
+      : `niciun trigger în ultimele ${spec.triggerMaxAgeMs / 60_000} minute`);
+  addGate(gateChecks, reasonCodes, 'TRIGGER_INVALIDATED_AFTER_SETUP', invalidatedTriggers.length === 0 || recentTriggers.length > 0,
+    invalidatedTriggers.length ? `${invalidatedTriggers.length} trigger(e) invalidate; ${recentTriggers.length} rămân valide` : 'niciun trigger eligibil nu a fost invalidat după apariție');
   addGate(gateChecks, reasonCodes, 'TRIGGER_DIRECTION_TIE', !triggerSelection.directionTie, triggerSelection.directionTie
     ? `trigger-ele de rang maxim au direcții opuse: ${triggerSelection.top.map((trigger) => `${trigger.type} ${trigger.direction} ${trigger.timeframe}`).join(' | ')}`
     : bestTrigger ? `${bestTrigger.type} ${bestTrigger.direction} ${bestTrigger.timeframe} selectat fără tie direcțional` : 'fără candidat selectabil');
   const candidate = bestTrigger ? bestTrigger.direction : 'WAIT';
+  const triggerAgeMs = bestTrigger ? Math.max(0, asOf - bestTrigger.closeTime) : null;
+  const strongTriggerAgeMs = spec.triggerMaxAgeMs * 0.67;
+  const triggerFresh = bestTrigger && triggerAgeMs <= strongTriggerAgeMs;
+  addGate(gateChecks, reasonCodes, 'TRIGGER_NOT_FRESH_ENOUGH', Boolean(triggerFresh), bestTrigger
+    ? `vârstă ${triggerAgeMs}ms; maxim strong ${Math.round(strongTriggerAgeMs)}ms`
+    : 'fără trigger selectat; prospețimea nu poate fi confirmată');
+  const triggerStrongEnough = bestTrigger && bestTrigger.strength >= 5;
+  addGate(gateChecks, reasonCodes, 'TRIGGER_STRENGTH_LOW', Boolean(triggerStrongEnough), bestTrigger
+    ? `strength=${bestTrigger.strength}; minimum strong=5`
+    : 'fără trigger selectat');
   const opposingTriggers = bestTrigger ? recentTriggers.filter((trigger) => trigger.direction !== candidate) : [];
   const materialOpposing = bestTrigger ? opposingTriggers.find((trigger) => trigger.strength >= bestTrigger.strength - 1) : null;
   addGate(gateChecks, reasonCodes, 'TRIGGER_CONFLICT', !materialOpposing, materialOpposing
@@ -328,6 +500,21 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   const requiredConfirmations = spec.execution.length;
   addGate(gateChecks, reasonCodes, 'EXECUTION_TF_ALIGNMENT_INCOMPLETE', confirmingTimeframes.length === requiredConfirmations,
     `${confirmingTimeframes.length}/${requiredConfirmations} TF obligatorii confirmă: ${confirmingTimeframes.join(', ') || 'niciunul'}${ambivalentTimeframes.length ? `; ambivalente: ${ambivalentTimeframes.join(', ')}` : ''}`);
+  const weakExecutionTrends = candidate === 'WAIT' ? execution : execution.filter((analysis) => !analysis.trendProfile
+    || analysis.trendProfile.state !== 'ESTABLISHED' || analysis.trendProfile.direction !== candidate);
+  addGate(gateChecks, reasonCodes, 'EXECUTION_TREND_NOT_PERSISTENT', candidate !== 'WAIT' && weakExecutionTrends.length === 0,
+    candidate === 'WAIT' ? 'fără direcție candidat'
+      : weakExecutionTrends.length
+        ? `trend nepersistent/nealiniat: ${weakExecutionTrends.map((analysis) => `${analysis.timeframe} ${analysis.trendProfile.state}/${analysis.trendProfile.direction} P=${analysis.trendProfile.persistence} E=${analysis.trendProfile.efficiency} slope=${analysis.trendProfile.ema20SlopeAtr}ATR`).join(' | ')}`
+        : `toate TF de execuție au EMA stack, pantă, persistență și efficiency stabilă în direcția ${candidate}`);
+  const opposingStructure = candidate === 'WAIT' ? [] : execution.filter((analysis) => analysis.structure === opposite);
+  const persistentStructureSupport = candidate === 'WAIT' ? [] : execution.filter((analysis) => analysis.structure === candidate
+    && Number(analysis.structurePersistence) >= 0.43);
+  addGate(gateChecks, reasonCodes, 'EXECUTION_STRUCTURE_NOT_PERSISTENT', candidate !== 'WAIT'
+    && opposingStructure.length === 0 && persistentStructureSupport.length >= 1,
+  candidate === 'WAIT' ? 'fără direcție candidat'
+    : opposingStructure.length ? `structură opusă pe ${opposingStructure.map((analysis) => analysis.timeframe).join(', ')}`
+      : `${persistentStructureSupport.length}/${execution.length} TF au structură persistentă ${candidate}; minimum 1`);
   const hasUpFrame = frameBiases.some((item) => item.dominant === 'UP');
   const hasDownFrame = frameBiases.some((item) => item.dominant === 'DOWN');
   const materialExecutionConflict = hasUpFrame && hasDownFrame;
@@ -335,9 +522,15 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
     materialExecutionConflict ? 'TF-urile de execuție au biasuri dominante opuse' : 'fără conflict dominant între TF-urile de execuție');
   const unusableFrames = execution.filter((analysis) => analysis.volatility !== 'USABLE').map((analysis) => analysis.timeframe);
   const directionalFrames = frameBiases.filter((item) => item.dominant !== 'NEUTRAL').length;
-  const chopOrUnusable = unusableFrames.length > 0 || directionalFrames < 2;
+  const inefficientFrames = execution.filter((analysis) => !analysis.trendProfile
+    || analysis.trendProfile.efficiency < MIN_TREND_EFFICIENCY
+    || analysis.trendProfile.state === 'CHOPPY').map((analysis) => analysis.timeframe);
+  const chopOrUnusable = unusableFrames.length > 0 || directionalFrames < 2 || inefficientFrames.length > 0;
   addGate(gateChecks, reasonCodes, 'CHOP_OR_VOLATILITY_UNUSABLE', !chopOrUnusable,
-    unusableFrames.length ? `volatilitate neutilizabilă: ${unusableFrames.join(', ')}` : directionalFrames < 2 ? 'chop/ambivalență: mai puțin de 2 TF au bias dominant' : 'volatilitate și structură dominante utilizabile');
+    unusableFrames.length ? `volatilitate neutilizabilă: ${unusableFrames.join(', ')}`
+      : inefficientFrames.length ? `mișcare ineficientă/choppy: ${inefficientFrames.join(', ')}`
+        : directionalFrames < 2 ? 'chop/ambivalență: mai puțin de 2 TF au bias dominant'
+          : 'volatilitate, efficiency și structură dominante utilizabile');
 
   const triggerAnalysis = bestTrigger ? analyses[bestTrigger.timeframe] : null;
   const signedExtensionAtr = triggerAnalysis
@@ -348,10 +541,33 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
     triggerAnalysis ? `${bestTrigger.timeframe}: extensie ${round(signedExtensionAtr, 2)} ATR față de EMA20; maxim 2.2 ATR în direcția intrării`
       : 'fără trigger selectat; extensia nu poate valida intrarea');
 
-  const hardHigherConflict = candidate !== 'WAIT' && context.some((analysis) => analysis.trend === opposite
-    && (analysis.momentum === opposite || analysis.structure === opposite) && analysis.trendStrengthPct >= 0.08);
+  const primaryContext = spec.primaryContext.map((timeframe) => analyses[timeframe]);
+  const macroContext = spec.macroContext.map((timeframe) => analyses[timeframe]);
+  const contextOpposition = candidate === 'WAIT' ? [] : context.filter((analysis) => analysis.trendProfile
+    && analysis.trendProfile.direction === opposite
+    && ['ESTABLISHED', 'DEVELOPING'].includes(analysis.trendProfile.state));
+  const hardHigherConflict = candidate !== 'WAIT' && context.some((analysis) => analysis.trendProfile
+    && analysis.trendProfile.direction === opposite
+    && analysis.trendProfile.state === 'ESTABLISHED');
   addGate(gateChecks, reasonCodes, 'HIGHER_TF_CONFLICT', !hardHigherConflict,
-    hardHigherConflict ? 'contextul higher-TF este material opus' : 'fără conflict material higher-TF');
+    hardHigherConflict ? `context established opus: ${context.filter((analysis) => analysis.trendProfile.direction === opposite && analysis.trendProfile.state === 'ESTABLISHED').map((analysis) => analysis.timeframe).join(', ')}`
+      : 'fără trend established opus pe higher-TF');
+  const primarySupport = candidate === 'WAIT' ? [] : primaryContext.filter((analysis) => analysis.trendProfile
+    && analysis.trendProfile.direction === candidate
+    && ['ESTABLISHED', 'DEVELOPING'].includes(analysis.trendProfile.state));
+  const primaryOpposition = candidate === 'WAIT' ? [] : primaryContext.filter((analysis) => analysis.trendProfile
+    && analysis.trendProfile.direction === opposite
+    && ['ESTABLISHED', 'DEVELOPING'].includes(analysis.trendProfile.state));
+  addGate(gateChecks, reasonCodes, 'PRIMARY_CONTEXT_NOT_CONFIRMED', candidate !== 'WAIT'
+    && primarySupport.length >= 1 && primaryOpposition.length === 0,
+  candidate === 'WAIT' ? 'fără direcție candidat'
+    : primaryOpposition.length ? `context primar opus: ${primaryOpposition.map((analysis) => analysis.timeframe).join(', ')}`
+      : `${primarySupport.length}/${primaryContext.length} TF primare confirmă trendul ${candidate}; minimum 1`);
+  const macroOpposition = candidate === 'WAIT' ? [] : macroContext.filter((analysis) => analysis.trendProfile
+    && analysis.trendProfile.direction === opposite && analysis.trendProfile.state === 'ESTABLISHED');
+  addGate(gateChecks, reasonCodes, 'MACRO_TREND_VETO', macroOpposition.length === 0,
+    macroOpposition.length ? `macro-veto ${opposite}: ${macroOpposition.map((analysis) => analysis.timeframe).join(', ')}`
+      : '30m/60m nu conțin trend established material opus rolului lor macro');
   addGate(gateChecks, reasonCodes, 'DIRECTIONAL_CONFLICT', candidate !== 'WAIT' && aggregateDirection === candidate,
     `trigger=${candidate}, agregat=${aggregateDirection}`);
   addGate(gateChecks, reasonCodes, 'MARGIN_LOW', margin >= 1.5, `margin=${margin}`);
@@ -380,22 +596,34 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   if (triggerSelection.directionTie) conflicts.push(`trigger-ele de rang maxim sunt co-egale UP/DOWN; intrarea este blocată`);
   ambivalentTimeframes.forEach((timeframe) => conflicts.push(`${timeframe}: scor direcțional ambivalent UP=DOWN`));
 
-  const contextAlignedCount = candidate === 'WAIT' ? 0 : context.filter((analysis) => analysis.trend === candidate).length;
-  const contextOpposedCount = candidate === 'WAIT' ? 0 : context.filter((analysis) => analysis.trend === opposite).length;
+  const contextAlignedCount = candidate === 'WAIT' ? 0 : context.filter((analysis) => analysis.trendProfile
+    && analysis.trendProfile.direction === candidate
+    && ['ESTABLISHED', 'DEVELOPING'].includes(analysis.trendProfile.state)).length;
+  const contextOpposedCount = contextOpposition.length;
+  const persistentExecutionCount = candidate === 'WAIT' ? 0 : execution.filter((analysis) => analysis.trendProfile
+    && analysis.trendProfile.state === 'ESTABLISHED' && analysis.trendProfile.direction === candidate).length;
+  const averageExecutionEfficiency = execution.length
+    ? average(execution.map((analysis) => Number(analysis.trendProfile && analysis.trendProfile.efficiency) || 0)) : 0;
   const qualityComponents = {
-    base: 34,
+    base: 24,
     trigger: bestTrigger ? Math.min(18, bestTrigger.strength * 2) : 0,
-    dominantTimeframes: confirmingTimeframes.length * 10,
-    confirmationTypes: confirmations.size * 4,
-    directionalMargin: Math.min(10, margin * 2),
-    higherTimeframeSupport: contextAlignedCount * 5,
-    higherTimeframeOpposition: -contextOpposedCount * 5,
+    triggerFreshness: triggerFresh ? 5 : 0,
+    dominantTimeframes: confirmingTimeframes.length * 8,
+    persistentExecutionTrend: persistentExecutionCount * 8,
+    executionEfficiency: Math.min(8, Math.round(averageExecutionEfficiency * 20)),
+    persistentStructure: persistentStructureSupport.length * 4,
+    confirmationTypes: confirmations.size * 3,
+    directionalMargin: Math.min(8, margin * 2),
+    higherTimeframeSupport: contextAlignedCount * 4,
+    primaryContextSupport: primarySupport.length * 5,
+    higherTimeframeOpposition: -contextOpposedCount * 7,
+    macroOpposition: -macroOpposition.length * 15,
     opposingTimeframes: -opposingTimeframes.length * 7,
     opposingTrigger: materialOpposing ? -12 : 0,
     triggerDirectionTie: triggerSelection.directionTie ? -20 : 0,
     hardHigherTimeframeConflict: hardHigherConflict ? -20 : 0,
     overextendedEntry: overextended ? -15 : 0,
-    chopOrUnusable: chopOrUnusable ? -12 : 0,
+    chopOrUnusable: chopOrUnusable ? -15 : 0,
   };
   const qualityRaw = Object.values(qualityComponents).reduce((sum, value) => sum + value, 0);
   const quality = Math.max(0, Math.min(100, Math.round(qualityRaw)));
@@ -410,32 +638,54 @@ function decideHorizon({ symbol, horizon, analyses, metadata, asOf, generatedAt,
   const timing = contractBoundaries(generatedAt, horizon);
   const signalKey = action === 'WAIT' || !bestTrigger ? null
     : `${ENGINE_VERSION}:${symbol}:${horizon}m:${direction}:${bestTrigger.timeframe}:${bestTrigger.type}:${bestTrigger.closeTime}`;
+  const multiTimeframeTrend = buildMultiTimeframeTrend(analyses);
+  const contextFingerprint = buildContextFingerprint({
+    symbol,
+    horizon,
+    candidate,
+    bestTrigger,
+    triggerAgeMs,
+    triggerWindowMs: spec.triggerMaxAgeMs,
+    execution,
+    context,
+  });
   return {
     engineVersion: ENGINE_VERSION,
     symbol, horizonMin: horizon, action, direction, bias, verdict, quality,
     protocol: spec.protocol,
     executionTimeframes: [...spec.execution], contextTimeframes: [...spec.context],
+    primaryContextTimeframes: [...spec.primaryContext], macroContextTimeframes: [...spec.macroContext],
     setupFingerprint: bestTrigger ? `${horizon}m|${bestTrigger.timeframe}|${bestTrigger.type}|${candidate}` : null,
+    contextFingerprint,
+    multiTimeframeTrend,
     qualityLabel: 'confluence score descriptiv (nu probabilitate)', qualityComponents,
     directionScores: { up: round(bullish), down: round(bearish), margin, aggregate: aggregateDirection },
     frameBiases, ambivalentTimeframes, scoreMargin: margin,
     reasonCodes: uniqueReasonCodes.length ? uniqueReasonCodes : ['SIGNAL_GATES_PASSED'], gateChecks,
-    trigger: bestTrigger ? { ...bestTrigger, ageMs: Math.max(0, asOf - bestTrigger.closeTime) } : null,
+    trigger: bestTrigger ? { ...bestTrigger, ageMs: triggerAgeMs } : null,
     triggerCandidates: triggerSelection.top.map((trigger) => ({ ...trigger, ageMs: Math.max(0, asOf - trigger.closeTime) })),
+    invalidatedTriggerCandidates: invalidatedTriggers.slice(0, 8).map((trigger) => ({
+      timeframe: trigger.timeframe,
+      type: trigger.type,
+      direction: trigger.direction,
+      closeTime: trigger.closeTime,
+      invalidatedAt: trigger.invalidatedAt,
+      invalidationLevel: trigger.invalidationLevel,
+    })),
     triggerSelection: {
       rule: 'cel mai nou close, apoi strength maxim; tie UP/DOWN => WAIT',
       directionTie: triggerSelection.directionTie,
       eligibleCount: recentTriggers.length,
       topCount: triggerSelection.top.length,
     },
-    triggerAgeMs: bestTrigger ? Math.max(0, asOf - bestTrigger.closeTime) : null,
+    triggerAgeMs,
     triggerWindowMs: spec.triggerMaxAgeMs,
     confirmingTimeframes, opposingTimeframes,
     confirmations: [...confirmations], evidence, conflicts,
-    timeframeAnalyses: Object.fromEntries([...spec.execution, ...spec.context].map((timeframe) => [timeframe, analyses[timeframe]])),
+    timeframeAnalyses: Object.fromEntries(Object.entries(analyses)),
     invalidation: candidate === 'UP' ? 'invalidare: close sub minimul triggerului sau conflict superior nou'
       : candidate === 'DOWN' ? 'invalidare: close peste maximul triggerului sau conflict superior nou' : 'așteaptă trigger și confirmări noi',
-    context: context.map((analysis) => `${analysis.timeframe} trend=${analysis.trend}, momentum=${analysis.momentum}`).join('; '),
+    context: context.map((analysis) => `${analysis.timeframe} trend=${analysis.trendProfile.direction}/${analysis.trendProfile.state}, P=${analysis.trendProfile.persistence}, E=${analysis.trendProfile.efficiency}, momentum=${analysis.momentum}`).join('; '),
     signalKey, price: analyses[spec.execution[0]].price, latestClosedCandleTime: latestCloseTime,
     asOf, generatedAt, entryBoundaryOpenTime: timing.entryOpenTime, expiryEstimateCloseTime: timing.expiryCloseTime,
   };
@@ -462,6 +712,9 @@ function analyzeSnapshot(snapshot, options = {}) {
 
 module.exports = {
   HORIZONS, ANALYSIS_CANDLE_COUNT, ENGINE_VERSION,
+  TREND_PERSISTENCE_LOOKBACK, TREND_EFFICIENCY_LOOKBACK,
+  MIN_TREND_PERSISTENCE, MIN_TREND_EFFICIENCY, MIN_EMA20_SLOPE_ATR,
   analyzeSnapshot, analyzeTimeframe, sanitizeInput, detectTriggers, decideHorizon,
+  buildTrendProfile, buildMultiTimeframeTrend, buildContextFingerprint,
   indicators: { ema, rsi, atr, macd },
 };

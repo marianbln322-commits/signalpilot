@@ -61,6 +61,12 @@ function compactAnalyses(signal) {
     structure: item.structure,
     volume: item.volume,
     regime: item.regime,
+    trendState: item.trendProfile && item.trendProfile.state,
+    trendPersistence: item.trendProfile && item.trendProfile.persistence,
+    trendEfficiency: item.trendProfile && item.trendProfile.efficiency,
+    ema20SlopeAtr: item.trendProfile && item.trendProfile.ema20SlopeAtr,
+    trendStrengthScore: item.trendProfile && item.trendProfile.strengthScore,
+    structurePersistence: item.structurePersistence,
     rsi: item.rsi,
     atrPct: item.atrPct,
     volumeRatio: item.volumeRatio,
@@ -68,6 +74,33 @@ function compactAnalyses(signal) {
     distanceFromEma20Atr: item.distanceFromEma20Atr,
     trendStrengthPct: item.trendStrengthPct,
   }]));
+}
+
+function solutionForLossTags(tags) {
+  if (tags.includes('CONFLICT_HIGHER_TF')) return {
+    code: 'REQUIRE_HIGHER_TIMEFRAME_REALIGNMENT',
+    detail: 'nu repetă contextul până când higher-TF nu mai este opus și apare confirmare nouă',
+  };
+  if (tags.includes('TREND_INEFICIENT') || tags.includes('TREND_NEPERSISTENT')) return {
+    code: 'REQUIRE_PERSISTENT_EFFICIENT_TREND',
+    detail: 'cere din nou EMA stack, pantă/ATR, persistență și efficiency pe TF-urile de execuție',
+  };
+  if (tags.includes('TRIGGER_TARZIU')) return {
+    code: 'REQUIRE_NEW_FRESH_TRIGGER',
+    detail: 'respinge reutilizarea triggerului vechi și așteaptă unul nou, mai proaspăt',
+  };
+  if (tags.includes('INTRARE_EXTINSA')) return {
+    code: 'REQUIRE_PULLBACK_BEFORE_REENTRY',
+    detail: 'așteaptă revenire către EMA20 și confirmare nouă înainte de o situație similară',
+  };
+  if (tags.includes('BREAKOUT_NECONFIRMAT')) return {
+    code: 'REQUIRE_FRESH_BREAKOUT_RETEST',
+    detail: 'cere un breakout/retest nou; breakout-ul pierzător nu este reutilizat',
+  };
+  return {
+    code: 'REQUIRE_NEW_CONFIRMATION_AFTER_COOLDOWN',
+    detail: 'aplică pauză pe context similar și cere un rezultat shadow favorabil înainte de reutilizare',
+  };
 }
 
 function outcomeReview(entry, candles) {
@@ -80,10 +113,10 @@ function outcomeReview(entry, candles) {
       && candle.closeTime === candle.openTime + 60_000 - 1);
   if (!continuous) {
     return {
-      reviewedAt: Date.now(), method: 'deterministic-v1', complete: false,
+      reviewedAt: Date.now(), method: 'deterministic-v2-mtf', complete: false,
       candlesObserved: window.length, expectedCandles,
       signedMovePct: null, maximumFavorableExcursionPct: null, maximumAdverseExcursionPct: null,
-      tags: ['REVIEW_WINDOW_INCOMPLETE'],
+      tags: ['REVIEW_WINDOW_INCOMPLETE'], solution: null,
       summary: `Review incomplet: ${window.length}/${expectedCandles} lumânări 1m continue; MFE/MAE nu sunt calculate.`,
     };
   }
@@ -105,21 +138,31 @@ function outcomeReview(entry, candles) {
     if (Number(entry.quality) < 75) tags.push('CONFLUENTA_LA_LIMITA');
     if (Number.isFinite(adversePct) && Number.isFinite(favorablePct) && adversePct > Math.max(0.01, favorablePct * 1.5)) tags.push('REVERSARE_RAPIDA');
     const execution = entry.features && entry.features.executionTimeframes || [];
-    const overextended = execution.some((timeframe) => {
-      const analysis = entry.features.analyses && entry.features.analyses[timeframe];
-      if (!analysis) return false;
+    const context = entry.features && entry.features.contextTimeframes || [];
+    const analyses = entry.features && entry.features.analyses || {};
+    const executionAnalyses = execution.map((timeframe) => analyses[timeframe]).filter(Boolean);
+    const contextAnalyses = context.map((timeframe) => analyses[timeframe]).filter(Boolean);
+    if (executionAnalyses.some((analysis) => Number(analysis.trendEfficiency) < 0.28)) tags.push('TREND_INEFICIENT');
+    if (executionAnalyses.some((analysis) => analysis.trendState !== 'ESTABLISHED')) tags.push('TREND_NEPERSISTENT');
+    const opposite = entry.direction === 'UP' ? 'DOWN' : 'UP';
+    if (contextAnalyses.some((analysis) => analysis.trend === opposite
+      && ['ESTABLISHED', 'DEVELOPING'].includes(analysis.trendState))) tags.push('CONFLICT_HIGHER_TF');
+    const triggerAgeRatio = Number(entry.features && entry.features.triggerAgeRatio);
+    if (Number.isFinite(triggerAgeRatio) && triggerAgeRatio > 0.5) tags.push('TRIGGER_TARZIU');
+    const overextended = executionAnalyses.some((analysis) => {
       const distance = Number(analysis.distanceFromEma20Atr);
       const signedExtension = entry.direction === 'UP' ? distance : -distance;
-      return Number.isFinite(signedExtension) && signedExtension > 1.8;
+      return Number.isFinite(signedExtension) && signedExtension > 1.5;
     });
     if (overextended) tags.push('INTRARE_EXTINSA');
     if (!tags.length) tags.push('VARIANTA_ADVERSA_FARA_CAUZA_UNICA');
   }
+  const solution = entry.win ? null : solutionForLossTags(tags);
   return {
-    reviewedAt: Date.now(), method: 'deterministic-v1', complete: true,
+    reviewedAt: Date.now(), method: 'deterministic-v2-mtf', complete: true,
     candlesObserved: window.length, expectedCandles,
     signedMovePct, maximumFavorableExcursionPct: favorablePct, maximumAdverseExcursionPct: adversePct,
-    tags,
+    tags, solution,
     summary: entry.win
       ? `WIN: direcția a închis favorabil cu ${signedMovePct == null ? '—' : signedMovePct}% la expirare.`
       : `LOSS: direcția a închis nefavorabil cu ${signedMovePct == null ? '—' : signedMovePct}%; cauze candidate: ${tags.join(', ')}.`,
@@ -177,16 +220,22 @@ class Journal {
       quality: signal.quality,
       trigger: signal.trigger,
       setupFingerprint: signal.setupFingerprint,
+      contextFingerprint: signal.contextFingerprint,
       features: {
         protocol: signal.protocol,
         executionTimeframes: signal.executionTimeframes,
         contextTimeframes: signal.contextTimeframes,
+        primaryContextTimeframes: signal.primaryContextTimeframes,
+        macroContextTimeframes: signal.macroContextTimeframes,
+        multiTimeframeTrend: signal.multiTimeframeTrend,
+        triggerAgeRatio: Number(signal.triggerWindowMs) > 0 ? Number(signal.triggerAgeMs) / Number(signal.triggerWindowMs) : null,
         confirmations: signal.confirmations,
         directionScores: signal.directionScores,
         frameBiases: signal.frameBiases,
         qualityComponents: signal.qualityComponents,
         analyses: compactAnalyses(signal),
         localLearning: signal.localLearning && signal.localLearning.considered ? {
+          adaptiveProtection: signal.localLearning.adaptiveProtection,
           observationId: signal.localLearning.observationId,
           bucketKey: signal.localLearning.bucketKey,
           phase: signal.localLearning.phase,
@@ -202,6 +251,7 @@ class Journal {
           exclusionReason: signal.localLearning.exclusionReason,
           blockReasons: signal.localLearning.blockReasons,
           setupGuard: signal.localLearning.setupGuard,
+          contextLesson: signal.localLearning.contextLesson,
           allowedLossStreak: signal.localLearning.allowedLossStreak,
           lossCircuit: signal.localLearning.lossCircuit,
         } : null,
@@ -334,5 +384,5 @@ class Journal {
 
 module.exports = {
   Journal, atomicWriteJson, aggregate, wilson95,
-  setupKey, outcomeReview, LEARNING_MINIMUM_SAMPLE,
+  setupKey, outcomeReview, solutionForLossTags, LEARNING_MINIMUM_SAMPLE,
 };

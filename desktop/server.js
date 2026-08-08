@@ -139,7 +139,7 @@ function publicState() {
     liveFeed: state.liveFeed, localLearning: localLearner.snapshot(config.symbols, payoutByHorizon),
     alerts: state.alerts, journal: journalState, backtests: state.backtests,
     warning: INSTANCE.adaptiveProtection
-      ? 'Instanța 3014: prețul live este observat din MEXC Spot la 1 secundă; deciziile folosesc exclusiv lumânări închise. ENTER este doar o recomandare manuală și cere toate porțile deterministe. Learnerul local poate bloca rapid după trei loss consecutive, poate suprima setup-uri statistic slabe și, după calificare, poate filtra sub pragul payout-ului. Event Futures poate avea reguli/preț de settlement diferite. Nu există promisiune de precizie sau profit.'
+      ? 'Instanța 3014: prețul live este observat din MEXC Spot la 1 secundă; motorul analizează constant 1m/5m/15m/30m/60m, dar deciziile folosesc exclusiv lumânări închise. ENTER este doar o recomandare manuală și cere trend persistent/eficient, trigger proaspăt și toate veto-urile de context. Learnerul local aplică patru trepte restrictive: lecție imediată pentru context similar după primul LOSS, circuit după trei LOSS consecutive, setup guard statistic și model logistic după calificare. Poate numai ENTER→WAIT, niciodată crea sau inversa semnale. Event Futures poate avea reguli/preț de settlement diferite de MEXC Spot. Scorul strong nu garantează precizie sau profit.'
       : 'Instanța 3013 păstrează learnerul logistic anterior, fără circuitul adaptiv nou. Prețul live este MEXC Spot, iar deciziile folosesc exclusiv lumânări închise. Nu există promisiune de precizie sau profit.',
   };
 }
