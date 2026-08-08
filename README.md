@@ -132,6 +132,22 @@ POST /api/calibrate    { "days": 30 }
 
 Rezultatul se salvează în `calibration.json` și e folosit live până când jurnalul tău propriu are destule rezultate rezolvate, moment în care are prioritate (datele tale reale bat istoricul).
 
+### Două populații care nu se amestecă niciodată
+
+Jurnalul conține două feluri de intrări, și distincția e esențială:
+
+| | ce e | intră în calibrare/miză/învățare? |
+|---|---|---|
+| `background` | o mostră per bară închisă, înregistrată chiar dacă nu s-a dat nicio alertă | **nu** |
+| alertă | semnal care a trecut filtrele — populația care se tranzacționează | **da** |
+| alertă `uncalibrated` | alertă reală apărută în observation mode (afișată, nu recomandată) | **da** |
+
+Mostrele de fundal se acumulează de ~60 de ori mai repede decât alertele. Orice medie peste amestecul celor două converge la rata de bază necondiționată — adică ~50% pe un orizont de tip monedă — și o face cu un interval de încredere tot mai **îngust**. Nu e doar imprecis: e ferm greșit, și devine tot mai încrezător în răspunsul greșit pe măsură ce aplicația rulează. Cu poarta EV care cere `CI low ≥ break-even + marjă`, efectul practic e că poarta nu s-ar deschide niciodată, oricât de real ar fi edge-ul.
+
+De aceea `journal.samples()` e singura sursă permisă pentru calibrare, iar `learning.analyze()` exclude fundalul implicit. Alertele `uncalibrated` sunt incluse deliberat: dacă nu ar fi numărate, observation mode nu ar putea strânge niciodată dovezile care i-ar permite să se încheie.
+
+Fundalul rămâne util, dar ca **reper**: răspunde la întrebarea „setup-ul filtrat e mai bun decât a lua pur și simplu fiecare bară?". Se raportează separat, în `stats().background` și `learning.summary().baseline`.
+
 ---
 
 ## Cum e gândit
