@@ -167,9 +167,11 @@ function saveCalibration(model) {
 // honestly instead of printing an invented number.
 function buildLivePrediction(verdict) {
   const ctx = { setup: verdict.setup, interval: verdict.interval, score: verdict.score };
-  const journalSamples = journal.all()
-    .filter((e) => e.status === 'resolved' && e.setup && e.interval)
-    .map((e) => ({ setup: e.setup, interval: e.interval, score: e.score, win: e.win }));
+  // Real alerts ONLY. Background bar samples are ~60x more numerous and describe
+  // the unconditional base rate (~50%), so including them drags every estimate to
+  // a coin flip with a tight interval — the gate would then never open, no matter
+  // how strong the real edge is. journal.samples() enforces the distinction.
+  const journalSamples = journal.samples();
 
   if (journalSamples.length >= (config.calibrationMinSample || 30)) {
     const live = cal.fit(journalSamples, { minSample: config.calibrationMinSample });
@@ -351,14 +353,16 @@ async function scanSymbol(symbol) {
     });
   }
 
-  // Continuous learning: log one observation per 5m candle per symbol (even when
-  // no alert fires) so the software keeps learning about ETH/BTC 24/7. These are
-  // resolved automatically and feed the learning layer, but stay out of the
-  // trade journal display.
+  // Continuous observation: log one sample per closed bar per symbol (even when
+  // no alert fires) so the app keeps watching ETH/BTC 24/7. These describe the
+  // UNCONDITIONAL population — every bar with a direction — so they are marked
+  // `background` and are excluded from calibration, sizing, learning and the
+  // trade journal. They exist to answer "is the filtered setup better than just
+  // taking every bar?", which requires keeping the two populations apart.
   if (config.useLearning && verdict.directie !== 'NEUTRU') {
     try {
       journal.record({
-        observation: true,
+        background: true,
         candleOpen: verdict.barOpenTime,
         symbol,
         directie: verdict.directie,
@@ -482,7 +486,13 @@ async function scanSymbol(symbol) {
       price: verdict.price,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
+      // Shown for observation only (model not yet calibrated) — but still a real
+      // alert, so it is journalled and counted. `background` is explicitly false:
+      // these must reach the calibration layer, otherwise observation mode can
+      // never gather the evidence that would let it end.
       observation: !!verdict.observation,
+      uncalibrated: !!verdict.observation,
+      background: false,
       ofState: verdict.orderflow ? verdict.orderflow.state : null,
       ofAgree: verdict.ofAgree || null,
       barCloseTime: verdict.barCloseTime,
