@@ -152,6 +152,44 @@ Direcția se deduce singură: la câștig coincide cu sensul mișcării, la pier
 
 Coloana `payout` e opțională, dar **fără ea defalcarea pe niveluri de payout e imposibilă** — payout-ul se poate deduce din P&L doar la pozițiile câștigătoare, fiindcă o pierdere e mereu −100% din miză indiferent ce payout ți se oferea. Unealta detectează situația și refuză tabelul, în loc să afișeze 100% pe fiecare nivel. Iar aceea e întrebarea care decide totul: **payout-ul mare apare în momentele mai greu de prezis, sau nu?** Dacă da, „intru doar la 85%" te selectează în cele mai grele momente și avantajul aparent dispare.
 
+## Ponderi învățate, nu inventate
+
+Până acum motorul scora setup-urile cu constante scrise de mână:
+
+```js
+if (sweep)                       w = 3 + Math.min(1.5, sweep.strength);
+if (structure.mss === 'bullish') add('up', 2.2, ...);
+if (structure.trend === 'up')    add('up', 1.5, ...);
+```
+
+Nimic nu a verificat vreodată dacă un sweep merită 3.0 și un trend 1.5, dacă ordinea nu ar trebui inversată, sau dacă vreuna dintre ele conteaza. Sunt întrebări empirice la care s-a răspuns prin afirmație. Asta e diferența dintre a aplica reguli dintr-o carte și a fi tranzacționat efectiv: cineva cu un milion de execuții are ponderile calibrate de rezultate.
+
+„Un milion de tranzacții de experiență" e o dimensiune de dataset, nu o metaforă. Un an de bare de 5 minute ≈ 105.000 de bare per simbol; fiecare devine un exemplu etichetat, la fiecare orizont. Două simboluri și două orizonturi trec de 400.000 de rezultate măsurate.
+
+```bash
+# o singură dată, pe mașina ta (are nevoie de rețea)
+node tools/collect.js --symbol ETHUSDT --days 365
+node tools/collect.js --symbol BTCUSDT --days 365
+
+# antrenare + validare walk-forward
+node tools/train.js --file data/ETHUSDT-5m-365d.json --horizon 10
+node tools/train.js --file data/ETHUSDT-5m-365d.json --horizon 30 --save
+
+# testul de nul, fără rețea: pe random walk TREBUIE să iasă ~50%
+node tools/train.js --synthetic --days 120
+```
+
+`lib/features.js` produce ~100 de features normalizate (momentum în unități de ATR, oscilatoare centrate, formă de lumânare, regim de volatilitate, distanțe la swing-uri, evenimentele SMC, aliniere între timeframe-uri, ora ca sin/cos). `lib/model.js` e regresie logistică cu L2, fără dependențe.
+
+### Ce face numărul demn de încredere
+
+- **Purjare.** Un eșantion la bara `i` e etichetat de bara `i+H`, deci eșantioanele `i..i+H-1` împart fereastra de rezultat. La fiecare graniță train/test se aruncă `H` bare.
+- **Interval de încredere onest.** Etichetele vecine se suprapun, deci `n` eșantioane consecutive conțin ~`n/H` observații independente. Se raportează ambele: intervalul naiv și cel calculat pe un sub-eșantion cu pas `H`.
+- **L2 ales înăuntrul fold-ului.** Coada blocului de antrenare devine validare, grila se scorează pe ea, iar câștigătorul se refitează pe tot blocul. Alegerea L2 uitându-te la fold-urile de test e scurgere de informație — și e exact modul în care un model mediocru capătă o cifră flatantă.
+- **Test de nul.** `--synthetic` înlocuiește piața cu un random walk fără drift. Rezultat: acuratețe out-of-sample **49.96%**, Brier **0.25128**, log loss **0.69573** — practic la limita lipsei de informație, iar poarta refuză. Dacă harness-ul ar produce edge din zgomot, nimic din el nu ar avea valoare.
+
+Un detaliu care ilustrează de ce contează intervalul onest: pe random walk, un fold individual a raportat **55.6%** acuratețe. Aceeași cifră pe care o revendica o versiune anterioară a acestui README ca „edge validat out-of-sample".
+
 ### Ce a arătat auditul pe 506 poziții reale
 
 Istoricul real de tranzacționare MEXC al utilizatorului (16.07–08.08.2026, 506 poziții decontate, validat contra totalurilor exportate) a fost trecut prin `tools/analyze-positions.js`. Rezultatul e păstrat aici pentru că e singura măsurătoare din acest proiect care nu e o estimare:
