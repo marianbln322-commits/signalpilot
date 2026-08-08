@@ -54,6 +54,51 @@ function analysesFor(result) {
   return { ...(ten && ten.timeframeAnalyses || {}), ...(thirty && thirty.timeframeAnalyses || {}) };
 }
 
+function analysisBalance(prediction) {
+  const rawUp = prediction && prediction.directionScores && prediction.directionScores.up;
+  const rawDown = prediction && prediction.directionScores && prediction.directionScores.down;
+  if (rawUp === null || rawUp === undefined || rawDown === null || rawDown === undefined) return null;
+  const up = Number(rawUp);
+  const down = Number(rawDown);
+  if (!Number.isFinite(up) || !Number.isFinite(down) || up < 0 || down < 0) return null;
+  const total = up + down;
+  const noDirectionalEvidence = total === 0;
+  const upPct = noDirectionalEvidence ? 50 : up / total * 100;
+  const downPct = noDirectionalEvidence ? 50 : down / total * 100;
+  const spread = Math.abs(upPct - downPct);
+  const dominant = noDirectionalEvidence || spread < 8 ? 'NEUTRAL' : upPct > downPct ? 'UP' : 'DOWN';
+  return {
+    up,
+    down,
+    total,
+    upPct,
+    downPct,
+    noDirectionalEvidence,
+    dominant,
+    label: noDirectionalEvidence ? 'NEUTRU · FĂRĂ DOVEZI' : dominant === 'UP' ? 'PRESIUNE UP' : dominant === 'DOWN' ? 'PRESIUNE DOWN' : 'ECHILIBRU',
+  };
+}
+
+function analysisBalancePanel(result) {
+  const predictions = result && result.predictions || {};
+  const cards = ['10m', '30m'].map((horizon) => {
+    const prediction = predictions[horizon];
+    const balance = analysisBalance(prediction);
+    const horizonLabel = horizon === '10m' ? 'ORIZONT DECIZIE 10 MINUTE' : 'ORIZONT DECIZIE 30 MINUTE';
+    if (!prediction || !balance) {
+      return `<div class="balance-card balance-NEUTRAL"><div class="balance-head"><strong>${safe(horizonLabel)} · ANALIZĂ INDISPONIBILĂ</strong></div><small>Lipsesc scorurile direcționale.</small></div>`;
+    }
+    const action = prediction.action === 'ENTER' && ['UP', 'DOWN'].includes(prediction.direction)
+      ? `SEMNAL ENTER ${prediction.direction}`
+      : 'WAIT · DOAR ANALIZĂ';
+    const evidenceNote = balance.noDirectionalEvidence
+      ? 'scor brut 0 / 0 · 50/50 este afișarea neutră convențională'
+      : `scor brut UP ${formatNumber(balance.up, 2)} / DOWN ${formatNumber(balance.down, 2)} · bias ${prediction.bias || 'NEUTRAL'}`;
+    return `<div class="balance-card balance-${safe(balance.dominant)}"><div class="balance-head"><strong>${safe(horizonLabel)} · ${safe(balance.label)}</strong><span>${safe(action)}</span></div><div class="balance-values"><b class="UP">UP ${safe(formatNumber(balance.upPct, 1))}%</b><b class="DOWN">DOWN ${safe(formatNumber(balance.downPct, 1))}%</b></div><svg class="balance-meter" viewBox="0 0 100 8" preserveAspectRatio="none" role="img" aria-label="${safe(`Balanță orizont ${horizon}: UP ${formatNumber(balance.upPct, 1)}%, DOWN ${formatNumber(balance.downPct, 1)}%`)}"><rect x="0" y="0" width="100" height="8" rx="4" fill="#27303d"/><rect x="0" y="0" width="${safe(balance.upPct.toFixed(3))}" height="8" rx="4" fill="#20c997"/><rect x="${safe(balance.upPct.toFixed(3))}" y="0" width="${safe(balance.downPct.toFixed(3))}" height="8" rx="4" fill="#f04f5f"/></svg><small>${safe(evidenceNote)}</small></div>`;
+  }).join('');
+  return `<div class="analysis-balance"><div class="analysis-balance-title"><b>Încrederea analizei acum</b><span>balanță relativă a dovezilor, nu probabilitate de câștig</span></div><div class="balance-grid">${cards}</div></div>`;
+}
+
 function linePath(values, field, x, y) {
   const points = values.map((item, index) => Number.isFinite(item[field]) ? `${x(index).toFixed(2)},${y(item[field]).toFixed(2)}` : null).filter(Boolean);
   return points.length > 1 ? points.join(' ') : '';
@@ -102,10 +147,16 @@ function marketChart(symbol, result, timeframe, ticker) {
   const ema20 = linePath(candles, 'ema20', x, y);
   const ema50 = linePath(candles, 'ema50', x, y);
   const lastCandle = candles[candles.length - 1];
+  const rangeHigh = chart.overlay && chart.overlay.rangeHigh;
+  const rangeLow = chart.overlay && chart.overlay.rangeLow;
+  const hasRangeHigh = Number.isFinite(rangeHigh);
+  const hasRangeLow = Number.isFinite(rangeLow);
   const liveLine = Number.isFinite(livePrice) ? `<line x1="${left}" y1="${y(livePrice).toFixed(2)}" x2="${width - right}" y2="${y(livePrice).toFixed(2)}" stroke="#f5f7ff" stroke-width="1" stroke-dasharray="4 3"/><rect x="${width - right + 2}" y="${(y(livePrice) - 9).toFixed(2)}" width="64" height="18" rx="3" fill="#f5f7ff"/><text x="${width - right + 34}" y="${(y(livePrice) + 4).toFixed(2)}" text-anchor="middle" fill="#0d1117" font-size="10" font-weight="700">${safe(formatPrice(livePrice))}</text>` : '';
-  const rangeLines = chart.overlay ? `<line x1="${left}" y1="${y(chart.overlay.rangeHigh).toFixed(2)}" x2="${width - right}" y2="${y(chart.overlay.rangeHigh).toFixed(2)}" stroke="#6b7483" stroke-dasharray="2 4"/><line x1="${left}" y1="${y(chart.overlay.rangeLow).toFixed(2)}" x2="${width - right}" y2="${y(chart.overlay.rangeLow).toFixed(2)}" stroke="#6b7483" stroke-dasharray="2 4"/>` : '';
+  const rangeLines = `${hasRangeHigh ? `<line x1="${left}" y1="${y(rangeHigh).toFixed(2)}" x2="${width - right}" y2="${y(rangeHigh).toFixed(2)}" stroke="#8a94a3" stroke-width="1" stroke-dasharray="3 4"/>` : ''}${hasRangeLow ? `<line x1="${left}" y1="${y(rangeLow).toFixed(2)}" x2="${width - right}" y2="${y(rangeLow).toFixed(2)}" stroke="#8a94a3" stroke-width="1" stroke-dasharray="3 4"/>` : ''}`;
+  const rangeLabels = `${hasRangeHigh ? `<text x="${width - right - 4}" y="${Math.max(top + 10, y(rangeHigh) - 4).toFixed(2)}" text-anchor="end" fill="#aab3c0" font-size="9" font-weight="700">MAX50 ${safe(formatPrice(rangeHigh))}</text>` : ''}${hasRangeLow ? `<text x="${width - right - 4}" y="${Math.min(priceBottom - 4, y(rangeLow) + 11).toFixed(2)}" text-anchor="end" fill="#aab3c0" font-size="9" font-weight="700">MIN50 ${safe(formatPrice(rangeLow))}</text>` : ''}`;
   const badges = analysis ? `<div class="analysis-strip"><span class="${safe(directionClass(analysis.trend))}">trend ${safe(analysis.trend)}</span><span class="${safe(directionClass(analysis.momentum))}">momentum ${safe(analysis.momentum)}</span><span class="${safe(directionClass(analysis.structure))}">structură ${safe(analysis.structure)}</span><span>regim ${safe(analysis.regime)}</span><span>RSI ${safe(formatNumber(analysis.rsi))}</span><span>ATR ${safe(formatNumber(analysis.atrPct, 3))}%</span><span>volum ${safe(formatNumber(analysis.volumeRatio))}x</span></div>` : '';
-  return `<div class="pro-chart">${badges}<div class="chart-legend"><span class="legend-live">preț live 1s</span><span class="legend-e9">EMA9</span><span class="legend-e20">EMA20</span><span class="legend-e50">EMA50</span><span class="legend-volume">volum</span></div><svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${safe(`${symbol} ${timeframe} candles MEXC și preț live`)}">${rangeLines}${ema50 ? `<polyline points="${safe(ema50)}" fill="none" stroke="#b14bff" stroke-width="1.2"/>` : ''}${ema20 ? `<polyline points="${safe(ema20)}" fill="none" stroke="#4cc9f0" stroke-width="1.2"/>` : ''}${ema9 ? `<polyline points="${safe(ema9)}" fill="none" stroke="#ffd166" stroke-width="1.2"/>` : ''}${bars}${liveLine}<text x="${left}" y="356" fill="#77808f" font-size="9">${safe(formatTime(candles[0].openTime))}</text><text x="${width - right}" y="356" text-anchor="end" fill="#77808f" font-size="9">close ${safe(formatTime(lastCandle.closeTime))}</text></svg><div class="chart-foot">90 din ${safe(chart.analysisCount || allCandles.length)} lumânări închise · linia albă este prețul live separat · ultim close ${safe(formatPrice(lastCandle.close))}</div></div>`;
+  const technicalLegend = `<div class="chart-legend"><span class="legend-live">preț live 1s</span><span class="legend-e9">EMA9 ${safe(formatPrice(lastCandle.ema9))}</span><span class="legend-e20">EMA20 ${safe(formatPrice(lastCandle.ema20))}</span><span class="legend-e50">EMA50 ${safe(formatPrice(lastCandle.ema50))}</span>${hasRangeHigh ? `<span class="legend-range">MAX50 ${safe(formatPrice(rangeHigh))}</span>` : ''}${hasRangeLow ? `<span class="legend-range">MIN50 ${safe(formatPrice(rangeLow))}</span>` : ''}<span class="legend-volume">volum</span></div>`;
+  return `<div class="pro-chart">${badges}${technicalLegend}<svg viewBox="0 0 ${width} ${height}" role="img" aria-label="${safe(`${symbol} ${timeframe}: lumânări MEXC, EMA9, EMA20, EMA50 și extremele ultimelor 50 de lumânări`)}">${rangeLines}${ema50 ? `<polyline points="${safe(ema50)}" fill="none" stroke="#b14bff" stroke-width="1.2"/>` : ''}${ema20 ? `<polyline points="${safe(ema20)}" fill="none" stroke="#4cc9f0" stroke-width="1.2"/>` : ''}${ema9 ? `<polyline points="${safe(ema9)}" fill="none" stroke="#ffd166" stroke-width="1.2"/>` : ''}${bars}${rangeLabels}${liveLine}<text x="${left}" y="356" fill="#77808f" font-size="9">${safe(formatTime(candles[0].openTime))}</text><text x="${width - right}" y="356" text-anchor="end" fill="#77808f" font-size="9">close ${safe(formatTime(lastCandle.closeTime))}</text></svg><div class="chart-foot">90 din ${safe(chart.analysisCount || allCandles.length)} lumânări închise · EMA din istoricul complet · MAX50/MIN50 sunt extreme tehnice, nu suport/rezistență garantată · linia albă este prețul live</div></div>`;
 }
 
 function renderMarkets() {
@@ -120,8 +171,8 @@ function renderMarkets() {
     const ticker = observedTicker && age <= 3_000 ? observedTicker : null;
     const change = ticker && Number(ticker.priceChangePercent);
     const changeClass = change > 0 ? 'UP' : change < 0 ? 'DOWN' : 'NEUTRAL';
-    const tabs = ['1m', '5m', '15m'].map((interval) => `<button class="tf-button ${interval === timeframe ? 'active' : ''}" data-symbol="${safe(symbol)}" data-timeframe="${safe(interval)}">${safe(interval)}</button>`).join('');
-    return `<article class="market-card"><div class="market-head"><div><h3>${safe(symbol.replace('USDT', '/USDT'))}</h3><div class="live-price">${safe(formatPrice(ticker && ticker.lastPrice))} <span class="${safe(changeClass)}">${Number.isFinite(change) ? `${change >= 0 ? '+' : ''}${formatNumber(change, 2)}%` : '—'}</span></div></div><div class="ticker-meta"><span>bid ${safe(formatPrice(ticker && ticker.bidPrice))}</span><span>ask ${safe(formatPrice(ticker && ticker.askPrice))}</span><span>spread ${safe(formatNumber(ticker && ticker.spreadBps, 3))} bps</span><span class="${ticker && age <= 3_000 ? 'fresh' : 'stale'}">${ticker ? `update ${formatAge(age)} · RTT ${ticker.latencyMs}ms` : 'preț indisponibil'}</span></div></div><div class="tf-tabs" role="tablist" aria-label="Interval grafic ${safe(symbol)}">${tabs}</div>${marketChart(symbol, result, timeframe, ticker)}</article>`;
+    const tabs = ['1m', '5m', '15m', '30m', '60m'].map((interval) => `<button class="tf-button ${interval === timeframe ? 'active' : ''}" data-symbol="${safe(symbol)}" data-timeframe="${safe(interval)}">${safe(interval)}</button>`).join('');
+    return `<article class="market-card"><div class="market-head"><div><h3>${safe(symbol.replace('USDT', '/USDT'))}</h3><div class="live-price">${safe(formatPrice(ticker && ticker.lastPrice))} <span class="${safe(changeClass)}">${Number.isFinite(change) ? `${change >= 0 ? '+' : ''}${formatNumber(change, 2)}%` : '—'}</span></div></div><div class="ticker-meta"><span>bid ${safe(formatPrice(ticker && ticker.bidPrice))}</span><span>ask ${safe(formatPrice(ticker && ticker.askPrice))}</span><span>spread ${safe(formatNumber(ticker && ticker.spreadBps, 3))} bps</span><span class="${ticker && age <= 3_000 ? 'fresh' : 'stale'}">${ticker ? `update ${formatAge(age)} · RTT ${ticker.latencyMs}ms` : 'preț indisponibil'}</span></div></div>${analysisBalancePanel(result)}<div class="chart-controls-label"><b>Interval lumânări afișat:</b><span>separat de orizontul deciziei de mai sus</span></div><div class="tf-tabs" role="tablist" aria-label="Interval lumânări pentru graficul ${safe(symbol)}">${tabs}</div>${marketChart(symbol, result, timeframe, ticker)}</article>`;
   }).join('');
 }
 
@@ -164,7 +215,11 @@ function decisionCard(symbol, prediction) {
   const reasons = (prediction.reasonCodes || []).slice(0, 5).map((reason) => `<span class="reason">${safe(reason)}</span>`).join('');
   const frameRows = (prediction.frameBiases || []).map((frame) => `<span class="frame-chip ${safe(directionClass(frame.dominant))}">${safe(frame.timeframe)} ${safe(frame.state)} · ${safe(frame.up)}:${safe(frame.down)}</span>`).join('');
   const learning = prediction.localLearning;
-  return `<article class="decision-card ${safe(visual)}"><div class="decision-top"><div><span class="symbol-label">${safe(symbol)}</span><h3>${safe(prediction.horizonMin)} minute</h3></div><span class="quality-ring">${safe(prediction.quality)}<small>/100</small></span></div><div class="decision-verdict ${safe(visual)}">${safe(title)}</div><p class="protocol">${safe(prediction.protocol)}</p><div class="frame-row">${frameRows}</div><div class="reason-codes">${reasons}</div><div class="decision-facts"><span>Bias <b class="${safe(directionClass(prediction.bias))}">${safe(prediction.bias)}</b></span><span>UP ${safe(formatNumber(prediction.directionScores && prediction.directionScores.up))} / DOWN ${safe(formatNumber(prediction.directionScores && prediction.directionScores.down))}</span><span>Trigger: ${safe(trigger)}</span><span>${safe(probabilityText(prediction))}</span></div>${localLearningBlock(learning)}<details class="audit"><summary>Audit complet al deciziei</summary><div class="audit-grid"><b>Execuție</b><span>${safe((prediction.executionTimeframes || []).join(' + '))}</span><b>Context</b><span>${safe((prediction.contextTimeframes || []).join(' + '))}</span><b>Confirmări</b><span>${safe((prediction.confirmations || []).join(', ') || '—')}</span><b>Dovezi</b><span>${compactList(prediction.evidence)}</span><b>Conflicte</b><span>${compactList(prediction.conflicts, 'niciun conflict explicit')}</span><b>Invalidare</b><span>${safe(prediction.invalidation)}</span><b>Entry</b><span>${safe(formatTime(prediction.entryBoundaryOpenTime))}</span><b>Expiry</b><span>${safe(formatTime(prediction.expiryEstimateCloseTime))}</span><b>Porți</b><span>${gatesTable(prediction.gateChecks)}</span><b>Signal key</b><span>${safe(prediction.signalKey || '—')}</span></div></details></article>`;
+  const balance = analysisBalance(prediction);
+  const balanceText = balance
+    ? `Balanță analiză: UP ${formatNumber(balance.upPct, 1)}% / DOWN ${formatNumber(balance.downPct, 1)}% (${balance.label.toLowerCase()})`
+    : 'Balanță analiză indisponibilă';
+  return `<article class="decision-card ${safe(visual)}"><div class="decision-top"><div><span class="symbol-label">${safe(symbol)}</span><h3>${safe(prediction.horizonMin)} minute</h3></div><span class="quality-ring">${safe(prediction.quality)}<small>/100</small></span></div><div class="decision-verdict ${safe(visual)}">${safe(title)}</div><p class="protocol">${safe(prediction.protocol)}</p><div class="frame-row">${frameRows}</div><div class="reason-codes">${reasons}</div><div class="decision-facts"><span>Bias <b class="${safe(directionClass(prediction.bias))}">${safe(prediction.bias)}</b></span><span>${safe(balanceText)} · scor relativ, nu probabilitate WIN</span><span>Trigger: ${safe(trigger)}</span><span>${safe(probabilityText(prediction))}</span></div>${localLearningBlock(learning)}<details class="audit"><summary>Audit complet al deciziei</summary><div class="audit-grid"><b>Execuție</b><span>${safe((prediction.executionTimeframes || []).join(' + '))}</span><b>Context</b><span>${safe((prediction.contextTimeframes || []).join(' + '))}</span><b>Confirmări</b><span>${safe((prediction.confirmations || []).join(', ') || '—')}</span><b>Dovezi</b><span>${compactList(prediction.evidence)}</span><b>Conflicte</b><span>${compactList(prediction.conflicts, 'niciun conflict explicit')}</span><b>Invalidare</b><span>${safe(prediction.invalidation)}</span><b>Entry</b><span>${safe(formatTime(prediction.entryBoundaryOpenTime))}</span><b>Expiry</b><span>${safe(formatTime(prediction.expiryEstimateCloseTime))}</span><b>Porți</b><span>${gatesTable(prediction.gateChecks)}</span><b>Signal key</b><span>${safe(prediction.signalKey || '—')}</span></div></details></article>`;
 }
 
 function renderDecisions() {
