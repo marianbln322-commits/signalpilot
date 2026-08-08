@@ -121,6 +121,36 @@ ETHUSDT</textarea>
               <small class="muted">Are nevoie de minim ~10 semnale per tipar înainte să acționeze.</small>
             </div>
         </div>
+        <div class="grid" style="margin-top:12px">
+            <div class="field">
+              <label>💰 Capital de tranzacționare (USDT)</label>
+              <input type="number" id="bankroll" min="1" step="10" value="1000" />
+              <label>Fracțiune Kelly (0.25 = un sfert)</label>
+              <input type="number" id="kellyFractionMultiplier" min="0.05" max="1" step="0.05" value="0.25" />
+              <small class="muted">Miza crește cu edge-ul măsurat. Se calculează din probabilitatea <b>prudentă</b>, nu din cea optimistă, apoi se înmulțește cu această fracțiune. Kelly integral maximizează creșterea doar dacă probabilitatea e exactă — nu e niciodată, iar supralicitarea duce la ruină. Un sfert de Kelly e practica standard.</small>
+            </div>
+            <div class="field">
+              <label>Plafon absolut per poziție (% din capital)</label>
+              <input type="number" id="maxStakePct" min="0.5" max="25" step="0.5" value="5" />
+              <small class="muted">Un contract binar nu se poate închide în pierdere parțială — nu există stop-loss. Oricât ar sugera formula, miza nu trece peste acest plafon.</small>
+              <label>Timp maxim de intrare după închiderea barei (secunde)</label>
+              <input type="number" id="maxEntryDelaySec" min="10" max="600" step="10" value="90" />
+              <small class="muted">Semnalul descrie bara care s-a închis. Intrarea 5 minute mai târziu e alt trade: orizont efectiv mai scurt și alt preț de intrare. După acest interval, semnalul expiră.</small>
+            </div>
+        </div>
+        <div class="grid" style="margin-top:12px">
+            <div class="field">
+              <label class="switch-inline"><input type="checkbox" id="requireEvGate" checked /> <b>🚦 Poarta EV</b> — nu alerta decât dacă probabilitatea calibrată bate pragul impus de payout</label>
+              <small class="muted">Pentru un contract binar, direcția nu e suficientă. Cu payout de 65% ai nevoie de 60.6% ca să fii pe zero; cu 82%, de 54.9%. Poarta compară <b>limita inferioară</b> a intervalului de încredere cu acest prag, nu estimarea optimistă — de asta refuză un 56% obținut din 25 de mostre.</small>
+            </div>
+            <div class="field">
+              <label>Marjă cerută peste pragul de rentabilitate (%)</label>
+              <input type="number" id="evMarginPct" min="0" max="15" step="0.5" value="1.5" />
+              <label>Rezultate minime per tipar înainte să am încredere</label>
+              <input type="number" id="calibrationMinSample" min="10" max="500" value="30" />
+              <small class="muted">Mai mic = alertează mai repede, dar pe statistici mai fragile.</small>
+            </div>
+        </div>
         <hr />
         <div class="grid">
           <div class="field">
@@ -147,9 +177,34 @@ ETHUSDT</textarea>
       </div>
     </section>
 
+    <!-- DIAGNOSTICS -->
+    <section class="panel">
+      <div class="panel-head">
+        <h2>🩺 Diagnostic — de ce văd / nu văd semnale</h2>
+        <button id="runDiagnose" class="btn-ghost">Verifică acum</button>
+      </div>
+      <div id="diagHeadline" class="diag-headline muted">apasă „Verifică acum"</div>
+      <div id="diagBody"></div>
+    </section>
+
+    <!-- CALIBRATION -->
+    <section class="panel">
+      <div class="panel-head"><h2>🎚️ Calibrare (obligatorie înainte de primul semnal)</h2></div>
+      <p class="muted" style="margin-top:-6px">
+        Aplicația nu îți dă o probabilitate până nu o măsoară. Calibrarea rulează motorul pe istoric și învață, pentru fiecare setup și fereastră, în ce procent din cazuri a ieșit bine. Fără asta, banner-ul va spune <b>„FĂRĂ DATE — nu intra”</b>, ceea ce e comportamentul corect: un scor de confluență (ex. „net 6.19”) nu este o probabilitate.
+      </p>
+      <div class="backtest-controls">
+        <button id="runCalibration" class="btn-primary">Calibrează pe ultimele 30 de zile</button>
+        <span id="calStatus" class="muted"></span>
+      </div>
+    </section>
+
     <!-- BACKTEST -->
     <section class="panel">
-      <div class="panel-head"><h2>Backtest (win-rate real pe istoric)</h2></div>
+      <div class="panel-head"><h2>Backtest (out-of-sample, cu baseline și marjă de eroare)</h2></div>
+      <p class="muted" style="margin-top:-6px">
+        Calibrarea se face pe o felie mai veche, iar scorul se dă pe una mai nouă, neatinsă. Se raportează și ce a obținut „mereu UP” pe exact aceleași bare, plus un test statistic față de o monedă aruncată. Dacă motorul nu bate clar aceste repere, nu are edge — indiferent cât de bine arată win-rate-ul general.
+      </p>
       <div class="backtest-controls">
         <select id="btSymbol"></select>
         <select id="btDays">

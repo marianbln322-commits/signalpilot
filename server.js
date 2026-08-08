@@ -2,13 +2,23 @@
 
 // ============================================================================
 // SignalPilot server — always-on local app (PinPilot style).
-// Serves the UI at http://localhost:3005, polls MEXC, runs the engine on a
+// Serves the UI at http://localhost:3011, polls MEXC, runs the engine on a
 // scheduler, pushes live updates over SSE, and alerts on good setups.
 // ============================================================================
 
 const path = require('path');
 const fs = require('fs');
 const { exec } = require('child_process');
+// Fail with a readable message instead of a cryptic "fetch is not defined" crash
+// deep inside a request. The exchange clients rely on the global fetch API, which
+// only exists from Node 18 onwards.
+const NODE_MAJOR = Number(process.versions.node.split('.')[0]);
+if (NODE_MAJOR < 18) {
+  console.error(`\n  Ai Node.js v${process.versions.node}, dar aplicația are nevoie de v18 sau mai nou.`);
+  console.error('  Descarcă versiunea LTS de pe https://nodejs.org apoi pornește din nou.\n');
+  process.exit(1);
+}
+
 const express = require('express');
 
 function openBrowser(url) {
@@ -25,11 +35,15 @@ const backtest = require('./lib/backtest');
 const journal = require('./lib/journal');
 const orderflow = require('./lib/orderflow');
 const learning = require('./lib/learning');
+const cal = require('./lib/calibration');
+const sizing = require('./lib/sizing');
+const { PriceTape } = require('./lib/priceTape');
 
-// Port 3005 by default so it runs alongside PinPilot (3004) and older
-// SignalPilot versions (3001/3002). Override with the PORT env var if needed.
-const PORT = process.env.PORT || 3005;
+// Port 3011 by default so it runs alongside PinPilot (3004) and older
+// SignalPilot versions (3001/3002/3005). Override with the PORT env var if needed.
+const PORT = process.env.PORT || 3011;
 const CONFIG_PATH = path.join(__dirname, 'config.json');
+const CALIBRATION_PATH = path.join(__dirname, 'calibration.json');
 const DEFAULT_CONFIG = {
   symbols: ['BTCUSDT', 'ETHUSDT'],
   scanIntervalSec: 8,
@@ -48,7 +62,37 @@ const DEFAULT_CONFIG = {
   adaptiveInterval: false,
   payout10: 65,          // current MEXC payout % for 10-min contracts (user updates)
   payout30: 82,          // current MEXC payout % for 30-min contracts
-  fallbackWinRate: 55,   // assumed win-rate when the journal has too few samples yet (sniper OOS ~55%)
+  // Event-futures EV gate. A signal is only actionable when its CALIBRATED
+  // probability clears the break-even imposed by the payout, with a cushion.
+  // Break-even = 1/(1+payout): 65% payout needs 60.6%, 82% payout needs 54.9%.
+  requireEvGate: true,   // never alert on a signal whose EV is not provably positive
+  evMarginPct: 1.5,      // required cushion above break-even
+  calibrationMinSample: 30, // resolved outcomes needed before a bucket is trusted
+
+  // Observation mode. Before any calibration exists, the EV gate blocks every
+  // alert — correct, but it makes the app look dead and indistinguishable from
+  // broken. With this on, uncalibrated signals are still surfaced, explicitly
+  // labelled as OBSERVATION rather than as a recommendation, so the engine's work
+  // is visible while the journal fills up. It never invents a probability.
+  observationMode: true,
+
+  // Position sizing. Stakes are derived from the measured edge via fractional
+  // Kelly on the CONSERVATIVE probability, then hard-capped. See lib/sizing.js.
+  bankroll: 1000,
+  kellyFractionMultiplier: 0.25,
+  maxStakePct: 5,
+  minStakePct: 0.5,
+
+  // Entry window. A verdict is computed at bar close; entering several minutes
+  // later is a materially different trade (shorter effective horizon, different
+  // entry price), so a stale signal is not actionable.
+  maxEntryDelaySec: 90,
+
+  // Settlement. MEXC determines Up/Down settlement from a composite index with a
+  // time-weighted average, so outcomes are graded on a TWAP over the final
+  // seconds rather than a single tick.
+  settlementTwapSec: 30,
+  priceSampleSec: 3,
   // Live order flow (order book + trade aggression). Confirms/vetoes direction.
   useOrderFlow: true,
   requireOfAgree: false, // if true, only alert when order flow does NOT conflict
@@ -61,9 +105,91 @@ const DEFAULT_CONFIG = {
 const CONF_RANK = { Scăzut: 1, Mediu: 2, Ridicat: 3 };
 
 let config = loadConfig();
+let calModel = loadCalibration();
 const latest = {};          // symbol -> last verdict
 const alerts = [];          // recent alert feed
 const sseClients = new Set();
+// (symbol -> barCloseTime) of the last bar we already acted on. The engine now
+// produces one verdict per CLOSED bar, so alerting is keyed to the bar rather
+// than to the poll: previously the same bar was re-evaluated every 8 seconds.
+const lastActedBar = {};
+let scanning = false;       // re-entrancy guard for the scheduler
+// Rolling price tape, sampled independently of the scan loop, so settlement can
+// use a time-weighted average over the final seconds of a contract window.
+const tape = new PriceTape();
+
+// Rolling diagnostics. An app that shows nothing is indistinguishable from an app
+// that is broken, so it has to be able to explain its own silence: what it saw,
+// and which filter stopped it.
+const diag = {
+  startedAt: Date.now(),
+  scans: 0,
+  fetchErrors: 0,
+  lastFetchError: null,
+  lastScanAt: null,
+  verdicts: { UP: 0, DOWN: 0, NEUTRU: 0 },
+  suppressions: {},   // reason -> count
+  alertsFired: 0,
+  observations: 0,
+  recentBars: [],     // last 40 bar-level outcomes, for the UI timeline
+};
+
+function noteSuppression(reason) {
+  // Collapse to a short key so the counter stays readable.
+  const key = String(reason || 'necunoscut').split(':')[0].slice(0, 70);
+  diag.suppressions[key] = (diag.suppressions[key] || 0) + 1;
+}
+
+function loadCalibration() {
+  try {
+    if (fs.existsSync(CALIBRATION_PATH)) {
+      const m = JSON.parse(fs.readFileSync(CALIBRATION_PATH, 'utf8'));
+      console.log(`Calibration loaded: ${m.total} rezultate, fitted ${new Date(m.fittedAt).toISOString()}`);
+      return m;
+    }
+  } catch (e) {
+    console.error('Calibration read error:', e.message);
+  }
+  return null;
+}
+
+function saveCalibration(model) {
+  try {
+    fs.writeFileSync(CALIBRATION_PATH, JSON.stringify(model, null, 2));
+  } catch (e) {
+    console.error('Calibration write error:', e.message);
+  }
+}
+
+// The live probability model blends two sources, preferring the user's own
+// resolved journal once it is large enough, and falling back to the calibration
+// fitted from historical backtest. If neither has enough data, we report that
+// honestly instead of printing an invented number.
+function buildLivePrediction(verdict) {
+  const ctx = { setup: verdict.setup, interval: verdict.interval, score: verdict.score };
+  const journalSamples = journal.all()
+    .filter((e) => e.status === 'resolved' && e.setup && e.interval)
+    .map((e) => ({ setup: e.setup, interval: e.interval, score: e.score, win: e.win }));
+
+  if (journalSamples.length >= (config.calibrationMinSample || 30)) {
+    const live = cal.fit(journalSamples, { minSample: config.calibrationMinSample });
+    const p = cal.predict(live, ctx);
+    if (p.ready) return { ...p, origin: 'jurnalul tău (forward-test real)' };
+  }
+  if (calModel) {
+    const p = cal.predict(calModel, ctx);
+    if (p.ready) return { ...p, origin: 'backtest istoric (calibrare)' };
+  }
+  return {
+    ready: false,
+    probability: null,
+    ciLow: null,
+    ciHigh: null,
+    n: journalSamples.length,
+    source: `nicio calibrare cu suficiente date (am ${journalSamples.length} rezultate, nevoie de ${config.calibrationMinSample || 30})`,
+    origin: null,
+  };
+}
 
 function loadConfig() {
   try {
@@ -97,43 +223,85 @@ async function scanSymbol(symbol) {
   const verdict = engine.decide(mtf);
   verdict.symbol = symbol;
 
-  // Interval = the setup's NATURAL window (fast momentum like sweeps -> 10 min,
-  // structural setups -> 30 min). Payout/EV is shown as INFO, and only used to
-  // adapt 10 -> 30 when adaptiveInterval is ON and the 10-min payout is poor.
-  // This keeps BOTH 10-min and 30-min signals instead of forcing everything 30.
+  // ---- Event-futures decision layer ----------------------------------------
+  // The window comes from the primary trigger (engine). What we add here is the
+  // only question that decides whether the trade is worth taking at all:
+  // does the CALIBRATED probability clear the break-even imposed by the payout?
+  //
+  // The previous version answered this by assuming a 55% win rate whenever the
+  // journal was thin (`fallbackWinRate`), then printing a confident EV computed
+  // from that assumption. That is a fabricated number driving a money decision,
+  // so it is gone. If there is no calibration data, the app now says so.
   if (verdict.directie !== 'NEUTRU') {
-    const ji = journal.recentByInterval(20);
-    const wr10 = (ji.tenMin.n >= 8 && ji.tenMin.winRate != null) ? ji.tenMin.winRate : config.fallbackWinRate;
-    const wr30 = (ji.thirtyMin.n >= 8 && ji.thirtyMin.winRate != null) ? ji.thirtyMin.winRate : config.fallbackWinRate;
-    const p10 = config.payout10 / 100;
-    const p30 = config.payout30 / 100;
-    const evOf = (wr, p) => (wr / 100) * p - (1 - wr / 100); // per $1 staked
-    const ev10 = evOf(wr10, p10);
-    const ev30 = evOf(wr30, p30);
-    const breakEven = (p) => +(100 / (1 + p)).toFixed(1);
+    const payoutFor = (iv) => (iv === '10 minute' ? config.payout10 : config.payout30);
 
-    const natural = verdict.interval; // set by engine from setup type
-    let chosen = natural;
-    // Optional trader-style adaptation: only nudge 10 -> 30 when 10-min EV is
-    // negative but 30-min is meaningfully better. Off by default.
-    if (config.adaptiveInterval && natural === '10 minute' && ev10 < 0 && ev30 > ev10) {
-      chosen = '30 minute';
-      verdict.intervalAdapted = { from: '10 minute', reason: `payout 10 min slab (EV ${(ev10 * 100).toFixed(1)}%) → 30 min` };
-    }
-    verdict.interval = chosen;
+    const prediction = buildLivePrediction(verdict);
+    verdict.prediction = prediction;
 
-    const chosenEv = chosen === '30 minute' ? ev30 : ev10;
+    const gate = cal.decide(prediction, payoutFor(verdict.interval), { marginPct: config.evMarginPct });
+    verdict.gate = gate;
+
+    // Compare both windows explicitly so the trader can see the trade-off.
+    const alt = verdict.interval === '10 minute' ? '30 minute' : '10 minute';
+    const altPrediction = buildLivePrediction({ ...verdict, interval: alt });
+    const altGate = cal.decide(altPrediction, payoutFor(alt), { marginPct: config.evMarginPct });
+
     verdict.ev = {
       payout10: config.payout10,
       payout30: config.payout30,
-      breakEven10: breakEven(p10),
-      breakEven30: breakEven(p30),
-      wr10,
-      wr30,
-      ev10: +(ev10 * 100).toFixed(1),
-      ev30: +(ev30 * 100).toFixed(1),
-      chosen,
-      positive: chosenEv > 0,
+      breakEven10: cal.breakEvenWinRate(config.payout10),
+      breakEven30: cal.breakEvenWinRate(config.payout30),
+      chosen: verdict.interval,
+      probability: prediction.probability,
+      probabilitySource: prediction.origin,
+      conservative: gate.conservative,
+      required: gate.required,
+      ev: gate.ev,
+      positive: gate.trade,
+      alternative: {
+        interval: alt,
+        probability: altPrediction.probability,
+        ev: altGate.ev,
+        trade: altGate.trade,
+      },
+    };
+
+    // Optional: switch to the other window when it is the one with positive EV.
+    if (config.adaptiveInterval && !gate.trade && altGate.trade) {
+      verdict.intervalAdapted = {
+        from: verdict.interval,
+        reason: `EV pozitiv doar pe ${alt} la payout-urile curente`,
+      };
+      verdict.interval = alt;
+      verdict.prediction = altPrediction;
+      verdict.gate = altGate;
+      verdict.ev.chosen = alt;
+    }
+
+    // ---- Position sizing --------------------------------------------------
+    // Bigger edge -> bigger stake, but derived from the conservative probability
+    // and shrunk by how many outcomes it rests on. See lib/sizing.js for why the
+    // cap matters: a binary contract has no partial exit.
+    verdict.sizing = sizing.recommend(verdict.gate, payoutFor(verdict.interval), {
+      bankroll: config.bankroll,
+      kellyFractionMultiplier: config.kellyFractionMultiplier,
+      maxStakePct: config.maxStakePct,
+      minStakePct: config.minStakePct,
+    });
+
+    // ---- Entry window -----------------------------------------------------
+    // The verdict describes the bar that just closed. Acting on it 6 minutes
+    // later is a different trade: the effective horizon is shorter and the entry
+    // price has moved. Signals therefore expire.
+    const closeTs = verdict.barCloseTime || verdict.ts;
+    const deadlineTs = closeTs + config.maxEntryDelaySec * 1000;
+    const secondsLeft = Math.round((deadlineTs - Date.now()) / 1000);
+    verdict.entryWindow = {
+      barCloseTime: closeTs,
+      deadlineTs,
+      secondsLeft,
+      stale: secondsLeft <= 0,
+      maxEntryDelaySec: config.maxEntryDelaySec,
     };
   }
 
@@ -148,12 +316,18 @@ async function scanSymbol(symbol) {
     }
   }
 
-  // Sniper eligibility (uses live UTC hour).
-  const hourUTC = new Date().getUTCHours();
+  // Sniper eligibility. Hour is taken from the BAR, not from wall-clock time, so
+  // the same bar is always judged against the same session window.
+  const hourUTC = verdict.barCloseTime
+    ? new Date(verdict.barCloseTime).getUTCHours()
+    : new Date().getUTCHours();
   verdict.sniper = engine.sniperEligibility(verdict, hourUTC, config.activeHoursUTC, config.sniperRequireVolume);
+  verdict.hourUTC = hourUTC;
 
-  // Primary setup category (for learning + display).
-  verdict.setup = primarySetup(verdict);
+  // NOTE: verdict.setup now comes from the engine's single trigger taxonomy
+  // (lib/engine.js TRIGGERS), so the live app, the journal and the backtest all
+  // agree on what "the setup" is. It used to be re-derived here from a separate
+  // copy of a regex that had drifted out of sync.
 
   // Live order flow (what a scalper reads): confirms or vetoes direction.
   if (config.useOrderFlow) {
@@ -183,41 +357,79 @@ async function scanSymbol(symbol) {
   // trade journal display.
   if (config.useLearning && verdict.directie !== 'NEUTRU') {
     try {
-      const c5 = mtf['5m'];
-      const candleOpen = c5[c5.length - 1].openTime;
       journal.record({
         observation: true,
-        candleOpen,
+        candleOpen: verdict.barOpenTime,
         symbol,
         directie: verdict.directie,
         interval: verdict.interval,
         incredere: verdict.incredere,
+        score: verdict.score,
         sniper: false,
         setup: verdict.setup,
         hourUTC,
         ofState: verdict.orderflow ? verdict.orderflow.state : null,
         ofAgree: verdict.ofAgree,
         price: verdict.price,
-        ts: verdict.ts,
+        // Anchor the outcome window to the BAR CLOSE, which is when the signal
+        // became actionable, rather than to the moment we happened to poll.
+        ts: verdict.barCloseTime || verdict.ts,
       });
     } catch { /* non-fatal */ }
   }
 
-  const prev = latest[symbol];
   latest[symbol] = verdict;
   broadcast('signal', verdict);
 
-  // Alert logic depends on mode.
+  // ---- Alerting: exactly once per closed bar --------------------------------
+  // Verdicts are now deterministic per (symbol, barCloseTime). The old logic
+  // compared each poll against the previous poll, so a bar could alert, stop
+  // alerting and alert again as the forming candle wobbled.
+  const barKey = verdict.barCloseTime;
+  const alreadyActed = barKey != null && lastActedBar[symbol] === barKey;
+
   let shouldAlert;
   if (config.sniperMode) {
-    // Only the A+ setup fires an alert.
-    const wasEligible = prev && prev.sniper && prev.sniper.eligible;
-    shouldAlert = verdict.sniper.eligible && (!wasEligible || prev.directie !== verdict.directie);
+    shouldAlert = verdict.sniper.eligible && !alreadyActed;
   } else {
-    const meetsConf = verdict.directie !== 'NEUTRU' &&
-      CONF_RANK[verdict.incredere] >= CONF_RANK[config.alertMinConfidence];
-    const changed = !prev || prev.directie !== verdict.directie || prev.incredere !== verdict.incredere;
-    shouldAlert = meetsConf && changed;
+    shouldAlert = verdict.directie !== 'NEUTRU' &&
+      CONF_RANK[verdict.incredere] >= CONF_RANK[config.alertMinConfidence] &&
+      !alreadyActed;
+  }
+
+  // EV gate: for a binary contract, direction is not enough — the calibrated
+  // probability has to beat the break-even the payout imposes. This is the
+  // single most important filter for event futures, so it runs before the rest.
+  if (shouldAlert && config.requireEvGate) {
+    if (!verdict.gate || !verdict.gate.trade) {
+      const uncalibrated = verdict.gate && verdict.gate.needsData;
+      if (uncalibrated && config.observationMode) {
+        // Surface it, but never as a recommendation. The distinction is carried
+        // through to the UI and the alert feed.
+        verdict.observation = true;
+        verdict.observationNote = 'necalibrat — semnal afișat pentru observare, NU e recomandare de intrare';
+      } else {
+        shouldAlert = false;
+        verdict.suppressed = uncalibrated
+          ? `fără probabilitate calibrată: ${verdict.gate.reason}`
+          : `EV nefavorabil: ${verdict.gate ? verdict.gate.reason : 'necunoscut'}`;
+      }
+    }
+  }
+
+  // Staleness veto: never alert on a bar whose entry window has already passed
+  // (e.g. after the app was asleep, or a slow poll).
+  if (shouldAlert && verdict.entryWindow && verdict.entryWindow.stale) {
+    shouldAlert = false;
+    verdict.suppressed = `semnal expirat (bara s-a închis acum ${Math.round((Date.now() - verdict.entryWindow.barCloseTime) / 1000)}s, limita e ${config.maxEntryDelaySec}s)`;
+  }
+
+  // Sizing veto: if the measured edge is too small to justify a minimum stake,
+  // there is nothing to trade even though the direction may be right. Skipped in
+  // observation mode, where by definition there is no stake to compute.
+  if (shouldAlert && !verdict.observation && verdict.sizing && verdict.sizing.stake <= 0) {
+    shouldAlert = false;
+    verdict.suppressed = verdict.sizing.reason;
   }
 
   // Order-flow veto: optionally require live order flow to not contradict.
@@ -232,59 +444,102 @@ async function scanSymbol(symbol) {
     verdict.suppressed = `istoricul tău dă doar ${verdict.learned.estimate}% pe acest tipar`;
   }
 
+  // Record what happened on this bar, once per bar, for the diagnostics panel.
+  if (barKey != null && !alreadyActed) {
+    diag.verdicts[verdict.directie] = (diag.verdicts[verdict.directie] || 0) + 1;
+    if (verdict.suppressed) noteSuppression(verdict.suppressed);
+    else if (verdict.directie === 'NEUTRU') noteSuppression('motorul e NEUTRU (niciun declanșator valid)');
+    diag.recentBars.unshift({
+      symbol,
+      barCloseTime: verdict.barCloseTime,
+      directie: verdict.directie,
+      setup: verdict.setup,
+      interval: verdict.interval,
+      score: verdict.score,
+      alerted: shouldAlert,
+      observation: !!verdict.observation,
+      blocked: verdict.suppressed || null,
+    });
+    if (diag.recentBars.length > 40) diag.recentBars.pop();
+  }
+
   if (shouldAlert) {
+    if (barKey != null) lastActedBar[symbol] = barKey;
+    if (verdict.observation) diag.observations++; else diag.alertsFired++;
     const alert = {
       symbol,
       directie: verdict.directie,
       interval: verdict.interval,
       incredere: verdict.incredere,
+      setup: verdict.setup,
+      probability: verdict.prediction ? verdict.prediction.probability : null,
+      ev: verdict.gate ? verdict.gate.ev : null,
+      stake: verdict.sizing ? verdict.sizing.stake : null,
+      stakePct: verdict.sizing ? verdict.sizing.pctOfBankroll : null,
+      tier: verdict.sizing ? verdict.sizing.tier : null,
+      tierLabel: verdict.sizing ? verdict.sizing.tierLabel : null,
+      deadlineTs: verdict.entryWindow ? verdict.entryWindow.deadlineTs : null,
       price: verdict.price,
       justificare: verdict.justificare,
       sniper: !!(verdict.sniper && verdict.sniper.eligible),
+      observation: !!verdict.observation,
       ofState: verdict.orderflow ? verdict.orderflow.state : null,
       ofAgree: verdict.ofAgree || null,
-      ts: verdict.ts,
+      barCloseTime: verdict.barCloseTime,
+      ts: verdict.barCloseTime || verdict.ts,
     };
     alerts.unshift(alert);
     if (alerts.length > 50) alerts.pop();
     // Auto-journal every alert with rich context for the learning layer.
     const logged = journal.record({
       ...alert,
-      setup: verdict.setup,
+      score: verdict.score,
       hourUTC,
     });
     broadcast('alert', alert);
     if (logged) broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
-    console.log(`[ALERT${alert.sniper ? ' 🎯 SNIPER' : ''}] ${symbol}: ${verdict.directie} ${verdict.interval} (${verdict.incredere}) OF:${alert.ofAgree || '-'} @ ${verdict.price}`);
+    console.log(`[ALERT${alert.sniper ? ' 🎯' : ''}] ${symbol} ${verdict.directie} ${verdict.interval} · p=${alert.probability != null ? alert.probability + '%' : 'n/a'} EV=${alert.ev != null ? alert.ev + '%' : '?'} · miză ${alert.tierLabel} ${alert.stake} (${alert.stakePct}%) @ ${verdict.price}`);
   }
   return verdict;
 }
 
-// Categorize the primary trigger of a verdict into a setup label.
-function primarySetup(verdict) {
-  const sig = (verdict.signals || []).find((s) => /sweep|squeeze|structure shift|fvg|divergen|crossover|absorb|distribu|reversie|band/i.test(s.label));
-  if (!sig) return 'context';
-  const l = sig.label.toLowerCase();
-  if (l.includes('sweep')) return 'Liquidity Sweep';
-  if (l.includes('squeeze')) return 'Squeeze breakout';
-  if (l.includes('structure shift')) return 'Market Structure Shift';
-  if (l.includes('ifvg')) return 'Inversion FVG';
-  if (l.includes('fvg')) return 'FVG retest';
-  if (l.includes('divergen')) return 'RSI divergence';
-  if (l.includes('crossover')) return 'MACD crossover';
-  if (l.includes('absorb') || l.includes('distribu')) return 'Volume absorption';
-  if (l.includes('reversie') || l.includes('band')) return 'Bollinger bounce';
-  return 'context';
+// Settlement price for one entry: a time-weighted average over the final
+// `settlementTwapSec` before expiry, matching how MEXC states Up/Down contracts
+// are settled (composite index + TWAP). Falls back to a live tick only if the
+// tape has no samples in the window, and records which method was used so the
+// journal never silently mixes the two.
+async function settlePrice(symbol, resolveTs) {
+  const windowMs = config.settlementTwapSec * 1000;
+  const t = tape.twap(symbol, resolveTs - windowMs, resolveTs);
+  if (t && Number.isFinite(t.price)) return t;
+  try {
+    const p = await mexc.fetchPrice(symbol);
+    return { price: p, method: 'last-price-fallback', samples: 1 };
+  } catch {
+    return null;
+  }
+}
+
+// Independent price sampler feeding the tape. Kept separate from the scan loop
+// so settlement resolution does not depend on scan cadence or on scans succeeding.
+async function samplePrices() {
+  await Promise.all(config.symbols.map(async (sym) => {
+    try {
+      const p = await mexc.fetchPrice(sym);
+      tape.push(sym, p);
+    } catch { /* transient; next tick */ }
+  }));
 }
 
 // Background resolver: closes out pending journal entries automatically.
 async function resolveJournal() {
   try {
-    const resolved = await journal.resolvePending((sym) => mexc.fetchPrice(sym));
+    const resolved = await journal.resolvePending(settlePrice);
     if (resolved.length) {
       broadcast('journal', { stats: journal.stats(), recent: journal.recent(40), learning: learning.summary(journal.all()) });
       for (const r of resolved) {
-        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice}->${r.exitPrice} => ${r.win ? 'WIN' : 'LOSS'}`);
+        const m = r.settlement ? `${r.settlement.method}/${r.settlement.samples}` : '?';
+        console.log(`[RESOLVED] ${r.symbol} ${r.directie} ${r.entryPrice} -> ${Number(r.exitPrice).toFixed(4)} (${m}) => ${r.win ? 'WIN' : 'LOSS'}`);
       }
     }
   } catch (e) {
@@ -292,14 +547,29 @@ async function resolveJournal() {
   }
 }
 
+// Re-entrancy guard: scanAll is async but was driven by a bare setInterval, so
+// a slow round (3 klines + depth + aggTrades per symbol, plus an optional AI
+// call) could still be in flight when the next tick fired. Overlapping rounds
+// duplicate every request, which is the fastest way to earn an exchange rate
+// limit, and they can interleave writes to the journal.
 async function scanAll() {
-  for (const symbol of config.symbols) {
-    try {
-      await scanSymbol(symbol);
-    } catch (e) {
-      console.error(`Scan error ${symbol}:`, e.message);
-      broadcast('error', { symbol, message: e.message });
+  if (scanning) return;
+  scanning = true;
+  try {
+    for (const symbol of config.symbols) {
+      try {
+        await scanSymbol(symbol);
+        diag.scans++;
+        diag.lastScanAt = Date.now();
+      } catch (e) {
+        diag.fetchErrors++;
+        diag.lastFetchError = { symbol, message: e.message, at: Date.now() };
+        console.error(`Scan error ${symbol}:`, e.message);
+        broadcast('error', { symbol, message: e.message });
+      }
     }
+  } finally {
+    scanning = false;
   }
 }
 
@@ -317,7 +587,16 @@ function startScheduler() {
 let resolveTimer = null;
 function startResolver() {
   if (resolveTimer) clearInterval(resolveTimer);
-  resolveTimer = setInterval(resolveJournal, 10000);
+  resolveTimer = setInterval(resolveJournal, 5000);
+}
+
+// Price sampler: fast and cheap, feeds the TWAP tape used for settlement.
+let sampleTimer = null;
+function startSampler() {
+  if (sampleTimer) clearInterval(sampleTimer);
+  const ms = Math.max(1, config.priceSampleSec) * 1000;
+  sampleTimer = setInterval(samplePrices, ms);
+  samplePrices();
 }
 
 // ---- HTTP -------------------------------------------------------------------
@@ -332,6 +611,13 @@ app.get('/api/state', (req, res) => {
     alerts,
     journal: { stats: journal.stats(), recent: journal.recent(40) },
     learning: learning.summary(journal.all()),
+    calibration: calModel ? { total: calModel.total, fittedAt: calModel.fittedAt, minSample: calModel.minSample } : null,
+    // Settlement readiness: without price samples, outcomes fall back to a single
+    // tick, which is not how the contract settles. Surfaced so it is visible.
+    settlement: {
+      twapSec: config.settlementTwapSec,
+      tape: Object.fromEntries(config.symbols.map((s) => [s, tape.stats(s)])),
+    },
   });
 });
 
@@ -379,9 +665,32 @@ app.post('/api/config', (req, res) => {
     const v = Number(body.payout30);
     if (v > 0 && v <= 500) config.payout30 = v;
   }
-  if (body.fallbackWinRate != null) {
-    const v = Number(body.fallbackWinRate);
-    if (v >= 40 && v <= 70) config.fallbackWinRate = v;
+  if (typeof body.requireEvGate === 'boolean') config.requireEvGate = body.requireEvGate;
+  if (typeof body.observationMode === 'boolean') config.observationMode = body.observationMode;
+  if (body.evMarginPct != null) {
+    const v = Number(body.evMarginPct);
+    if (v >= 0 && v <= 15) config.evMarginPct = v;
+  }
+  if (body.calibrationMinSample != null) {
+    const v = Number(body.calibrationMinSample);
+    if (v >= 10 && v <= 500) config.calibrationMinSample = v;
+  }
+  if (body.bankroll != null) {
+    const v = Number(body.bankroll);
+    if (v > 0 && v <= 1e9) config.bankroll = v;
+  }
+  if (body.kellyFractionMultiplier != null) {
+    const v = Number(body.kellyFractionMultiplier);
+    // Above full Kelly is never a defensible setting, so it is not accepted.
+    if (v > 0 && v <= 1) config.kellyFractionMultiplier = v;
+  }
+  if (body.maxStakePct != null) {
+    const v = Number(body.maxStakePct);
+    if (v > 0 && v <= 25) config.maxStakePct = v;
+  }
+  if (body.maxEntryDelaySec != null) {
+    const v = Number(body.maxEntryDelaySec);
+    if (v >= 10 && v <= 600) config.maxEntryDelaySec = v;
   }
   if (Array.isArray(body.activeHoursUTC)) {
     config.activeHoursUTC = body.activeHoursUTC
@@ -405,6 +714,7 @@ app.post('/api/config', (req, res) => {
   }
   saveConfig();
   startScheduler();
+  startSampler(); // symbols or cadence may have changed
   res.json({ ok: true, config: { ...config, gemini: { ...config.gemini, apiKey: config.gemini.apiKey ? '********' : '' } } });
 });
 
@@ -422,11 +732,116 @@ app.get('/api/backtest', async (req, res) => {
   const days = Math.min(60, Math.max(3, Number(req.query.days) || 15));
   const endDaysAgo = Math.max(0, Number(req.query.endDaysAgo) || 0);
   try {
-    const result = await backtest.run(symbol, { days, endDaysAgo });
+    const result = await backtest.run(symbol, {
+      days,
+      endDaysAgo,
+      // The backtest must evaluate against the SAME payouts and the SAME EV
+      // threshold the live app uses, otherwise it is grading a different rule.
+      payout10: config.payout10,
+      payout30: config.payout30,
+      marginPct: config.evMarginPct,
+      minSample: config.calibrationMinSample,
+    });
     res.json(result);
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
+});
+
+// Fit the live probability model from historical data and persist it.
+// This is what gives the app calibrated probabilities on day one, before the
+// user's own journal is large enough to speak for itself.
+app.post('/api/calibrate', async (req, res) => {
+  const symbols = Array.isArray(req.body?.symbols) && req.body.symbols.length
+    ? req.body.symbols.map((s) => String(s).toUpperCase())
+    : config.symbols;
+  const days = Math.min(60, Math.max(7, Number(req.body?.days) || 30));
+  try {
+    const perSymbol = {};
+    const allTrades = [];
+    for (const sym of symbols) {
+      const r = await backtest.run(sym, {
+        days,
+        payout10: config.payout10,
+        payout30: config.payout30,
+        marginPct: config.evMarginPct,
+        minSample: config.calibrationMinSample,
+        // Use the whole span for fitting here; honest evaluation stays in
+        // /api/backtest, which keeps a held-out slice.
+        trainFraction: 0.9,
+      });
+      if (r.error) { perSymbol[sym] = { error: r.error }; continue; }
+      perSymbol[sym] = {
+        evaluated: r.evaluated,
+        outOfSample: r.outOfSample.all,
+        byInterval: r.outOfSample.byInterval,
+      };
+      // Rebuild raw samples from the fitted model's own training rows is not
+      // possible, so refit from the reported trades of this run.
+      for (const t of r.trades) {
+        allTrades.push({ setup: t.setup, interval: t.interval, score: t.score, win: t.win });
+      }
+    }
+    if (!allTrades.length) {
+      return res.status(400).json({ error: 'nu s-au produs semnale pentru calibrare' });
+    }
+    calModel = cal.fit(allTrades, { minSample: config.calibrationMinSample });
+    calModel.symbols = symbols;
+    calModel.days = days;
+    saveCalibration(calModel);
+    res.json({ ok: true, model: calModel, perSymbol });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Self-explanation endpoint: "why am I not seeing signals?"
+app.get('/api/diagnose', (req, res) => {
+  const resolved = journal.all().filter((e) => e.status === 'resolved').length;
+  const pending = journal.all().filter((e) => e.status === 'pending').length;
+  const needed = config.calibrationMinSample || 30;
+
+  // The single most useful line: what is the actual blocker right now.
+  let headline;
+  let action = null;
+  if (diag.fetchErrors > 0 && diag.scans === 0) {
+    headline = 'Nu pot ajunge la MEXC — fără date nu există semnale.';
+    action = 'Verifică https://api.mexc.com/api/v3/ping în browser. Dacă nici acolo nu răspunde, e blocat de rețeaua ta.';
+  } else if (!calModel && resolved < needed) {
+    headline = `Nu există încă o probabilitate măsurată (${resolved}/${needed} rezultate în jurnal).`;
+    action = 'Apasă "Calibrează pe ultimele 30 de zile" ca să obții probabilități imediat, din istoric.';
+  } else {
+    headline = 'Sistemul are date și calibrare. Semnalele apar când un setup trece pragul.';
+  }
+
+  res.json({
+    headline,
+    action,
+    uptimeSec: Math.round((Date.now() - diag.startedAt) / 1000),
+    scans: diag.scans,
+    lastScanAt: diag.lastScanAt,
+    fetchErrors: diag.fetchErrors,
+    lastFetchError: diag.lastFetchError,
+    verdicts: diag.verdicts,
+    alertsFired: diag.alertsFired,
+    observations: diag.observations,
+    blockedBy: Object.entries(diag.suppressions)
+      .sort((a, b) => b[1] - a[1])
+      .map(([reason, count]) => ({ reason, count })),
+    recentBars: diag.recentBars,
+    calibration: calModel
+      ? { total: calModel.total, minSample: calModel.minSample, fittedAt: calModel.fittedAt }
+      : null,
+    journal: { resolved, pending, needed },
+    observationMode: config.observationMode,
+    requireEvGate: config.requireEvGate,
+    sniperMode: config.sniperMode,
+    settlementTape: Object.fromEntries(config.symbols.map((s) => [s, tape.stats(s)])),
+  });
+});
+
+app.get('/api/calibration', (req, res) => {
+  res.json(calModel || { total: 0, note: 'nicio calibrare salvată — rulează POST /api/calibrate' });
 });
 
 // SSE stream for live updates.
@@ -466,6 +881,7 @@ function startServer(port, attemptsLeft) {
     console.log(ok ? '  MEXC reachable: OK' : '  WARNING: MEXC not reachable from this machine.');
     startScheduler();
     startResolver();
+    startSampler();
     if (process.env.NO_OPEN !== '1') openBrowser(`http://localhost:${port}`);
   });
   server.on('error', (err) => {

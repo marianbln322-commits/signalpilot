@@ -4,10 +4,16 @@
   "description": "Local real-time MEXC signal engine for 10/30-min event-futures UP/DOWN decisions (deterministic indicators + SMC, optional Gemini narrator, backtest).",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "doctor": "node tools/doctor.js",
+    "selftest": "node tools/selftest.js",
+    "bundle": "node tools/bundle.js"
   },
   "author": "",
   "license": "MIT",
+  "engines": {
+    "node": ">=18"
+  },
   "dependencies": {
     "express": "^4.19.2"
   }
