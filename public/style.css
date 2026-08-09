@@ -268,3 +268,30 @@ button:hover { filter: brightness(1.1); }
   line-height: 1.55;
 }
 .diag-err .muted { margin-top: 5px; font-size: 11px; }
+
+
+/* ---- Live price -----------------------------------------------------------
+   The engine reads closed candles, so its price can be minutes old. The tape
+   pushes index-price ticks every few seconds; these rules make it visible that
+   the number is moving and say where it came from. */
+.price-src {
+  font-size: 11px;
+  color: #7c8798;
+  margin: -6px 0 8px;
+  letter-spacing: .01em;
+}
+
+.card-price {
+  transition: color .25s ease;
+}
+
+@keyframes tickUp {
+  0% { color: #22c55e; transform: translateY(1px); }
+  100% { color: inherit; transform: none; }
+}
+@keyframes tickDown {
+  0% { color: #ef4444; transform: translateY(-1px); }
+  100% { color: inherit; transform: none; }
+}
+.card-price.tick-up { animation: tickUp .45s ease-out; }
+.card-price.tick-down { animation: tickDown .45s ease-out; }

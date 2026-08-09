@@ -271,6 +271,37 @@ async function scanSymbol(symbol) {
   const verdict = engine.decide(mtf);
   verdict.symbol = symbol;
 
+  // ---- Live price -----------------------------------------------------------
+  // The engine deliberately sees only CLOSED candles, so the price it derives is
+  // the last close — up to 5 minutes old on the 5m view. That is correct for
+  // structure and invalidation, and wrong for everything a human reads.
+  //
+  // Display and journal entry therefore use the price tape, which samples the
+  // INDEX price (what the contract settles against) every `priceSampleSec`. The
+  // forming candle is the next-best fallback, and the closed price is the last
+  // resort. Whichever was used is reported, so a stale figure can never be
+  // mistaken for a live one.
+  verdict.closedPrice = verdict.price;
+  const latest = tape.latest(symbol);
+  const maxAgeMs = Math.max(6000, (config.priceSampleSec || 3) * 3000);
+  if (latest && Date.now() - latest.ts <= maxAgeMs) {
+    verdict.price = latest.price;
+    verdict.priceSource = priceSource[symbol] === 'index' ? 'index (live)' : 'spot (live)';
+    verdict.priceAgeSec = +((Date.now() - latest.ts) / 1000).toFixed(1);
+  } else {
+    const forming = (mtf.__forming && mtf.__forming['5m']) || null;
+    if (forming && Number.isFinite(forming.close)) {
+      verdict.price = forming.close;
+      verdict.priceSource = 'lumânare în formare';
+      verdict.priceAgeSec = +((Date.now() - forming.openTime) / 1000).toFixed(1);
+    } else {
+      verdict.priceSource = 'ultima închidere (bandă de prețuri indisponibilă)';
+      verdict.priceAgeSec = verdict.barCloseTime
+        ? +((Date.now() - verdict.barCloseTime) / 1000).toFixed(1)
+        : null;
+    }
+  }
+
   // ---- Event-futures decision layer ----------------------------------------
   // The window comes from the primary trigger (engine). What we add here is the
   // only question that decides whether the trade is worth taking at all:
@@ -631,6 +662,15 @@ async function samplePrices() {
     if (price != null) {
       tape.push(sym, price);
       priceSource[sym] = source;
+      // Push every tick to the UI. The scan loop only runs every few seconds and
+      // is tied to bar closes, so without this the displayed price moved in jumps
+      // and looked frozen between scans.
+      broadcast('price', {
+        symbol: sym,
+        price,
+        source: source === 'index' ? 'index (live)' : 'spot (live)',
+        ts: Date.now(),
+      });
     }
   }));
 }

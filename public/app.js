@@ -38,6 +38,17 @@ const localToUtc = (h) => (((h + OFF) % 24) + 24) % 24;
 const utcToLocal = (h) => (((h - OFF) % 24) + 24) % 24;
 
 // ---------- rendering ----------
+// Says where the displayed price came from, and warns when it is not live.
+// The engine works on closed candles, so its own price can be minutes old; that
+// is fine for structure and misleading on screen, hence the explicit label.
+function priceSrcLabel(v) {
+  if (!v.priceSource) return '';
+  const age = v.priceAgeSec;
+  const stale = /închidere|formare/.test(v.priceSource) && age != null && age > 30;
+  const agePart = age == null ? '' : age < 5 ? ' · actualizat acum' : ` · acum ${Math.round(age)}s`;
+  return `${stale ? '⚠ ' : ''}preț ${v.priceSource}${agePart}`;
+}
+
 function fmt(n) {
   if (n === null || n === undefined) return '—';
   return typeof n === 'number' ? n.toLocaleString('en-US', { maximumFractionDigits: 2 }) : n;
@@ -152,8 +163,9 @@ function renderCard(v) {
   return `
     <div class="card-top">
       <span class="card-sym">${v.symbol}</span>
-      <span class="card-price">${fmt(v.price)} USDT</span>
+      <span class="card-price" data-price-for="${v.symbol}" title="${v.priceSource || ''}">${fmt(v.price)} USDT</span>
     </div>
+    <div class="price-src" data-price-src-for="${v.symbol}">${priceSrcLabel(v)}</div>
     ${banner}
     ${ofRow(v)}
     <details class="analysis" data-sym="${v.symbol}" ${detailsOpen[v.symbol] ? 'open' : ''}>
@@ -263,6 +275,24 @@ function connect() {
     });
   });
   es.addEventListener('signal', (e) => upsertCard(JSON.parse(e.data)));
+  // Price ticks arrive far more often than scans, so they are applied directly to
+  // the price element instead of re-rendering the card.
+  es.addEventListener('price', (e) => {
+    const t = JSON.parse(e.data);
+    const el = document.querySelector(`[data-price-for="${t.symbol}"]`);
+    if (el) {
+      const prev = Number(String(el.textContent).replace(/[^\d.]/g, ''));
+      el.textContent = `${fmt(t.price)} USDT`;
+      el.title = t.source;
+      if (Number.isFinite(prev) && prev !== t.price) {
+        el.classList.remove('tick-up', 'tick-down');
+        void el.offsetWidth; // restart the animation
+        el.classList.add(t.price > prev ? 'tick-up' : 'tick-down');
+      }
+    }
+    const src = document.querySelector(`[data-price-src-for="${t.symbol}"]`);
+    if (src) src.textContent = `preț ${t.source} · actualizat acum`;
+  });
   es.addEventListener('alert', (e) => addAlert(JSON.parse(e.data)));
   es.addEventListener('journal', (e) => {
     const d = JSON.parse(e.data);
